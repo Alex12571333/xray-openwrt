@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Xray Setup — OpenWrt</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --border:   #30363d;
+      --accent:   #58a6ff;
+      --accent2:  #3fb950;
+      --text:     #e6edf3;
+      --muted:    #8b949e;
+      --err:      #f85149;
+      --radius:   10px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 48px 16px 64px;
+    }
+
+    .wrap { width: 100%; max-width: 680px; }
+
+    /* ── Header ── */
+    header { text-align: center; margin-bottom: 40px; }
+    header h1 { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.5px; }
+    header h1 span { color: var(--accent); }
+    header p  { margin-top: 8px; color: var(--muted); font-size: .95rem; }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px 28px 24px;
+      margin-bottom: 20px;
+    }
+    .card + .card { margin-top: 0; }
+
+    label {
+      display: block;
+      font-size: .82rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      margin-bottom: 8px;
+    }
+
+    input[type="url"], input[type="text"] {
+      width: 100%;
+      padding: 11px 14px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: .95rem;
+      outline: none;
+      transition: border-color .15s;
+    }
+    input:focus { border-color: var(--accent); }
+    input::placeholder { color: var(--muted); }
+
+    .hint {
+      margin-top: 7px;
+      font-size: .82rem;
+      color: var(--muted);
+    }
+
+    /* ── Button ── */
+    .btn-row { margin-top: 22px; }
+    button.primary {
+      width: 100%;
+      padding: 12px;
+      background: var(--accent);
+      color: #0d1117;
+      border: none;
+      border-radius: 6px;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+    }
+    button.primary:hover  { opacity: .88; }
+    button.primary:active { transform: scale(.98); }
+
+    /* ── Result ── */
+    #result { display: none; margin-top: 20px; }
+
+    .result-label {
+      font-size: .82rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .code-block {
+      position: relative;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 14px 16px;
+      font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+      font-size: .85rem;
+      line-height: 1.6;
+      word-break: break-all;
+      color: var(--accent2);
+    }
+
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: var(--border);
+      color: var(--text);
+      border: none;
+      border-radius: 5px;
+      padding: 4px 10px;
+      font-size: .78rem;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .copy-btn:hover    { background: var(--accent); color: #0d1117; }
+    .copy-btn.copied   { background: var(--accent2); color: #0d1117; }
+
+    /* ── Steps ── */
+    .steps { list-style: none; counter-reset: step; }
+    .steps li {
+      counter-increment: step;
+      display: flex;
+      gap: 14px;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: .93rem;
+      line-height: 1.55;
+    }
+    .steps li:last-child { border-bottom: none; }
+    .steps li::before {
+      content: counter(step);
+      flex-shrink: 0;
+      width: 24px; height: 24px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #0d1117;
+      font-weight: 700;
+      font-size: .78rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 1px;
+    }
+    .steps li b { color: var(--text); }
+    .steps li span { color: var(--muted); }
+    code {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-family: "SF Mono", "Fira Code", monospace;
+      font-size: .85em;
+      color: var(--accent);
+    }
+
+    /* ── Error ── */
+    .error-msg {
+      color: var(--err);
+      font-size: .85rem;
+      margin-top: 8px;
+      display: none;
+    }
+
+    /* ── Footer ── */
+    footer {
+      margin-top: 40px;
+      text-align: center;
+      font-size: .82rem;
+      color: var(--muted);
+    }
+    footer a { color: var(--accent); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Xray Setup <span>/ OpenWrt</span></h1>
+    <p>Автоматическая установка и настройка Xray на роутере за одну команду</p>
+  </header>
+
+  <!-- Форма -->
+  <div class="card">
+    <label for="subUrl">Ссылка на подписку</label>
+    <input type="url" id="subUrl"
+           placeholder="https://your-provider.com/api/sub?token=…"
+           autocomplete="off" spellcheck="false">
+    <p class="hint">Base64-encoded VLESS подписка от вашего провайдера</p>
+    <p class="error-msg" id="subErr">Введите корректный URL подписки</p>
+
+    <div class="btn-row">
+      <button class="primary" onclick="generate()">Сгенерировать команду →</button>
+    </div>
+  </div>
+
+  <!-- Результат -->
+  <div id="result">
+    <div class="card">
+      <div class="result-label">Команда для роутера</div>
+      <div class="code-block" id="cmdOutput">
+        <button class="copy-btn" id="copyBtn" onclick="copyCmd()">Копировать</button>
+        <span id="cmdText"></span>
+      </div>
+      <p class="hint" style="margin-top:10px">
+        Вставьте в SSH-сессию на роутере и нажмите Enter
+      </p>
+    </div>
+  </div>
+
+  <!-- Инструкция -->
+  <div class="card">
+    <label>Как использовать</label>
+    <ol class="steps">
+      <li>
+        <div>
+          <b>Подключитесь к роутеру по SSH</b><br>
+          <span>Откройте терминал и выполните </span>
+          <code>ssh root@192.168.1.1</code>
+        </div>
+      </li>
+      <li>
+        <div>
+          <b>Вставьте ссылку на подписку выше</b><br>
+          <span>Нажмите «Сгенерировать команду» — получите готовую строку</span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <b>Скопируйте и выполните команду на роутере</b><br>
+          <span>Скрипт сам скачает Xray, настроит конфиг и запустит прокси</span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <b>Проверьте работу</b><br>
+          <code>wget -qO- --proxy socks5://127.0.0.1:1080 https://ipinfo.io/ip</code>
+        </div>
+      </li>
+    </ol>
+  </div>
+
+  <!-- Порты -->
+  <div class="card">
+    <label>Порты после установки</label>
+    <ol class="steps">
+      <li><div><b>SOCKS5</b> <span>— </span><code>127.0.0.1:1080</code><span> — для браузеров и приложений</span></div></li>
+      <li><div><b>HTTP</b>   <span>— </span><code>127.0.0.1:1081</code><span> — HTTP-прокси</span></div></li>
+      <li><div><b>TProxy</b> <span>— </span><code>0.0.0.0:12345</code><span> — прозрачный прокси для iptables</span></div></li>
+    </ol>
+  </div>
+
+  <footer>
+    <a href="https://github.com/XTLS/Xray-core" target="_blank">Xray-core</a>
+    &nbsp;·&nbsp;
+    Работает на OpenWrt 22.02+ (BusyBox ash)
+  </footer>
+
+</div>
+
+<script>
+  // Адрес raw-файла скрипта на GitHub (замените на свой после пуша)
+  const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh';
+
+  function generate() {
+    const subInput = document.getElementById('subUrl');
+    const errEl    = document.getElementById('subErr');
+    const url      = subInput.value.trim();
+
+    // Валидация
+    errEl.style.display = 'none';
+    subInput.style.borderColor = '';
+
+    if (!url || !isValidUrl(url)) {
+      errEl.style.display = 'block';
+      subInput.style.borderColor = 'var(--err)';
+      subInput.focus();
+      return;
+    }
+
+    // Генерация команды
+    const cmd = `wget --no-check-certificate -qO- '${SCRIPT_RAW_URL}' | sh -s -- '${url}'`;
+
+    document.getElementById('cmdText').textContent = cmd;
+    document.getElementById('result').style.display = 'block';
+    document.getElementById('copyBtn').textContent  = 'Копировать';
+    document.getElementById('copyBtn').classList.remove('copied');
+
+    document.getElementById('result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  function copyCmd() {
+    const text = document.getElementById('cmdText').textContent;
+    const btn  = document.getElementById('copyBtn');
+
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(() => flash(btn));
+    } else {
+      // Fallback для старых браузеров
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity  = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      flash(btn);
+    }
+  }
+
+  function flash(btn) {
+    btn.textContent = 'Скопировано ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = 'Копировать';
+      btn.classList.remove('copied');
+    }, 2000);
+  }
+
+  function isValidUrl(s) {
+    try { const u = new URL(s); return u.protocol === 'https:' || u.protocol === 'http:'; }
+    catch { return false; }
+  }
+
+  // Enter в поле тоже генерирует
+  document.getElementById('subUrl').addEventListener('keydown', e => {
+    if (e.key === 'Enter') generate();
+  });
+</script>
+</body>
+</html>
