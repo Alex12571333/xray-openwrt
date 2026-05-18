@@ -223,16 +223,17 @@ gen_outbound() {
 
     # --- security block ---
     local security_json
+    local effective_sni="${SV_SNI:-${SV_HOST}}"
     case "$SV_SEC" in
         tls)
             local alpn_part=""
             if [ -n "$SV_ALPN" ]; then
                 alpn_part=",\"alpn\":$(alpn_to_json "$SV_ALPN")"
             fi
-            security_json="\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${SV_SNI}\"${alpn_part}}"
+            security_json="\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${effective_sni}\"${alpn_part}}"
             ;;
         reality)
-            security_json="\"security\":\"reality\",\"realitySettings\":{\"serverName\":\"${SV_SNI}\",\"fingerprint\":\"${SV_FP}\",\"publicKey\":\"${SV_PBK}\",\"shortId\":\"${SV_SID}\"}"
+            security_json="\"security\":\"reality\",\"realitySettings\":{\"serverName\":\"${effective_sni}\",\"fingerprint\":\"${SV_FP}\",\"publicKey\":\"${SV_PBK}\",\"shortId\":\"${SV_SID}\"}"
             ;;
         *)
             security_json="\"security\":\"none\""
