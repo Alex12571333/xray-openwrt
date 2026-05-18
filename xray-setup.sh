@@ -22,6 +22,15 @@ die()  { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 info() { printf '>>> %s\n' "$*"; }
 warn() { printf 'ПРЕДУПРЕЖДЕНИЕ: %s\n' "$*" >&2; }
 
+# base64 -d: BusyBox applet или openssl fallback (GL-iNet / OpenWrt 21.02)
+_b64d() {
+    if command -v base64 >/dev/null 2>&1; then
+        base64 -d
+    else
+        openssl base64 -d -A
+    fi
+}
+
 # ─── Ротация лога: обрезаем до 128 КБ при превышении 256 КБ ──────────────────
 _rotate_log() {
     [ -f "$XRAY_LOG" ] || return 0
@@ -101,7 +110,7 @@ fetch_subscription() {
     raw=$(wget --no-check-certificate -qO- "$1") || die "Ошибка загрузки подписки: $1"
     [ -n "$raw" ] || die "Пустой ответ подписки"
     local decoded
-    decoded=$(printf '%s\n' "$raw" | base64 -d 2>/dev/null | tr -d '\r') \
+    decoded=$(printf '%s\n' "$raw" | _b64d 2>/dev/null | tr -d '\r') \
         || die "Ошибка декодирования base64"
     [ -n "$decoded" ] || die "Пустой результат после base64"
     printf '%s\n' "$decoded" | grep '^vless://' || true
