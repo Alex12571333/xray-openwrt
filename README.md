@@ -70,17 +70,13 @@ sh /etc/xray/setup.sh
 >>> Найдено серверов: 86
 
 >>> === Выбор лучших серверов ===
->>> Фаза 1: TCP-пинг (первые 20 из 86)...
+>>> Тестирую серверы (первые 20 из 86)...
   [ 1/20] cdn4-35.vk-cdnvideo.com:8443         120ms ✓
   [ 2/20] cdn3-87.vk-cdnvideo.com:8443         115ms ✓
   [ 3/20] cdn9-20.vk-cdnvideo.com:8443         130ms ✓
   [ 4/20] cdn3-25.vk-cdnvideo.com:8443         310ms ✓
   ...
->>> Фаза 2: проверка YouTube через прокси (топ-9 кандидатов)...
-  cdn3-87.vk-cdnvideo.com:8443              ✓ YouTube OK
-  cdn4-35.vk-cdnvideo.com:8443              ✓ YouTube OK
-  cdn9-20.vk-cdnvideo.com:8443              ✓ YouTube OK
->>> Прошли проверку: 3 — используем их
+>>> Доступно: 19 — беру топ-3 по латентности
 
 >>> === Парсинг ===
 >>>   Сервер 1: cdn3-87.vk-cdnvideo.com:8443  type=tcp  security=tls

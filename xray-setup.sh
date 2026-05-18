@@ -112,41 +112,8 @@ _uptime_cs() {
     awk '{printf "%d", $1*100}' /proc/uptime 2>/dev/null || printf '0'
 }
 
-# ─── Проверка реальной доступности через прокси (YouTube) ────────────────────
-# Запускает временный Xray на порту 19999, тестирует HTTPS через него
-# Возвращает 0 если YouTube доступен, 1 иначе
-_test_server_proxy() {
-    local line="$1"
-    [ -x "$XRAY_BIN" ] || return 1
-
-    parse_vless "$line" "99" 2>/dev/null || return 1
-    [ -f "/tmp/xray_sv_99.env" ] || return 1
-
-    local cfg="${WORK_DIR}/tst.json"
-    local ob; ob=$(gen_outbound "t99" "/tmp/xray_sv_99.env" 2>/dev/null)
-    rm -f "/tmp/xray_sv_99.env"
-    [ -n "$ob" ] || return 1
-
-    printf '{"log":{"loglevel":"none"},"inbounds":[{"tag":"h","listen":"127.0.0.1","port":19999,"protocol":"http","settings":{}}],"outbounds":[%s]}\n' \
-        "$ob" > "$cfg"
-
-    "$XRAY_BIN" run -c "$cfg" >/dev/null 2>&1 &
-    local xpid=$!
-    sleep 2
-
-    local ok=1
-    http_proxy="http://127.0.0.1:19999" \
-    wget --no-check-certificate -q --spider --tries=1 --timeout=10 \
-        "https://www.youtube.com/" 2>/dev/null && ok=0
-
-    kill "$xpid" 2>/dev/null
-    wait "$xpid" 2>/dev/null
-    sleep 1
-    return $ok
-}
-
-# ─── Выбор лучших серверов: TCP-пинг → проверка YouTube ──────────────────────
-# $1 — файл с vless:// строками, $2 — сколько нужно (3), $3 — сколько тестить по TCP (20)
+# ─── Выбор лучших серверов по TCP-пингу ──────────────────────────────────────
+# $1 — файл с vless:// строками, $2 — сколько нужно (3), $3 — сколько тестить (20)
 select_best_servers() {
     local input="$1" want="${2:-3}" test_max="${3:-20}"
     local scored="${WORK_DIR}/scored.txt"
@@ -154,7 +121,7 @@ select_best_servers() {
 
     local total tested=0
     total=$(wc -l < "$input" | tr -d ' ')
-    printf '>>> Фаза 1: TCP-пинг (первые %s из %s)...\n' "$test_max" "$total" >&2
+    printf '>>> Тестирую серверы (первые %s из %s)...\n' "$test_max" "$total" >&2
 
     while IFS= read -r line && [ "$tested" -lt "$test_max" ]; do
         [ -z "$line" ] && continue
@@ -180,48 +147,13 @@ select_best_servers() {
     done < "$input"
 
     local found; found=$(wc -l < "$scored" | tr -d ' ')
-    if [ "$found" -eq 0 ]; then
+    if [ "$found" -gt 0 ]; then
+        printf '>>> Доступно: %s — беру топ-%s по латентности\n' "$found" "$want" >&2
+        sort -n "$scored" | head -"$want" | cut -f2-
+    else
         warn "нет доступных серверов в первых $test_max — берём первые $want без проверки"
         head -"$want" "$input"
-        return
     fi
-
-    # Фаза 2: проверка реальной доступности (YouTube) через временный Xray
-    if [ -x "$XRAY_BIN" ]; then
-        printf '>>> Фаза 2: проверка YouTube через прокси (топ-%d кандидатов)...\n' \
-            "$((want * 3))" >&2
-        local verified="${WORK_DIR}/verified.txt"
-        local sorted="${WORK_DIR}/sorted.txt"
-        > "$verified"
-        sort -n "$scored" > "$sorted"
-
-        local v_count=0 v_ms v_line v_rest v_after v_hp v_host v_port
-        while IFS=$'\t' read -r v_ms v_line && [ "$v_count" -lt "$((want * 3))" ]; do
-            v_rest="${v_line#vless://}"; v_after="${v_rest#*@}"
-            case "$v_after" in *\?*) v_hp="${v_after%%\?*}";; *) v_hp="${v_after%%#*}";; esac
-            v_host="${v_hp%:*}"; v_port="${v_hp##*:}"
-            printf '  %-38s ' "${v_host}:${v_port}" >&2
-            if _test_server_proxy "$v_line"; then
-                printf '✓ YouTube OK\n' >&2
-                printf '%04d\t%s\n' "$v_ms" "$v_line" >> "$verified"
-                v_count=$((v_count + 1))
-                [ "$v_count" -ge "$want" ] && break
-            else
-                printf '✗ YouTube недоступен\n' >&2
-            fi
-        done < "$sorted"
-
-        if [ -s "$verified" ]; then
-            local vfound; vfound=$(wc -l < "$verified" | tr -d ' ')
-            printf '>>> Прошли проверку: %s — используем их\n' "$vfound" >&2
-            sort -n "$verified" | head -"$want" | cut -f2-
-            return
-        fi
-        warn "ни один сервер не прошёл тест YouTube — используем TCP-результаты"
-    fi
-
-    printf '>>> Доступно по TCP: %s — беру топ-%s\n' "$found" "$want" >&2
-    sort -n "$scored" | head -"$want" | cut -f2-
 }
 
 # ─── ALPN → JSON-массив ───────────────────────────────────────────────────────
