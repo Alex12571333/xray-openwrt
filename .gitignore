@@ -1,3 +1,5 @@
 openwrt-*.ext4
 openwrt-*-Image
 openwrt-*.gz
+owrt-kernel.bin
+owrt-rootfs.img
