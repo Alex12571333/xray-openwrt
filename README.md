@@ -188,9 +188,9 @@ curl -x socks5://127.0.0.1:1080 https://ipinfo.io
 # Через HTTP-прокси
 curl -x http://127.0.0.1:1081 https://ipinfo.io
 
-# Логи Xray
-tail -f /var/log/xray.log
-tail -f /var/log/xray-error.log
+# Логи Xray (через syslog — не занимают место на флеше)
+logread | grep xray
+logread -f | grep xray
 ```
 
 ---
@@ -261,9 +261,6 @@ sh xray-setup.sh test
 | `/etc/xray/setup.sh` | Скрипт (постоянная копия) |
 | `/etc/init.d/xray` | Procd init-скрипт автозапуска |
 | `/var/run/xray.pid` | PID запущенного процесса |
-| `/var/log/xray.log` | Лог stdout |
-| `/var/log/xray-error.log` | Лог ошибок |
-| `/var/log/xray-update.log` | Лог автообновлений |
 
 ---
 

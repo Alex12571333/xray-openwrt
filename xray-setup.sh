@@ -269,7 +269,7 @@ gen_config() {
 
     cat > "$XRAY_CONFIG" << CFGEOF
 {
-  "log": {"loglevel":"warning","error":"/var/log/xray-error.log"},
+  "log": {"loglevel":"warning"},
   "inbounds": [
     {"tag":"socks","listen":"0.0.0.0","port":1080,"protocol":"socks",
      "settings":{"auth":"noauth","udp":true}},
@@ -315,10 +315,10 @@ start_xray() {
     fi
     killall xray 2>/dev/null || true
     sleep 1
-    "$XRAY_BIN" run -c "$XRAY_CONFIG" >> /var/log/xray.log 2>&1 &
+    "$XRAY_BIN" run -c "$XRAY_CONFIG" 2>&1 | logger -t xray &
     local pid=$!
     sleep 1
-    kill -0 "$pid" 2>/dev/null || die "Xray упал сразу — проверьте /var/log/xray.log"
+    kill -0 "$pid" 2>/dev/null || die "Xray упал сразу — проверьте: logread | grep xray"
     printf '%s\n' "$pid" > "$XRAY_PID"
     info "Xray запущен, PID $pid"
 }
@@ -510,8 +510,7 @@ cmd_uninstall() {
     printf '\nБудет удалено:\n'
     printf '  /usr/bin/xray, /etc/xray/,\n'
     printf '  автозапуск (/etc/init.d/xray),\n'
-    printf '  автообновление (cron),\n'
-    printf '  логи /var/log/xray*.log\n\n'
+    printf '  автообновление (cron)\n\n'
     printf 'Подтвердите удаление [y/N]: '; read -r confirm
     case "$confirm" in
         y|Y) ;;
@@ -529,7 +528,6 @@ cmd_uninstall() {
     info "Удаляю файлы..."
     rm -f "$XRAY_BIN"
     rm -rf /etc/xray
-    rm -f /var/log/xray*.log
 
     printf '\nXray полностью удалён\n'
 }
