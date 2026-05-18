@@ -70,13 +70,17 @@ sh /etc/xray/setup.sh
 >>> Найдено серверов: 86
 
 >>> === Выбор лучших серверов ===
->>> Тестирую серверы (первые 20 из 86)...
+>>> Фаза 1: TCP-пинг (первые 20 из 86)...
   [ 1/20] cdn4-35.vk-cdnvideo.com:8443         120ms ✓
   [ 2/20] cdn3-87.vk-cdnvideo.com:8443         115ms ✓
   [ 3/20] cdn9-20.vk-cdnvideo.com:8443         130ms ✓
   [ 4/20] cdn3-25.vk-cdnvideo.com:8443         310ms ✓
   ...
->>> Доступно: 19 — беру топ-3 по латентности
+>>> Фаза 2: проверка YouTube через прокси (топ-9 кандидатов)...
+  cdn3-87.vk-cdnvideo.com:8443              ✓ YouTube OK
+  cdn4-35.vk-cdnvideo.com:8443              ✓ YouTube OK
+  cdn9-20.vk-cdnvideo.com:8443              ✓ YouTube OK
+>>> Прошли проверку: 3 — используем их
 
 >>> === Парсинг ===
 >>>   Сервер 1: cdn3-87.vk-cdnvideo.com:8443  type=tcp  security=tls
@@ -188,9 +192,9 @@ curl -x socks5://127.0.0.1:1080 https://ipinfo.io
 # Через HTTP-прокси
 curl -x http://127.0.0.1:1081 https://ipinfo.io
 
-# Логи Xray (через syslog — не занимают место на флеше)
-logread | grep xray
-logread -f | grep xray
+# Логи Xray (макс. 256 КБ, ротация автоматически)
+tail -f /var/log/xray.log
+tail -100 /var/log/xray.log
 ```
 
 ---
@@ -261,6 +265,7 @@ sh xray-setup.sh test
 | `/etc/xray/setup.sh` | Скрипт (постоянная копия) |
 | `/etc/init.d/xray` | Procd init-скрипт автозапуска |
 | `/var/run/xray.pid` | PID запущенного процесса |
+| `/var/log/xray.log` | Лог (макс. 256 КБ, ротация при запуске) |
 
 ---
 
