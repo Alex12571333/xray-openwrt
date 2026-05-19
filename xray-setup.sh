@@ -26,7 +26,7 @@ WORK_DIR=$(mktemp -d /tmp/xray-XXXXXX)
 trap 'rm -rf "$WORK_DIR" /tmp/xray_sv_*.env /tmp/xray_ping*.txt 2>/dev/null' EXIT INT TERM
 
 die()  { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
-info() { printf '>>> %s\n' "$*"; }
+info() { printf '>>> %s\n' "$*" >&2; }
 warn() { printf 'ПРЕДУПРЕЖДЕНИЕ: %s\n' "$*" >&2; }
 
 # ─── Backup / Rollback / Watchdog ────────────────────────────────────────────
@@ -292,6 +292,8 @@ select_best_servers() {
         if nc -z -w 2 "$host" "$port" 2>/dev/null; then
             t2=$(_uptime_cs)
             ms=$(( (t2 - t1) * 10 ))
+            # ms=0 если uptime-таймер не успел тикнуть — ставим 1 чтобы сервер не отсеялся
+            [ "$ms" -le 0 ] && ms=1
             printf '%04d\t%s\n' "$ms" "$line" >> "$scored"
             printf '  [%2d/%d] %-38s %3dms ✓\n' "$tested" "$test_max" "${host}:${port}" "$ms" >&2
         else
