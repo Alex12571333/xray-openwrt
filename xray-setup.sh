@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260519"
+SCRIPT_VERSION="20260520"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -21,6 +21,9 @@ XRAY_CONFIG_BAK="${XRAY_CONFIG}.bak"
 XRAY_WATCHDOG_SCRIPT="/tmp/xray-watchdog.sh"
 XRAY_WATCHDOG_OK="/tmp/xray-watchdog-ok"
 XRAY_WATCHDOG_PID="/tmp/xray-watchdog.pid"
+IPTABLES_CHAIN="XRAY_TP"
+FIREWALL_MARK="# xray-tproxy"
+FIREWALL_USER="/etc/firewall.user"
 
 WORK_DIR=$(mktemp -d /tmp/xray-XXXXXX)
 trap 'rm -rf "$WORK_DIR" /tmp/xray_sv_*.env /tmp/xray_ping*.txt 2>/dev/null' EXIT INT TERM
@@ -455,7 +458,7 @@ gen_config() {
     {"tag":"http","listen":"0.0.0.0","port":1081,"protocol":"http","settings":{}},
     {"tag":"tproxy","listen":"0.0.0.0","port":12345,"protocol":"dokodemo-door",
      "settings":{"network":"tcp,udp","followRedirect":true},
-     "streamSettings":{"sockopt":{"tproxy":"tproxy"}}}
+     "streamSettings":{"sockopt":{"tproxy":"redirect"}}}
   ],
   "outbounds": [
 ${ob1},
@@ -674,6 +677,99 @@ cron_interval() {
     printf '%s' "$entry" | awk '{printf "каждые %s ч.", substr($2,3)}'
 }
 
+# ─── iptables прозрачный прокси (TCP REDIRECT) ───────────────────────────────
+_lan_iface() {
+    ip link show br-lan >/dev/null 2>&1 && printf 'br-lan' || printf 'eth0'
+}
+
+iptables_active() {
+    iptables -t nat -L "$IPTABLES_CHAIN" >/dev/null 2>&1
+}
+
+setup_iptables() {
+    local iface; iface=$(_lan_iface)
+    info "Настраиваю прозрачный прокси iptables ($iface → :12345)..."
+    remove_iptables 2>/dev/null || true
+
+    iptables -t nat -N "$IPTABLES_CHAIN" 2>/dev/null || true
+
+    # Пропускаем приватные/зарезервированные адреса напрямую
+    iptables -t nat -A "$IPTABLES_CHAIN" -d 0.0.0.0/8     -j RETURN
+    iptables -t nat -A "$IPTABLES_CHAIN" -d 10.0.0.0/8    -j RETURN
+    iptables -t nat -A "$IPTABLES_CHAIN" -d 127.0.0.0/8   -j RETURN
+    iptables -t nat -A "$IPTABLES_CHAIN" -d 169.254.0.0/16 -j RETURN
+    iptables -t nat -A "$IPTABLES_CHAIN" -d 172.16.0.0/12 -j RETURN
+    iptables -t nat -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
+    iptables -t nat -A "$IPTABLES_CHAIN" -d 224.0.0.0/4   -j RETURN
+    iptables -t nat -A "$IPTABLES_CHAIN" -d 240.0.0.0/4   -j RETURN
+
+    # Перенаправляем TCP в Xray tproxy-порт
+    iptables -t nat -A "$IPTABLES_CHAIN" -p tcp -j REDIRECT --to-ports 12345
+
+    # Применяем к LAN-трафику
+    iptables -t nat -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN"
+
+    info "Прозрачный прокси включён (TCP, интерфейс $iface)"
+    _persist_iptables "$iface"
+}
+
+remove_iptables() {
+    local iface; iface=$(_lan_iface)
+    iptables -t nat -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    _unpersist_iptables
+    info "Прозрачный прокси отключён"
+}
+
+_persist_iptables() {
+    local iface="${1:-br-lan}"
+    _unpersist_iptables
+    {
+        printf '%s\n' "$FIREWALL_MARK"
+        printf 'iptables -t nat -N XRAY_TP 2>/dev/null || true\n'
+        printf 'iptables -t nat -A XRAY_TP -d 0.0.0.0/8 -j RETURN\n'
+        printf 'iptables -t nat -A XRAY_TP -d 10.0.0.0/8 -j RETURN\n'
+        printf 'iptables -t nat -A XRAY_TP -d 127.0.0.0/8 -j RETURN\n'
+        printf 'iptables -t nat -A XRAY_TP -d 169.254.0.0/16 -j RETURN\n'
+        printf 'iptables -t nat -A XRAY_TP -d 172.16.0.0/12 -j RETURN\n'
+        printf 'iptables -t nat -A XRAY_TP -d 192.168.0.0/16 -j RETURN\n'
+        printf 'iptables -t nat -A XRAY_TP -d 224.0.0.0/4 -j RETURN\n'
+        printf 'iptables -t nat -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
+        printf 'iptables -t nat -A XRAY_TP -p tcp -j REDIRECT --to-ports 12345\n'
+        printf 'iptables -t nat -A PREROUTING -i %s -j XRAY_TP\n' "$iface"
+        printf '%s-end\n' "$FIREWALL_MARK"
+    } >> "$FIREWALL_USER"
+    info "Правила iptables сохранены → $FIREWALL_USER (персистентны)"
+}
+
+_unpersist_iptables() {
+    [ -f "$FIREWALL_USER" ] || return 0
+    local tmp
+    tmp=$(awk -v s="$FIREWALL_MARK" -v e="${FIREWALL_MARK}-end" \
+        '$0==s{skip=1;next} $0==e{skip=0;next} !skip{print}' "$FIREWALL_USER")
+    printf '%s\n' "$tmp" > "$FIREWALL_USER"
+}
+
+cmd_tproxy_menu() {
+    local cur; iptables_active && cur="включён" || cur="выключен"
+    printf '\nПрозрачный прокси (весь LAN-трафик через Xray): %s\n\n' "$cur"
+    printf '  1  Включить\n'
+    printf '  2  Выключить\n'
+    printf '  0  Назад\n\n'
+    printf 'Выбор: '; read -r ch
+    case "$ch" in
+        1)
+            if [ ! -f "$XRAY_CONFIG" ]; then
+                printf 'Сначала настройте подписку (пункт 1)\n'
+            else
+                setup_iptables || warn "Ошибка настройки iptables"
+            fi
+            ;;
+        2) remove_iptables ;;
+    esac
+}
+
 # ─── Применение подписки ──────────────────────────────────────────────────────
 apply_subscription() {
     local sub_url="$1"
@@ -725,9 +821,15 @@ apply_subscription() {
         die "Установка отменена: прокси не работает после запуска"
     fi
 
-    printf '\n  SOCKS5 : 127.0.0.1:1080\n'
-    printf '  HTTP   : 127.0.0.1:1081\n'
-    printf '  TProxy : 0.0.0.0:12345\n\n'
+    # Прозрачный прокси: включаем автоматически или переключаем если уже был включён
+    setup_iptables 2>/dev/null \
+        || warn "iptables недоступен — прозрачный прокси не активен (SOCKS5 :1080 работает)"
+
+    local lan_ip; lan_ip=$(ip -4 addr show br-lan 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+    [ -z "$lan_ip" ] && lan_ip="<IP роутера>"
+    printf '\n  SOCKS5 : %s:1080  (вручную на устройстве)\n' "$lan_ip"
+    printf '  HTTP   : %s:1081  (вручную на устройстве)\n' "$lan_ip"
+    printf '  TProxy : включён — весь LAN автоматически\n\n'
 }
 
 # ─── Статус ───────────────────────────────────────────────────────────────────
@@ -757,6 +859,9 @@ cmd_status() {
         || printf '  Автозапуск  : выключен\n'
 
     printf '  Автообновл. : %s\n' "$(cron_interval)"
+    iptables_active \
+        && printf '  TProxy      : включён (весь LAN через Xray)\n' \
+        || printf '  TProxy      : выключен (только ручной прокси)\n'
     printf '  Скрипт      : v%s\n' "$SCRIPT_VERSION"
 
     if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
@@ -821,6 +926,8 @@ cmd_uninstall() {
 
     remove_init_script
     remove_cron
+
+    remove_iptables 2>/dev/null || true
 
     info "Удаляю файлы..."
     rm -f "$XRAY_BIN"
@@ -946,9 +1053,14 @@ menu() {
         printf '║  6  Автообновление подписки      ║\n'
         printf '║  7  Удалить всё                  ║\n'
         printf '║  8  Тесты                        ║\n'
+        if iptables_active 2>/dev/null; then
+        printf '║  9  Прозрачный прокси (вкл) ✓    ║\n'
+        else
+        printf '║  9  Прозрачный прокси (выкл)     ║\n'
+        fi
         printf '║  u  Обновить скрипт              ║\n'
         if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
-        printf '║  9  Отменить watchdog ⚠           ║\n'
+        printf '║  w  Отменить watchdog ⚠           ║\n'
         fi
         printf '║  0  Выход                        ║\n'
         printf '╚══════════════════════════════════╝\n'
@@ -988,8 +1100,9 @@ menu() {
             6) cmd_autoupdate_menu ;;
             7) cmd_uninstall ;;
             8) cmd_test ;;
+            9) cmd_tproxy_menu ;;
             u|U) cmd_self_update ;;
-            9) _cancel_watchdog ;;
+            w|W) _cancel_watchdog ;;
             0|q|Q) printf 'Выход\n'; exit 0 ;;
             *) printf 'Неверный выбор\n' ;;
         esac
