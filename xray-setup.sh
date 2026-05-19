@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260524"
+SCRIPT_VERSION="20260525"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -475,7 +475,7 @@ ${ob3},
     "rules": [
       {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
       {"type":"field","ip":["geoip:ru"],"outboundTag":"direct"},
-      {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$"],"outboundTag":"direct"},
+      {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$","domain:steampowered.com","domain:steamcommunity.com","domain:steam-chat.com","domain:steamgames.com","domain:valvesoftware.com","domain:steamstatic.com","domain:steamcontent.com"],"outboundTag":"direct"},
       {"type":"field","network":"tcp,udp","balancerTag":"balancer"}
     ]
   },
