@@ -14,6 +14,10 @@ CRON_MARKER="# xray-autoupdate"
 GITHUB_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 XRAY_LOG="/var/log/xray.log"
 XRAY_LOG_MAX=262144   # 256 КБ — при превышении оставляем последние 128 КБ
+XRAY_CONFIG_BAK="${XRAY_CONFIG}.bak"
+XRAY_WATCHDOG_SCRIPT="/tmp/xray-watchdog.sh"
+XRAY_WATCHDOG_OK="/tmp/xray-watchdog-ok"
+XRAY_WATCHDOG_PID="/tmp/xray-watchdog.pid"
 
 WORK_DIR=$(mktemp -d /tmp/xray-XXXXXX)
 trap 'rm -rf "$WORK_DIR" /tmp/xray_sv_*.env /tmp/xray_ping*.txt 2>/dev/null' EXIT INT TERM
@@ -22,7 +26,110 @@ die()  { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 info() { printf '>>> %s\n' "$*"; }
 warn() { printf 'ПРЕДУПРЕЖДЕНИЕ: %s\n' "$*" >&2; }
 
-# base64 -d: BusyBox applet или openssl fallback (GL-iNet / OpenWrt 21.02)
+# ─── Backup / Rollback / Watchdog ────────────────────────────────────────────
+_save_backup() {
+    [ -f "$XRAY_CONFIG" ] || return 0
+    cp "$XRAY_CONFIG" "$XRAY_CONFIG_BAK"
+    info "Резервная копия конфига сохранена → $XRAY_CONFIG_BAK"
+}
+
+# Проверяем что прокси поднят и пропускает трафик (SOCKS5 → HTTP fallback)
+_test_proxy() {
+    local url="https://www.gstatic.com/generate_204"
+    if command -v curl >/dev/null 2>&1; then
+        curl -s --max-time 10 -x socks5://127.0.0.1:1080 "$url" >/dev/null 2>&1 && return 0
+        curl -s --max-time 10 -x http://127.0.0.1:1081   "$url" >/dev/null 2>&1 && return 0
+    fi
+    http_proxy="http://127.0.0.1:1081" wget --no-check-certificate -qO- "$url" >/dev/null 2>&1
+}
+
+# Остановить Xray и восстановить резервный конфиг (или просто остановить)
+_do_rollback() {
+    warn "=== ОТКАТ ==="
+    [ -f "$XRAY_PID" ] && kill "$(cat "$XRAY_PID")" 2>/dev/null; rm -f "$XRAY_PID"
+    killall xray 2>/dev/null || true
+    sleep 1
+    if [ -f "$XRAY_CONFIG_BAK" ]; then
+        cp "$XRAY_CONFIG_BAK" "$XRAY_CONFIG"
+        warn "Восстановлен старый конфиг, перезапускаю Xray..."
+        XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
+        local pid=$!
+        sleep 1
+        kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid" > "$XRAY_PID" \
+            && warn "Xray запущен со старым конфигом (PID $pid)" \
+            || warn "Старый Xray тоже не запустился — процесс остановлен"
+    else
+        warn "Резервной копии нет — Xray остановлен"
+    fi
+    rm -f "$XRAY_WATCHDOG_SCRIPT" "$XRAY_WATCHDOG_OK" "$XRAY_WATCHDOG_PID"
+}
+
+# Запустить фоновый watchdog: проверяет прокси каждые 60с в течение 3 мин.
+# Если проверка провалилась и маркер не выставлен — откат.
+_start_watchdog() {
+    rm -f "$XRAY_WATCHDOG_OK"
+    cat > "$XRAY_WATCHDOG_SCRIPT" << WDEOF
+#!/bin/sh
+MARKER="$XRAY_WATCHDOG_OK"
+PID_FILE="$XRAY_PID"
+CONFIG="$XRAY_CONFIG"
+CONFIG_BAK="$XRAY_CONFIG_BAK"
+XRAY_BIN="$XRAY_BIN"
+LOG="$XRAY_LOG"
+
+_wdcheck() {
+    local url="https://www.gstatic.com/generate_204"
+    if command -v curl >/dev/null 2>&1; then
+        curl -s --max-time 10 -x socks5://127.0.0.1:1080 "\$url" >/dev/null 2>&1 && return 0
+        curl -s --max-time 10 -x http://127.0.0.1:1081   "\$url" >/dev/null 2>&1 && return 0
+    fi
+    http_proxy="http://127.0.0.1:1081" wget --no-check-certificate -qO- "\$url" >/dev/null 2>&1
+}
+
+_wdrollback() {
+    printf '%s WATCHDOG: прокси не отвечает — откат\n' "\$(date)" >> "\$LOG"
+    [ -f "\$PID_FILE" ] && kill "\$(cat "\$PID_FILE")" 2>/dev/null; rm -f "\$PID_FILE"
+    killall xray 2>/dev/null || true; sleep 1
+    if [ -f "\$CONFIG_BAK" ]; then
+        cp "\$CONFIG_BAK" "\$CONFIG"
+        XRAY_LOCATION_ASSET=/etc/xray "\$XRAY_BIN" run -c "\$CONFIG" >> "\$LOG" 2>&1 &
+        printf '%s\n' "\$!" > "\$PID_FILE"
+        printf '%s WATCHDOG: старый конфиг восстановлен, PID %s\n' "\$(date)" "\$(cat "\$PID_FILE")" >> "\$LOG"
+    else
+        printf '%s WATCHDOG: бэкап не найден — Xray остановлен\n' "\$(date)" >> "\$LOG"
+    fi
+}
+
+i=0
+while [ \$i -lt 3 ]; do
+    sleep 60
+    [ -f "\$MARKER" ] && exit 0
+    if ! _wdcheck; then
+        _wdrollback
+        rm -f "$XRAY_WATCHDOG_SCRIPT" "$XRAY_WATCHDOG_OK" "$XRAY_WATCHDOG_PID"
+        exit 1
+    fi
+    i=\$((i + 1))
+done
+rm -f "$XRAY_WATCHDOG_SCRIPT" "$XRAY_WATCHDOG_OK" "$XRAY_WATCHDOG_PID"
+exit 0
+WDEOF
+    chmod +x "$XRAY_WATCHDOG_SCRIPT"
+    nohup sh "$XRAY_WATCHDOG_SCRIPT" > /dev/null 2>&1 &
+    printf '%s\n' "$!" > "$XRAY_WATCHDOG_PID"
+    warn "Watchdog активен: 3 минуты мониторинга, откат при обрыве"
+    warn "Отменить: touch $XRAY_WATCHDOG_OK"
+}
+
+_cancel_watchdog() {
+    [ -f "$XRAY_WATCHDOG_PID" ] || return 0
+    touch "$XRAY_WATCHDOG_OK"
+    kill "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null || true
+    rm -f "$XRAY_WATCHDOG_SCRIPT" "$XRAY_WATCHDOG_OK" "$XRAY_WATCHDOG_PID"
+    info "Watchdog отменён"
+}
+
+# ─── base64 -d: BusyBox applet или openssl fallback (GL-iNet / OpenWrt 21.02)
 _b64d() {
     if command -v base64 >/dev/null 2>&1; then
         base64 -d
@@ -419,6 +526,8 @@ cron_interval() {
 apply_subscription() {
     local sub_url="$1"
 
+    _save_backup
+
     info "=== Установка Xray ==="
     install_xray
 
@@ -453,6 +562,17 @@ apply_subscription() {
     info "=== Запуск ==="
     start_xray
 
+    info "=== Проверка подключения ==="
+    sleep 2
+    if _test_proxy; then
+        info "Подключение через прокси: OK"
+        _start_watchdog
+    else
+        warn "Прокси не отвечает — откат"
+        _do_rollback
+        die "Установка отменена: прокси не работает после запуска"
+    fi
+
     printf '\n  SOCKS5 : 127.0.0.1:1080\n'
     printf '  HTTP   : 127.0.0.1:1081\n'
     printf '  TProxy : 0.0.0.0:12345\n\n'
@@ -485,6 +605,10 @@ cmd_status() {
         || printf '  Автозапуск  : выключен\n'
 
     printf '  Автообновл. : %s\n' "$(cron_interval)"
+
+    if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
+        printf '  Watchdog    : активен (автооткат при обрыве)\n'
+    fi
     printf '\n'
 }
 
@@ -669,6 +793,9 @@ menu() {
         printf '║  6  Автообновление подписки      ║\n'
         printf '║  7  Удалить всё                  ║\n'
         printf '║  8  Тесты                        ║\n'
+        if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
+        printf '║  9  Отменить watchdog ⚠           ║\n'
+        fi
         printf '║  0  Выход                        ║\n'
         printf '╚══════════════════════════════════╝\n'
         printf 'Выбор: '; read -r choice
@@ -707,6 +834,7 @@ menu() {
             6) cmd_autoupdate_menu ;;
             7) cmd_uninstall ;;
             8) cmd_test ;;
+            9) _cancel_watchdog ;;
             0|q|Q) printf 'Выход\n'; exit 0 ;;
             *) printf 'Неверный выбор\n' ;;
         esac
