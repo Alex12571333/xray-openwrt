@@ -138,7 +138,7 @@ cmd_self_update() {
     info "Проверяю обновления..."
 
     local tmp="${WORK_DIR}/setup_new.sh"
-    wget --no-check-certificate -qO "$tmp" "$SCRIPT_URL" 2>/dev/null \
+    _dl "$SCRIPT_URL" "$tmp" \
         || { warn "Не удалось скачать скрипт с GitHub"; return 1; }
     [ -s "$tmp" ] || { warn "Скачан пустой файл"; return 1; }
 
@@ -162,6 +162,16 @@ cmd_self_update() {
         || { warn "Не удалось записать скрипт в $XRAY_SELF"; return 1; }
     info "Скрипт обновлён: $SCRIPT_VERSION → $new_ver"
     info "Перезапустите: sh $XRAY_SELF"
+}
+
+# ─── Скачивание файла: curl (с редиректами) или wget ─────────────────────────
+_dl() {
+    # $1 = URL, $2 = путь назначения ("-" для stdout)
+    if command -v curl >/dev/null 2>&1; then
+        curl -L --no-check-certificate -s -f -o "$2" "$1"
+    else
+        wget --no-check-certificate -qO "$2" "$1"
+    fi
 }
 
 # ─── base64 -d: BusyBox applet или openssl fallback (GL-iNet / OpenWrt 21.02)
@@ -217,7 +227,7 @@ install_xray() {
     info "Архитектура: $(uname -m) → $archive"
 
     local api_resp
-    api_resp=$(wget --no-check-certificate -qO- "$GITHUB_API") \
+    api_resp=$(_dl "$GITHUB_API" -) \
         || die "Не удалось получить данные из GitHub API"
     [ -n "$api_resp" ] || die "Пустой ответ от GitHub API"
 
@@ -231,7 +241,7 @@ install_xray() {
     info "Скачиваю $archive..."
 
     local zip="${WORK_DIR}/xray.zip"
-    wget --no-check-certificate -qO "$zip" "$url" || die "Ошибка загрузки: $url"
+    _dl "$url" "$zip" || die "Ошибка загрузки: $url"
     [ -s "$zip" ] || die "Архив пустой"
 
     local ex="${WORK_DIR}/x"
@@ -251,7 +261,7 @@ install_xray() {
 fetch_subscription() {
     info "Скачиваю подписку..."
     local raw
-    raw=$(wget --no-check-certificate -qO- "$1") || die "Ошибка загрузки подписки: $1"
+    raw=$(_dl "$1" -) || die "Ошибка загрузки подписки: $1"
     [ -n "$raw" ] || die "Пустой ответ подписки"
     local decoded
     decoded=$(printf '%s\n' "$raw" | _b64d 2>/dev/null | tr -d '\r') \
