@@ -1,6 +1,6 @@
 #!/bin/sh
-# xray-setup.sh — Xray + VLESS подписка для OpenWrt 22.02+
-# Зависимости: wget, base64, unzip, grep, sed, awk, nc (BusyBox)
+# xray-setup.sh — Xray + VLESS подписка для OpenWrt 21.02+ (GL-iNet, OpenWrt)
+# Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test]  или без аргументов — меню
 
 XRAY_BIN="/usr/bin/xray"
@@ -82,7 +82,7 @@ install_xray() {
     local url
     url=$(printf '%s\n' "$api_resp" \
         | grep '"browser_download_url"' \
-        | grep "\"${archive}\"" \
+        | grep "/${archive}\"" \
         | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' \
         | head -1)
     [ -n "$url" ] || die "URL для $archive не найден"
@@ -628,9 +628,11 @@ cmd_test() {
         if [ -f "$XRAY_PID" ] && kill -0 "$(cat "$XRAY_PID")" 2>/dev/null; then
             _ok "процесс запущен (PID $(cat "$XRAY_PID"))"
             local ip
-            ip=$(wget --no-check-certificate -qO- \
-                -e "socks5_proxy=socks5://127.0.0.1:1080" \
-                https://ipinfo.io/ip 2>/dev/null | tr -d '\n')
+            if command -v curl >/dev/null 2>&1; then
+                ip=$(curl -s --max-time 10 -x socks5://127.0.0.1:1080 https://ipinfo.io/ip 2>/dev/null | tr -d '\n')
+            else
+                ip=$(http_proxy="http://127.0.0.1:1081" wget --no-check-certificate -qO- https://ipinfo.io/ip 2>/dev/null | tr -d '\n')
+            fi
             [ -n "$ip" ] && _ok "SOCKS5 :1080 работает (IP: $ip)" \
                          || _fail "SOCKS5 :1080" "нет ответа" "IP-адрес"
         else
