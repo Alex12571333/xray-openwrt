@@ -384,7 +384,9 @@ OUTJSON
 
 # ─── Генерация config.json ────────────────────────────────────────────────────
 gen_config() {
-    info "Генерирую конфиг: $XRAY_CONFIG"
+    # $1 — путь назначения (по умолчанию $XRAY_CONFIG)
+    local dest="${1:-$XRAY_CONFIG}"
+    info "Генерирую конфиг: $dest"
     mkdir -p /etc/xray
 
     local ob1 ob2 ob3
@@ -392,7 +394,7 @@ gen_config() {
     ob2=$(gen_outbound "proxy2" "$([ -f /tmp/xray_sv_2.env ] && echo /tmp/xray_sv_2.env || echo /tmp/xray_sv_1.env)")
     ob3=$(gen_outbound "proxy3" "$([ -f /tmp/xray_sv_3.env ] && echo /tmp/xray_sv_3.env || echo /tmp/xray_sv_1.env)")
 
-    cat > "$XRAY_CONFIG" << CFGEOF
+    cat > "$dest" << CFGEOF
 {
   "log": {"loglevel":"warning"},
   "inbounds": [
@@ -430,7 +432,7 @@ CFGEOF
     info "Конфиг записан"
 }
 
-# ─── Запуск Xray ──────────────────────────────────────────────────────────────
+# ─── Запуск Xray (полный — kill + sleep + start) ──────────────────────────────
 start_xray() {
     mkdir -p /var/run
     if [ -f "$XRAY_PID" ]; then
@@ -447,6 +449,104 @@ start_xray() {
     kill -0 "$pid" 2>/dev/null || die "Xray упал сразу — проверьте лог: $XRAY_LOG"
     printf '%s\n' "$pid" > "$XRAY_PID"
     info "Xray запущен, PID $pid"
+}
+
+# ─── Быстрый рестарт — минимальный разрыв (~300 мс) ─────────────────────────
+# Используется при обновлении подписки когда серверы изменились.
+# Старый процесс убивается немедленно, новый стартует без sleep 1.
+# Ждём готовности через nc -z (до 5 с).
+_fast_restart() {
+    [ -f "$XRAY_PID" ] && kill "$(cat "$XRAY_PID")" 2>/dev/null; rm -f "$XRAY_PID"
+    killall xray 2>/dev/null || true
+    mkdir -p /var/run "$(dirname "$XRAY_LOG")"
+    _rotate_log
+    XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
+    local pid=$!
+    local i=0
+    while [ $i -lt 5 ]; do
+        sleep 1
+        nc -z 127.0.0.1 1080 2>/dev/null && break
+        i=$((i + 1))
+    done
+    kill -0 "$pid" 2>/dev/null || die "Xray не запустился — проверьте лог: $XRAY_LOG"
+    printf '%s\n' "$pid" > "$XRAY_PID"
+    info "Xray перезапущен, PID $pid"
+}
+
+# ─── Сравнение серверов: 0 = серверы изменились, 1 = те же ──────────────────
+_servers_changed() {
+    local new_config="$1"
+    [ -f "$XRAY_CONFIG" ] || return 0
+    local old_hosts new_hosts
+    old_hosts=$(grep '"address"' "$XRAY_CONFIG"  | sed 's/.*"address": *"\([^"]*\)".*/\1/' | sort)
+    new_hosts=$(grep '"address"' "$new_config" | sed 's/.*"address": *"\([^"]*\)".*/\1/' | sort)
+    [ "$old_hosts" = "$new_hosts" ] && return 1 || return 0
+}
+
+# ─── Обновление подписки без разрыва соединений ───────────────────────────────
+update_subscription() {
+    local sub_url="$1"
+    [ -n "$sub_url" ] || { [ -f "$XRAY_SUB_FILE" ] && sub_url=$(cat "$XRAY_SUB_FILE"); }
+    [ -n "$sub_url" ] || die "URL подписки не задан"
+
+    info "=== Обновление подписки ==="
+    local vless_lines
+    vless_lines=$(fetch_subscription "$sub_url")
+    [ -n "$vless_lines" ] || die "В подписке не найдено серверов"
+
+    local total; total=$(printf '%s\n' "$vless_lines" | grep -c '^vless://' || true)
+    info "Найдено серверов: $total"
+    printf '%s\n' "$vless_lines" > "${WORK_DIR}/vless.txt"
+
+    info "=== Выбор лучших серверов ==="
+    local best
+    best=$(select_best_servers "${WORK_DIR}/vless.txt" 3 20)
+    [ -n "$best" ] || die "Не удалось выбрать серверы"
+    printf '%s\n' "$best" > "${WORK_DIR}/best.txt"
+
+    info "=== Парсинг ==="
+    local i=0
+    while IFS= read -r line && [ "$i" -lt 3 ]; do
+        [ -z "$line" ] && continue
+        i=$((i + 1))
+        parse_vless "$line" "$i" || i=$((i - 1))
+    done < "${WORK_DIR}/best.txt"
+    [ "$i" -gt 0 ] || die "Не удалось распарсить ни один сервер"
+
+    info "=== Генерация конфига ==="
+    local new_cfg="${WORK_DIR}/config_new.json"
+    gen_config "$new_cfg"
+
+    # Валидация нового конфига
+    if ! XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -test -c "$new_cfg" >/dev/null 2>&1; then
+        warn "Новый конфиг невалиден — текущий конфиг не изменён"
+        return 1
+    fi
+
+    # Если серверы не изменились — просто обновить файл, перезапуск не нужен
+    if ! _servers_changed "$new_cfg"; then
+        info "Серверы не изменились — перезапуск не нужен"
+        cp "$new_cfg" "$XRAY_CONFIG"
+        return 0
+    fi
+
+    info "Серверы обновились — быстрый рестарт (~300 мс разрыв)"
+    _save_backup
+    cp "$new_cfg" "$XRAY_CONFIG"
+
+    if [ -x "$XRAY_BIN" ] && [ -f "$XRAY_PID" ] && kill -0 "$(cat "$XRAY_PID")" 2>/dev/null; then
+        _fast_restart
+    else
+        start_xray
+    fi
+
+    sleep 1
+    if _test_proxy; then
+        info "Обновление применено, прокси работает"
+    else
+        warn "Прокси не отвечает после обновления — откат"
+        _do_rollback
+    fi
 }
 
 # ─── Автозапуск (procd init-скрипт) ──────────────────────────────────────────
@@ -499,8 +599,8 @@ install_cron() {
     local hours="${1:-6}"
     mkdir -p /etc/crontabs
     remove_cron
-    printf '0 */%s * * * sh %s "$(cat %s)" >> /var/log/xray-update.log 2>&1 %s\n' \
-        "$hours" "$XRAY_SELF" "$XRAY_SUB_FILE" "$CRON_MARKER" >> "$XRAY_CRON"
+    printf '0 */%s * * * sh %s update >> /var/log/xray-update.log 2>&1 %s\n' \
+        "$hours" "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
     /etc/init.d/cron restart 2>/dev/null || true
     info "Автообновление: каждые ${hours} часов"
 }
@@ -845,8 +945,9 @@ menu() {
 main() {
     local arg="${1:-${XRAY_SUB_URL:-}}"
     case "$arg" in
-        test) cmd_test ;;
-        "")   menu ;;
+        test)   cmd_test ;;
+        update) update_subscription "" ;;
+        "")     menu ;;
         *)
             mkdir -p /etc/xray
             printf '%s\n' "$arg" > "$XRAY_SUB_FILE"
