@@ -94,12 +94,14 @@ install_xray() {
 
     local ex="${WORK_DIR}/x"
     mkdir -p "$ex"
-    unzip -o "$zip" xray -d "$ex" || die "Ошибка распаковки"
+    unzip -o "$zip" xray geoip.dat geosite.dat -d "$ex" || die "Ошибка распаковки"
     [ -f "${ex}/xray" ] || die "Бинарник xray не найден в архиве"
 
-    mkdir -p "$(dirname "$XRAY_BIN")"
+    mkdir -p "$(dirname "$XRAY_BIN")" /etc/xray
     mv "${ex}/xray" "$XRAY_BIN" && chmod +x "$XRAY_BIN" \
         || die "Не удалось установить xray в $XRAY_BIN"
+    [ -f "${ex}/geoip.dat"   ] && mv "${ex}/geoip.dat"   /etc/xray/geoip.dat
+    [ -f "${ex}/geosite.dat" ] && mv "${ex}/geosite.dat" /etc/xray/geosite.dat
     info "Xray установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
 }
 
@@ -307,7 +309,6 @@ ${ob3},
                    "strategy":{"type":"leastPing"}}],
     "rules": [
       {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
-      {"type":"field","domain":["geosite:ru"],"outboundTag":"direct"},
       {"type":"field","ip":["geoip:ru"],"outboundTag":"direct"},
       {"type":"field","network":"tcp,udp","balancerTag":"balancer"}
     ]
@@ -333,7 +334,7 @@ start_xray() {
     sleep 1
     mkdir -p "$(dirname "$XRAY_LOG")"
     _rotate_log
-    "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
+    XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
     local pid=$!
     sleep 1
     kill -0 "$pid" 2>/dev/null || die "Xray упал сразу — проверьте лог: $XRAY_LOG"
@@ -359,6 +360,7 @@ STOP=01
 
 start_service() {
     procd_open_instance
+    procd_set_param env XRAY_LOCATION_ASSET=/etc/xray
     procd_set_param command /usr/bin/xray run -c /etc/xray/config.json
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
