@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260521"
+SCRIPT_VERSION="20260522"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -475,7 +475,7 @@ ${ob3},
       {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
       {"type":"field","ip":["geoip:ru"],"outboundTag":"direct"},
       {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"outboundTag":"direct"},
-      {"type":"field","domain":["regexp:\\.ru$","regexp:\\.su$","domain:telegram.org","domain:t.me"],"outboundTag":"direct"},
+      {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$","domain:telegram.org","domain:t.me"],"outboundTag":"direct"},
       {"type":"field","network":"tcp,udp","balancerTag":"balancer"}
     ]
   },
