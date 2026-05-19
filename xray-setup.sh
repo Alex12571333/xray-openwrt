@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260525"
+SCRIPT_VERSION="20260526"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -458,7 +458,7 @@ gen_config() {
     {"tag":"http","listen":"0.0.0.0","port":1081,"protocol":"http","settings":{}},
     {"tag":"tproxy","listen":"0.0.0.0","port":12345,"protocol":"dokodemo-door",
      "settings":{"network":"tcp,udp","followRedirect":true},
-     "streamSettings":{"sockopt":{"tproxy":"redirect"}},
+     "streamSettings":{"sockopt":{"tproxy":"tproxy"}},
      "sniffing":{"enabled":true,"destOverride":["http","tls"],"routeOnly":true}}
   ],
   "outbounds": [
@@ -685,41 +685,71 @@ _lan_iface() {
 }
 
 iptables_active() {
-    iptables -t nat -L "$IPTABLES_CHAIN" >/dev/null 2>&1
+    iptables -t mangle -L "$IPTABLES_CHAIN" >/dev/null 2>&1
 }
 
 setup_iptables() {
     local iface; iface=$(_lan_iface)
-    info "Настраиваю прозрачный прокси iptables ($iface → :12345)..."
+    info "Настраиваю TPROXY (TCP+UDP, $iface → :12345)..."
+
+    # Устанавливаем модуль TPROXY если нет
+    if ! iptables -t mangle -A OUTPUT -j TPROXY --tproxy-mark 0x1 --on-port 1 2>/dev/null; then
+        info "Устанавливаю kmod-ipt-tproxy..."
+        opkg update >/dev/null 2>&1
+        opkg install kmod-ipt-tproxy >/dev/null 2>&1 \
+            || warn "Не удалось установить kmod-ipt-tproxy — попробуйте вручную: opkg install kmod-ipt-tproxy"
+    else
+        iptables -t mangle -D OUTPUT -j TPROXY --tproxy-mark 0x1 --on-port 1 2>/dev/null || true
+    fi
+
     remove_iptables 2>/dev/null || true
 
-    iptables -t nat -N "$IPTABLES_CHAIN" 2>/dev/null || true
+    # Цепочка в таблице mangle
+    iptables -t mangle -N "$IPTABLES_CHAIN" 2>/dev/null || true
 
-    # Пропускаем приватные/зарезервированные адреса напрямую
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 0.0.0.0/8     -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 10.0.0.0/8    -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 127.0.0.0/8   -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 169.254.0.0/16 -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 172.16.0.0/12 -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 224.0.0.0/4   -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 240.0.0.0/4   -j RETURN
+    # Пропускаем приватные/зарезервированные адреса
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 0.0.0.0/8      -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 10.0.0.0/8     -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 127.0.0.0/8    -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 169.254.0.0/16 -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 172.16.0.0/12  -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
 
-    # Перенаправляем TCP в Xray tproxy-порт
-    iptables -t nat -A "$IPTABLES_CHAIN" -p tcp -j REDIRECT --to-ports 12345
+    # TPROXY TCP и UDP → порт 12345
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
 
-    # Применяем к LAN-трафику
-    iptables -t nat -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN"
+    # Применяем к входящему LAN-трафику
+    iptables -t mangle -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN"
 
-    info "Прозрачный прокси включён (TCP, интерфейс $iface)"
+    # IP-маршрут: помеченный трафик → lo (обязательно для TPROXY)
+    ip rule add fwmark 0x1 lookup 100 2>/dev/null || true
+    ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+
+    # Удаляем старые NAT-правила если остались
+    iptables -t nat -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$IPTABLES_CHAIN" 2>/dev/null || true
+
+    info "Прозрачный прокси включён (TCP+UDP, интерфейс $iface)"
     _persist_iptables "$iface"
 }
 
 remove_iptables() {
     local iface; iface=$(_lan_iface)
+    # mangle
+    iptables -t mangle -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    # nat (старые правила)
     iptables -t nat -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t nat -F "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t nat -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    # ip rule/route
+    ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
+    ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
     _unpersist_iptables
     info "Прозрачный прокси отключён"
 }
@@ -729,20 +759,23 @@ _persist_iptables() {
     _unpersist_iptables
     {
         printf '%s\n' "$FIREWALL_MARK"
-        printf 'iptables -t nat -N XRAY_TP 2>/dev/null || true\n'
-        printf 'iptables -t nat -A XRAY_TP -d 0.0.0.0/8 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 10.0.0.0/8 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 127.0.0.0/8 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 169.254.0.0/16 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 172.16.0.0/12 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 192.168.0.0/16 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 224.0.0.0/4 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -p tcp -j REDIRECT --to-ports 12345\n'
-        printf 'iptables -t nat -A PREROUTING -i %s -j XRAY_TP\n' "$iface"
+        printf 'iptables -t mangle -N XRAY_TP 2>/dev/null || true\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 0.0.0.0/8 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 10.0.0.0/8 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 127.0.0.0/8 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 169.254.0.0/16 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 172.16.0.0/12 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 192.168.0.0/16 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 224.0.0.0/4 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -p tcp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
+        printf 'iptables -t mangle -A XRAY_TP -p udp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
+        printf 'iptables -t mangle -A PREROUTING -i %s -j XRAY_TP\n' "$iface"
+        printf 'ip rule add fwmark 0x1 lookup 100 2>/dev/null || true\n'
+        printf 'ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true\n'
         printf '%s-end\n' "$FIREWALL_MARK"
     } >> "$FIREWALL_USER"
-    info "Правила iptables сохранены → $FIREWALL_USER (персистентны)"
+    info "Правила TPROXY сохранены → $FIREWALL_USER (персистентны)"
 }
 
 _unpersist_iptables() {
