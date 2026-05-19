@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260531"
+SCRIPT_VERSION="20260532"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -716,6 +716,8 @@ setup_iptables() {
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
+    # Пропускаем 4game/Lineage2 серверы полностью (GameGuard обнаруживает прокси)
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 109.105.128.0/17 -j RETURN
 
     # TPROXY TCP (весь) → порт 12345
     iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
@@ -776,6 +778,7 @@ _persist_iptables() {
         printf 'iptables -t mangle -A XRAY_TP -d 192.168.0.0/16 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 224.0.0.0/4 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 109.105.128.0/17 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -p tcp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
         printf 'iptables -t mangle -A XRAY_TP -p udp -d 91.108.4.0/22 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
         printf 'iptables -t mangle -A XRAY_TP -p udp -d 91.108.8.0/22 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
