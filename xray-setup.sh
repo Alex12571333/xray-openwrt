@@ -168,7 +168,7 @@ cmd_self_update() {
 _dl() {
     # $1 = URL, $2 = путь назначения ("-" для stdout)
     if command -v curl >/dev/null 2>&1; then
-        curl -L --no-check-certificate -s -f -o "$2" "$1"
+        curl -L -k -s -f -o "$2" "$1"
     else
         wget --no-check-certificate -qO "$2" "$1"
     fi
