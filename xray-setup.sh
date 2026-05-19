@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260526"
+SCRIPT_VERSION="20260527"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -717,9 +717,17 @@ setup_iptables() {
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
 
-    # TPROXY TCP и UDP → порт 12345
+    # TPROXY TCP (весь) → порт 12345
     iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
+
+    # TPROXY UDP только для Telegram (91.108.x.x и 149.154.x.x)
+    # Остальной UDP (игры, Remote Play и т.д.) идёт напрямую
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -d 91.108.4.0/22   -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -d 91.108.8.0/22   -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -d 91.108.12.0/22  -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -d 91.108.16.0/22  -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -d 91.108.56.0/22  -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -d 149.154.160.0/20 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345
 
     # Применяем к входящему LAN-трафику
     iptables -t mangle -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN"
@@ -769,7 +777,12 @@ _persist_iptables() {
         printf 'iptables -t mangle -A XRAY_TP -d 224.0.0.0/4 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -p tcp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
-        printf 'iptables -t mangle -A XRAY_TP -p udp -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
+        printf 'iptables -t mangle -A XRAY_TP -p udp -d 91.108.4.0/22 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
+        printf 'iptables -t mangle -A XRAY_TP -p udp -d 91.108.8.0/22 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
+        printf 'iptables -t mangle -A XRAY_TP -p udp -d 91.108.12.0/22 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
+        printf 'iptables -t mangle -A XRAY_TP -p udp -d 91.108.16.0/22 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
+        printf 'iptables -t mangle -A XRAY_TP -p udp -d 91.108.56.0/22 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
+        printf 'iptables -t mangle -A XRAY_TP -p udp -d 149.154.160.0/20 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 12345\n'
         printf 'iptables -t mangle -A PREROUTING -i %s -j XRAY_TP\n' "$iface"
         printf 'ip rule add fwmark 0x1 lookup 100 2>/dev/null || true\n'
         printf 'ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true\n'
