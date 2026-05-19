@@ -1,7 +1,10 @@
 #!/bin/sh
 # xray-setup.sh — Xray + VLESS подписка для OpenWrt 21.02+ (GL-iNet, OpenWrt)
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
-# Использование: sh xray-setup.sh [sub_url|test]  или без аргументов — меню
+# Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
+
+SCRIPT_VERSION="20260519"
+SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
 XRAY_CONFIG="/etc/xray/config.json"
@@ -127,6 +130,38 @@ _cancel_watchdog() {
     kill "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null || true
     rm -f "$XRAY_WATCHDOG_SCRIPT" "$XRAY_WATCHDOG_OK" "$XRAY_WATCHDOG_PID"
     info "Watchdog отменён"
+}
+
+# ─── Обновление скрипта с GitHub ─────────────────────────────────────────────
+cmd_self_update() {
+    info "Текущая версия: $SCRIPT_VERSION"
+    info "Проверяю обновления..."
+
+    local tmp="${WORK_DIR}/setup_new.sh"
+    wget --no-check-certificate -qO "$tmp" "$SCRIPT_URL" 2>/dev/null \
+        || { warn "Не удалось скачать скрипт с GitHub"; return 1; }
+    [ -s "$tmp" ] || { warn "Скачан пустой файл"; return 1; }
+
+    # Читаем версию из нового скрипта
+    local new_ver
+    new_ver=$(grep '^SCRIPT_VERSION=' "$tmp" | head -1 | sed 's/SCRIPT_VERSION="\(.*\)"/\1/')
+    [ -n "$new_ver" ] || { warn "Не удалось определить версию нового скрипта"; return 1; }
+
+    info "Доступная версия: $new_ver"
+
+    if [ "$new_ver" -le "$SCRIPT_VERSION" ] 2>/dev/null; then
+        info "Скрипт актуален — обновление не требуется"
+        return 0
+    fi
+
+    # Проверяем синтаксис
+    sh -n "$tmp" 2>/dev/null || { warn "Новый скрипт не прошёл проверку синтаксиса"; return 1; }
+
+    # Применяем
+    cp "$tmp" "$XRAY_SELF" && chmod +x "$XRAY_SELF" \
+        || { warn "Не удалось записать скрипт в $XRAY_SELF"; return 1; }
+    info "Скрипт обновлён: $SCRIPT_VERSION → $new_ver"
+    info "Перезапустите: sh $XRAY_SELF"
 }
 
 # ─── base64 -d: BusyBox applet или openssl fallback (GL-iNet / OpenWrt 21.02)
@@ -705,6 +740,7 @@ cmd_status() {
         || printf '  Автозапуск  : выключен\n'
 
     printf '  Автообновл. : %s\n' "$(cron_interval)"
+    printf '  Скрипт      : v%s\n' "$SCRIPT_VERSION"
 
     if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
         printf '  Watchdog    : активен (автооткат при обрыве)\n'
@@ -893,6 +929,7 @@ menu() {
         printf '║  6  Автообновление подписки      ║\n'
         printf '║  7  Удалить всё                  ║\n'
         printf '║  8  Тесты                        ║\n'
+        printf '║  u  Обновить скрипт              ║\n'
         if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
         printf '║  9  Отменить watchdog ⚠           ║\n'
         fi
@@ -934,6 +971,7 @@ menu() {
             6) cmd_autoupdate_menu ;;
             7) cmd_uninstall ;;
             8) cmd_test ;;
+            u|U) cmd_self_update ;;
             9) _cancel_watchdog ;;
             0|q|Q) printf 'Выход\n'; exit 0 ;;
             *) printf 'Неверный выбор\n' ;;
@@ -945,9 +983,10 @@ menu() {
 main() {
     local arg="${1:-${XRAY_SUB_URL:-}}"
     case "$arg" in
-        test)   cmd_test ;;
-        update) update_subscription "" ;;
-        "")     menu ;;
+        test)        cmd_test ;;
+        update)      update_subscription "" ;;
+        self-update) cmd_self_update ;;
+        "")          menu ;;
         *)
             mkdir -p /etc/xray
             printf '%s\n' "$arg" > "$XRAY_SUB_FILE"
