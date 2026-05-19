@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260528"
+SCRIPT_VERSION="20260529"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -707,6 +707,9 @@ setup_iptables() {
     # Цепочка в таблице mangle
     iptables -t mangle -N "$IPTABLES_CHAIN" 2>/dev/null || true
 
+    # Пропускаем уже установленные соединения (фикс для игр при рестарте)
+    iptables -t mangle -A "$IPTABLES_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
     # Пропускаем приватные/зарезервированные адреса
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 0.0.0.0/8      -j RETURN
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 10.0.0.0/8     -j RETURN
@@ -768,6 +771,7 @@ _persist_iptables() {
     {
         printf '%s\n' "$FIREWALL_MARK"
         printf 'iptables -t mangle -N XRAY_TP 2>/dev/null || true\n'
+        printf 'iptables -t mangle -A XRAY_TP -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 0.0.0.0/8 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 10.0.0.0/8 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 127.0.0.0/8 -j RETURN\n'
