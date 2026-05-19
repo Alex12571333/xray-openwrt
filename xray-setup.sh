@@ -226,23 +226,28 @@ install_xray() {
     archive="Xray-linux-${arch}.zip"
     info "Архитектура: $(uname -m) → $archive"
 
-    local api_resp
-    api_resp=$(_dl "$GITHUB_API" -) \
-        || die "Не удалось получить данные из GitHub API"
-    [ -n "$api_resp" ] || die "Пустой ответ от GitHub API"
-
-    local url
-    url=$(printf '%s\n' "$api_resp" \
-        | grep '"browser_download_url"' \
-        | grep "/${archive}\"" \
-        | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' \
-        | head -1)
-    [ -n "$url" ] || die "URL для $archive не найден"
-    info "Скачиваю $archive..."
-
+    # Сначала пробуем прямой URL latest/download (не требует GitHub API)
+    local direct_url="https://github.com/XTLS/Xray-core/releases/latest/download/${archive}"
     local zip="${WORK_DIR}/xray.zip"
-    _dl "$url" "$zip" || die "Ошибка загрузки: $url"
-    [ -s "$zip" ] || die "Архив пустой"
+    info "Скачиваю $archive..."
+    _dl "$direct_url" "$zip"
+    # Если файл не скачался или не zip — пробуем через GitHub API
+    if ! unzip -t "$zip" >/dev/null 2>&1; then
+        info "Прямой URL не сработал — пробую через GitHub API..."
+        local api_resp
+        api_resp=$(_dl "$GITHUB_API" -) \
+            || die "Не удалось получить данные из GitHub API"
+        [ -n "$api_resp" ] || die "Пустой ответ от GitHub API"
+        local url
+        url=$(printf '%s\n' "$api_resp" \
+            | grep '"browser_download_url"' \
+            | grep "/${archive}\"" \
+            | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' \
+            | head -1)
+        [ -n "$url" ] || die "URL для $archive не найден в GitHub API"
+        _dl "$url" "$zip" || die "Ошибка загрузки: $url"
+        unzip -t "$zip" >/dev/null 2>&1 || die "Скачанный архив повреждён. Проверьте интернет-соединение."
+    fi
 
     local ex="${WORK_DIR}/x"
     mkdir -p "$ex"
