@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260534"
+SCRIPT_VERSION="20260535"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -688,10 +688,14 @@ install_cron() {
     local hours="${1:-6}"
     mkdir -p /etc/crontabs
     remove_cron
+    # Обновление подписки
     printf '0 */%s * * * sh %s update >> /var/log/xray-update.log 2>&1 %s\n' \
         "$hours" "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
+    # Обновление геоданных — раз в сутки в 4:00
+    printf '0 4 * * * sh %s geodata >> /var/log/xray-update.log 2>&1 %s\n' \
+        "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
     /etc/init.d/cron restart 2>/dev/null || true
-    info "Автообновление: каждые ${hours} часов"
+    info "Автообновление подписки: каждые ${hours} часов, геоданные: раз в сутки"
 }
 
 remove_cron() {
@@ -1209,6 +1213,7 @@ main() {
     case "$arg" in
         test)        cmd_test ;;
         update)      update_subscription "" ;;
+        geodata)     update_geodata && _fast_restart 2>/dev/null || true ;;
         self-update) cmd_self_update ;;
         "")          menu ;;
         *)
