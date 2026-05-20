@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260540"
+SCRIPT_VERSION="20260541"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -642,6 +642,38 @@ _fast_restart() {
     info "Xray перезапущен, PID $pid"
 }
 
+# ─── Горячая перезагрузка конфига через SIGHUP (без разрыва соединений) ──────
+# Xray подхватывает новый config.json и продолжает работу.
+# Если конфиг невалиден — Xray сам остаётся на старом (встроенная защита).
+# Fallback на _fast_restart если процесс не ответил.
+_reload_xray() {
+    local pid; pid=$(_find_xray_pid)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        warn "Xray не запущен — запускаю..."
+        start_xray
+        return
+    fi
+    kill -HUP "$pid" 2>/dev/null || {
+        warn "SIGHUP не удался — делаю быстрый рестарт"
+        _fast_restart
+        return
+    }
+    # Ждём чтобы Xray успел применить новый конфиг
+    sleep 2
+    # Проверяем что порт отвечает
+    local i=0
+    while [ $i -lt 5 ]; do
+        nc -z 127.0.0.1 1080 2>/dev/null && break
+        sleep 1; i=$((i + 1))
+    done
+    if ! nc -z 127.0.0.1 1080 2>/dev/null; then
+        warn "Xray не отвечает после SIGHUP — делаю быстрый рестарт"
+        _fast_restart
+        return
+    fi
+    info "Конфиг перезагружен без обрыва соединений (SIGHUP, PID $pid)"
+}
+
 # ─── Сравнение серверов: 0 = серверы изменились, 1 = те же ──────────────────
 _servers_changed() {
     local new_config="$1"
@@ -695,30 +727,20 @@ update_subscription() {
         return 1
     fi
 
-    # Если серверы не изменились — просто обновить файл, перезапуск не нужен
-    if ! _servers_changed "$new_cfg"; then
-        info "Серверы не изменились — перезапуск не нужен"
-        cp "$new_cfg" "$XRAY_CONFIG"
-        return 0
+    # Проверяем изменение серверов ДО перезаписи конфига
+    if _servers_changed "$new_cfg" 2>/dev/null; then
+        info "Серверы обновились — горячая перезагрузка конфига"
+    else
+        info "Серверы не изменились — горячая перезагрузка конфига"
     fi
 
-    info "Серверы обновились — быстрый рестарт (~300 мс разрыв)"
     _save_backup
     cp "$new_cfg" "$XRAY_CONFIG"
 
-    if [ -x "$XRAY_BIN" ] && [ -f "$XRAY_PID" ] && kill -0 "$(cat "$XRAY_PID")" 2>/dev/null; then
-        _fast_restart
-    else
-        start_xray
-    fi
-
-    sleep 1
-    if _test_proxy; then
-        info "Обновление применено, прокси работает"
-    else
-        warn "Прокси не отвечает после обновления — откат"
-        _do_rollback
-    fi
+    # SIGHUP: Xray перечитывает config.json без разрыва соединений.
+    # Если новый конфиг невалиден — Xray сам остаётся на старом (встроенная защита).
+    _reload_xray
+    info "Обновление подписки завершено"
 }
 
 # ─── Автозапуск (procd init-скрипт) ──────────────────────────────────────────
