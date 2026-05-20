@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260561"
+SCRIPT_VERSION="20260562"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -1695,6 +1695,7 @@ menu() {
         printf '║  9  Прозрачный прокси (выкл)     ║\n'
         fi
         printf '║  r  Восстановить всё             ║\n'
+        printf '║  c  Сброс сети (iptables+conntrack)║\n'
         printf '║  g  Обновить геоданные           ║\n'
         printf '║  u  Обновить скрипт              ║\n'
         if warp_configured 2>/dev/null; then
@@ -1744,6 +1745,7 @@ menu() {
             8) cmd_test ;;
             9) cmd_tproxy_menu ;;
             r|R) cmd_recover ;;
+            c|C) cmd_netreset ;;
             g|G) update_geodata && info "Перезапустите Xray (пункт 3) чтобы применить" ;;
             u|U) cmd_self_update ;;
             p|P) cmd_warp_menu ;;
@@ -1752,6 +1754,40 @@ menu() {
             *) printf 'Неверный выбор\n' ;;
         esac
     done
+}
+
+# ─── Сброс сети: полная очистка iptables/ip rules/conntrack ──────────────────
+# Убирает ВСЁ что связано с tproxy — даже "призрачные" правила от прошлых запусков.
+# Xray и конфиг НЕ удаляются. После сброса трафик идёт напрямую.
+cmd_netreset() {
+    info "=== Сброс сети ==="
+    info "Останавливаю Xray..."
+    killall xray 2>/dev/null || true
+    rm -f "$XRAY_PID"
+
+    info "Очищаю iptables (все интерфейсы, все дубли)..."
+    for _if in br-lan eth0 eth1 eth0.2 br0; do
+        iptables -t mangle -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+        iptables -t nat   -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    done
+    iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t nat    -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t nat    -X "$IPTABLES_CHAIN" 2>/dev/null || true
+
+    info "Удаляю все ip rule (все дубли)..."
+    while ip rule del fwmark 0x1 lookup 100    2>/dev/null; do :; done
+    while ip rule del fwmark 0x1/0x1 lookup 100 2>/dev/null; do :; done
+    ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+
+    info "Сбрасываю conntrack (зависшие соединения)..."
+    conntrack -F 2>/dev/null || true
+
+    info "Очищаю firewall.user..."
+    _unpersist_iptables
+
+    info "=== Готово: сеть сброшена, трафик идёт напрямую ==="
+    info "Для запуска Xray нажмите r"
 }
 
 # ─── Полное восстановление без ввода URL ─────────────────────────────────────
