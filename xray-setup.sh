@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260544"
+SCRIPT_VERSION="20260545"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -557,6 +557,7 @@ ${warp_ob_line}
       {"type":"field","ip":["geoip:ru","109.105.128.0/17"],"outboundTag":"direct"},
 ${warp_rule_line}
       {"type":"field","domain":["geosite:ru-blocked"],"balancerTag":"balancer"},
+      {"type":"field","port":"2106,7777,9014,2009","balancerTag":"balancer"},
       {"type":"field","network":"tcp,udp","outboundTag":"direct"}
     ]
   },
@@ -887,16 +888,10 @@ setup_iptables() {
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
-    # ── Lineage 2 / 4game — GameGuard обнаруживает прокси, идём напрямую ──────
-    # По IP-диапазону 4game
+    # ── Lineage 2 / 4game ────────────────────────────────────────────────────
+    # Российские серверы 4game — напрямую (GameGuard обнаруживает прокси)
+    # Европейские серверы — через Xray, Xray роутит их в balancer по портам
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 109.105.128.0/17 -j RETURN
-    # По портам — защита на случай серверов вне диапазона
-    # 2106=login, 7777=game, 9014=GameGuard/auth, 2009=alt-login
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 2106 -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 7777 -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 9014 -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp --dport 9014 -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 2009 -j RETURN
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── Управляющий трафик — никогда не перехватываем ────────────────────────
@@ -970,11 +965,6 @@ _persist_iptables() {
         printf 'iptables -t mangle -A XRAY_TP -d 224.0.0.0/4 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 109.105.128.0/17 -j RETURN\n'
-        printf 'iptables -t mangle -A XRAY_TP -p tcp --dport 2106 -j RETURN\n'
-        printf 'iptables -t mangle -A XRAY_TP -p tcp --dport 7777 -j RETURN\n'
-        printf 'iptables -t mangle -A XRAY_TP -p tcp --dport 9014 -j RETURN\n'
-        printf 'iptables -t mangle -A XRAY_TP -p udp --dport 9014 -j RETURN\n'
-        printf 'iptables -t mangle -A XRAY_TP -p tcp --dport 2009 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -p tcp --dport 22 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -p tcp --dport 21115:21119 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -p udp --dport 21115:21116 -j RETURN\n'
