@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260578"
+SCRIPT_VERSION="20260579"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -213,33 +213,89 @@ _updater_daemon() {
         [ "$(cat "$XRAY_UPDATER_PID")" = "$$" ] || return 0
     fi
     printf '%s\n' "$$" > "$XRAY_UPDATER_PID"
+    logger -t xray-upd "Демон запущен (PID $$)"
+
+    # local-объявления вынесены из цикла — в BusyBox ash local внутри while
+    # иногда ведёт себя непредсказуемо.
+    local remote_ver current_ver tmp
+
     while true; do
         sleep 10
-        # Шаг 1: качаем version (10 байт) — почти нет трафика
-        local remote_ver
-        remote_ver=$(wget --no-check-certificate -qO- "$SCRIPT_VERSION_URL" 2>/dev/null \
-            | tr -d ' \r\n')
+
+        # ── Шаг 1: качаем version (10 байт) — почти нет трафика ─────────────
+        # Пробуем через SOCKS5 Xray (если ISP блокирует raw.githubusercontent.com),
+        # при неудаче — напрямую. Та же логика что и в _tg_send.
+        if command -v curl >/dev/null 2>&1; then
+            remote_ver=$(curl -s -k --max-time 6 -x socks5://127.0.0.1:1080 \
+                "$SCRIPT_VERSION_URL" 2>/dev/null | tr -d ' \r\n')
+            [ -z "$remote_ver" ] && \
+                remote_ver=$(curl -s -k --max-time 8 "$SCRIPT_VERSION_URL" 2>/dev/null \
+                    | tr -d ' \r\n')
+        else
+            remote_ver=$(https_proxy=http://127.0.0.1:1081 wget --no-check-certificate \
+                -qO- "$SCRIPT_VERSION_URL" 2>/dev/null | tr -d ' \r\n')
+            [ -z "$remote_ver" ] && \
+                remote_ver=$(wget --no-check-certificate -qO- "$SCRIPT_VERSION_URL" \
+                    2>/dev/null | tr -d ' \r\n')
+        fi
+
+        # Не удалось получить версию — пробуем в следующую итерацию
         [ -z "$remote_ver" ] && continue
+
         # Читаем текущую версию из файла (не из переменной — файл мог обновиться)
-        local current_ver
         current_ver=$(grep '^SCRIPT_VERSION=' "$XRAY_SELF" 2>/dev/null \
             | head -1 | sed 's/SCRIPT_VERSION="\(.*\)"/\1/')
         [ -z "$current_ver" ] && current_ver="$SCRIPT_VERSION"
+
         # Проверяем удалённые команды (remote debug) — каждые 10 сек
         _check_remote_cmd
 
         # Версия та же — ничего не делаем (типичный случай, 99.9% итераций)
         [ "$remote_ver" -le "$current_ver" ] 2>/dev/null && continue
-        # Шаг 2: новая версия — качаем полный скрипт (~60KB, редко)
-        local tmp; tmp=$(mktemp /tmp/xray-upd-XXXXXX.sh 2>/dev/null) || tmp="/tmp/xray-upd-$$.sh"
-        wget --no-check-certificate -qO "$tmp" "$SCRIPT_URL" 2>/dev/null || { rm -f "$tmp"; continue; }
-        [ -s "$tmp" ] || { rm -f "$tmp"; continue; }
-        sh -n "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
-        cp "$tmp" "$XRAY_SELF" && chmod +x "$XRAY_SELF" || { rm -f "$tmp"; continue; }
-        rm -f "$tmp"
-        logger -t xray "Скрипт обновлён: $current_ver → $remote_ver"
-        _tg_send "🔄 Скрипт обновлён: $current_ver → $remote_ver"
-        current_ver="$remote_ver"
+
+        logger -t xray-upd "Новая версия: $current_ver → $remote_ver, скачиваю..."
+
+        # ── Шаг 2: новая версия — качаем полный скрипт (~60KB, редко) ────────
+        tmp=$(mktemp /tmp/xray-upd-XXXXXX.sh 2>/dev/null) || tmp="/tmp/xray-upd-$$.sh"
+
+        local ok=0
+        if command -v curl >/dev/null 2>&1; then
+            curl -L -s -k --max-time 30 -x socks5://127.0.0.1:1080 \
+                -o "$tmp" "$SCRIPT_URL" 2>/dev/null && [ -s "$tmp" ] && ok=1
+            [ "$ok" = 0 ] && \
+                curl -L -s -k --max-time 30 -o "$tmp" "$SCRIPT_URL" 2>/dev/null \
+                    && [ -s "$tmp" ] && ok=1
+        else
+            https_proxy=http://127.0.0.1:1081 wget --no-check-certificate \
+                -qO "$tmp" "$SCRIPT_URL" 2>/dev/null && [ -s "$tmp" ] && ok=1
+            [ "$ok" = 0 ] && \
+                wget --no-check-certificate -qO "$tmp" "$SCRIPT_URL" 2>/dev/null \
+                    && [ -s "$tmp" ] && ok=1
+        fi
+
+        if [ "$ok" = 0 ]; then
+            rm -f "$tmp"
+            logger -t xray-upd "Не удалось скачать скрипт — повтор через 10 сек"
+            continue
+        fi
+
+        # Проверяем синтаксис
+        if ! sh -n "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            logger -t xray-upd "Скрипт не прошёл проверку синтаксиса — пропускаю"
+            continue
+        fi
+
+        # Применяем
+        if cp "$tmp" "$XRAY_SELF" && chmod +x "$XRAY_SELF"; then
+            rm -f "$tmp"
+            logger -t xray-upd "Обновлён: $current_ver → $remote_ver"
+            _tg_send "🔄 Скрипт обновлён: $current_ver → $remote_ver"
+            current_ver="$remote_ver"
+        else
+            rm -f "$tmp"
+            logger -t xray-upd "Ошибка записи скрипта"
+        fi
     done
 }
 
@@ -248,9 +304,12 @@ _start_updater() {
     if [ -f "$XRAY_UPDATER_PID" ] && kill -0 "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null; then
         return 0
     fi
+    # Файл скрипта должен существовать
+    [ -f "$XRAY_SELF" ] || { logger -t xray-upd "XRAY_SELF не найден: $XRAY_SELF"; return 1; }
     # Запускаем демон в фоне
     nohup sh "$XRAY_SELF" _updater_daemon > /dev/null 2>&1 &
     printf '%s\n' "$!" > "$XRAY_UPDATER_PID"
+    logger -t xray-upd "_start_updater: запущен PID $!"
 }
 
 _stop_updater() {
@@ -1998,6 +2057,11 @@ cmd_status() {
         printf '  WARP        : выключен\n'
     fi
     printf '  Скрипт      : v%s\n' "$SCRIPT_VERSION"
+    if [ -f "$XRAY_UPDATER_PID" ] && kill -0 "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null; then
+        printf '  Демон апдейт: запущен (PID %s)\n' "$(cat "$XRAY_UPDATER_PID")"
+    else
+        printf '  Демон апдейт: не запущен\n'
+    fi
     printf '  SSH туннель : %s\n' "$(_tunnel_status)"
 
     if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
