@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260538"
+SCRIPT_VERSION="20260539"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -994,7 +994,8 @@ gen_warp_outbound() {
 WARPJSON
 }
 
-# Перегенерировать конфиг из сохранённых серверов (после смены WARP)
+# Перегенерировать конфиг из сохранённых серверов (после смены WARP/доменов).
+# Пишет во временный файл → валидирует xray -test → бэкап → применяет.
 _regen_config_from_saved() {
     local sf="$XRAY_SERVERS_FILE"
     [ -f "$sf" ] || {
@@ -1008,7 +1009,22 @@ _regen_config_from_saved() {
         parse_vless "$line" "$i" 2>/dev/null || i=$((i - 1))
     done < "$sf"
     [ "$i" -gt 0 ] || { warn "Не удалось распарсить серверы из $sf"; return 1; }
-    gen_config
+
+    # Генерируем во временный файл — не трогаем рабочий конфиг до проверки
+    local tmp_cfg="${WORK_DIR}/config_regen.json"
+    gen_config "$tmp_cfg" || return 1
+
+    # Валидация (только если xray уже установлен)
+    if [ -x "$XRAY_BIN" ]; then
+        if ! XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -test -c "$tmp_cfg" >/dev/null 2>&1; then
+            warn "Новый конфиг не прошёл проверку Xray — текущий конфиг не изменён"
+            return 1
+        fi
+    fi
+
+    _save_backup
+    cp "$tmp_cfg" "$XRAY_CONFIG"
+    info "Конфиг обновлён"
 }
 
 _warp_show_domains() {
@@ -1031,9 +1047,14 @@ _warp_add_domain() {
     _nd=$(printf '%s' "$_nd" | sed 's|https*://||; s|/.*||')
     mkdir -p /etc/xray
     printf '%s\n' "$_nd" >> "$WARP_DOMAINS_FILE"
-    info "Добавлен: $_nd"
-    if _regen_config_from_saved 2>/dev/null; then
-        _fast_restart 2>/dev/null && info "Применено" || warn "Перезапустите Xray (пункт 3)"
+    info "Домен сохранён: $_nd"
+    # Применяем только если WARP настроен (иначе домен будет применён при настройке WARP)
+    if warp_configured 2>/dev/null; then
+        if _regen_config_from_saved 2>/dev/null; then
+            _fast_restart 2>/dev/null && info "Применено" || warn "Перезапустите Xray (пункт 3)"
+        fi
+    else
+        info "WARP не настроен — домен применится после настройки WARP (пункт 1)"
     fi
 }
 
@@ -1041,18 +1062,29 @@ _warp_remove_domain() {
     [ -f "$WARP_DOMAINS_FILE" ] && [ -s "$WARP_DOMAINS_FILE" ] || {
         printf 'Пользовательский список пуст\n'; return
     }
+    # Считаем только реальные домены (без комментариев и пустых строк)
+    local _total; _total=$(grep -v '^#' "$WARP_DOMAINS_FILE" | grep -c '[^[:space:]]' || true)
+    [ "$_total" -gt 0 ] 2>/dev/null || { printf 'Пользовательский список пуст\n'; return; }
+
     printf '\nПользовательские домены:\n'
-    grep -v '^#' "$WARP_DOMAINS_FILE" | grep -v '^$' | awk '{printf "  %d  %s\n", NR, $0}'
+    grep -v '^#' "$WARP_DOMAINS_FILE" | grep '[^[:space:]]' | awk '{printf "  %d  %s\n", NR, $0}'
     printf '\nНомер для удаления (0 — отмена): '; read -r _rn
-    [ "$_rn" = "0" ] || [ -z "$_rn" ] && return
-    local _total; _total=$(grep -v '^#' "$WARP_DOMAINS_FILE" | grep -c '.' || true)
+    case "$_rn" in ''|0) return ;; esac
+
     if [ "$_rn" -gt 0 ] 2>/dev/null && [ "$_rn" -le "$_total" ] 2>/dev/null; then
-        local _dom; _dom=$(grep -v '^#' "$WARP_DOMAINS_FILE" | grep -v '^$' | awk "NR==$_rn")
-        local _tmp; _tmp=$(grep -v "^${_dom}$" "$WARP_DOMAINS_FILE")
+        local _dom; _dom=$(grep -v '^#' "$WARP_DOMAINS_FILE" | grep '[^[:space:]]' | awk "NR==$_rn")
+        # Экранируем спецсимволы regex (точки в доменах: netflix.com → netflix\.com)
+        local _pat; _pat=$(printf '%s' "$_dom" | sed 's/[.[\*^$]/\\&/g')
+        local _tmp; _tmp=$(grep -v "^${_pat}$" "$WARP_DOMAINS_FILE")
         printf '%s\n' "$_tmp" > "$WARP_DOMAINS_FILE"
         info "Удалён: $_dom"
-        if _regen_config_from_saved 2>/dev/null; then
-            _fast_restart 2>/dev/null && info "Применено" || warn "Перезапустите Xray (пункт 3)"
+        # Применяем только если WARP настроен
+        if warp_configured 2>/dev/null; then
+            if _regen_config_from_saved 2>/dev/null; then
+                _fast_restart 2>/dev/null && info "Применено" || warn "Перезапустите Xray (пункт 3)"
+            fi
+        else
+            info "WARP не настроен — изменение применится при настройке WARP"
         fi
     else
         printf 'Неверный номер\n'
@@ -1111,10 +1143,13 @@ cmd_warp_menu() {
                 rm -f "$WARP_CONF"
                 info "WARP удалён"
                 if [ -f "$XRAY_CONFIG" ]; then
-                    _regen_config_from_saved 2>/dev/null \
-                        && _fast_restart 2>/dev/null \
-                        && info "Конфиг обновлён (без WARP)" \
-                        || info "Запустите обновление подписки (пункт 1) для применения."
+                    if _regen_config_from_saved 2>/dev/null; then
+                        _fast_restart 2>/dev/null \
+                            && info "Конфиг обновлён (WARP отключён)" \
+                            || warn "Конфиг обновлён, перезапустите Xray (пункт 3)"
+                    else
+                        info "Запустите обновление подписки (пункт 1) для применения."
+                    fi
                 fi
                 ;;
             4) _warp_show_domains ;;
