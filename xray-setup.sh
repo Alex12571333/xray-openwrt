@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260565"
+SCRIPT_VERSION="20260566"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL=""  # Хранится локально в /etc/xray/sub_url — не нужно указывать здесь
 
@@ -286,11 +286,6 @@ detect_arch() {
 install_xray() {
     if [ -x "$XRAY_BIN" ]; then
         info "Xray уже установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
-        # Проверяем geodata — без них Xray падает сразу при запуске
-        if [ ! -f /etc/xray/geoip.dat ] || [ ! -f /etc/xray/geosite.dat ]; then
-            warn "Geodata отсутствует — скачиваю..."
-            update_geodata || warn "Не удалось скачать geodata — Xray может не запуститься"
-        fi
         return 0
     fi
     info "Xray не найден — устанавливаю из GitHub..."
@@ -324,17 +319,13 @@ install_xray() {
 
     local ex="${WORK_DIR}/x"
     mkdir -p "$ex"
-    unzip -o "$zip" xray geoip.dat geosite.dat -d "$ex" || die "Ошибка распаковки"
+    unzip -o "$zip" xray -d "$ex" || die "Ошибка распаковки"
     [ -f "${ex}/xray" ] || die "Бинарник xray не найден в архиве"
 
     mkdir -p "$(dirname "$XRAY_BIN")" /etc/xray
     mv "${ex}/xray" "$XRAY_BIN" && chmod +x "$XRAY_BIN" \
         || die "Не удалось установить xray в $XRAY_BIN"
-    [ -f "${ex}/geoip.dat"   ] && mv "${ex}/geoip.dat"   /etc/xray/geoip.dat
-    [ -f "${ex}/geosite.dat" ] && mv "${ex}/geosite.dat" /etc/xray/geosite.dat
     info "Xray установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
-    # Скачиваем актуальные геоданные с русскими блокировками (обязательно)
-    update_geodata || warn "Geodata не скачаны — запустите g из меню после установки"
 }
 
 # ─── Скачать файл с попыткой нескольких зеркал ───────────────────────────────
@@ -580,24 +571,6 @@ gen_config() {
         printf "["; for(i=1;i<=NF;i++){if(i>1)printf ","; printf "\"%s\"",$i}; printf "]"
     }')
 
-    # Пробуем получить geosite:ru-blocked (одна попытка скачать если нет)
-    local _has_ru_blocked=0
-    if _has_geosite_ru_blocked; then
-        _has_ru_blocked=1
-    else
-        warn "geosite:ru-blocked не найден — пробую скачать geodata (runetfreedom)..."
-        if update_geodata 2>/dev/null && _has_geosite_ru_blocked; then
-            _has_ru_blocked=1
-            info "Geodata обновлена, geosite:ru-blocked доступен"
-        else
-            warn "Geodata недоступна — используется встроенный список доменов (YouTube, Instagram и др.)"
-        fi
-    fi
-
-    # Встроенный список ВСЕГДА в конфиге; geosite:ru-blocked — дополнительно если скачан
-    local ru_blocked_rule=""
-    [ "$_has_ru_blocked" = 1 ] && \
-        ru_blocked_rule='      {"type":"field","domain":["geosite:ru-blocked"],"balancerTag":"balancer"},'
     # catch-all ВСЕГДА direct — иначе при недоступных прокси весь интернет ломается
     local catchall_tag='"outboundTag":"direct"'
 
@@ -665,13 +638,11 @@ ${warp_ob_line}
     "balancers": [{"tag":"balancer","selector":["proxy1","proxy2","proxy3"],
                    "strategy":{"type":"leastPing"}}],
     "rules": [
-      {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
-      {"type":"field","ip":["geoip:ru","109.105.128.0/17"],"outboundTag":"direct"},
+      {"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4"],"outboundTag":"direct"},
       {"type":"field","domain":["domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
 ${warp_rule_line}
       {"type":"field","ip":${tg_ip_json},"balancerTag":"balancer"},
       {"type":"field","domain":${builtin_json},"balancerTag":"balancer"},
-${ru_blocked_rule}
       {"type":"field","port":"2106,7777,9014,2009","balancerTag":"balancer"},
       {"type":"field","network":"tcp,udp",${catchall_tag}}
     ]
