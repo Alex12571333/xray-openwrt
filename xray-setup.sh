@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260576"
+SCRIPT_VERSION="20260577"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -273,28 +273,48 @@ _tg_configured() {
     local t; t=$(_tg_token); [ -n "$t" ] && [ "$t" != "none" ]
 }
 
+# Вспомогательная функция — строим аргументы прокси для curl/wget.
+# Роутер сам НЕ ходит через tproxy (tproxy только для br-lan).
+# Если Xray запущен — направляем свои запросы через его SOCKS5.
+_tg_proxy_args_curl() {
+    nc -z 127.0.0.1 1080 2>/dev/null && printf '%s' "-x socks5://127.0.0.1:1080" || printf ''
+}
+_tg_proxy_env_wget() {
+    nc -z 127.0.0.1 1080 2>/dev/null && printf '%s' "https_proxy=socks5://127.0.0.1:1080 http_proxy=socks5://127.0.0.1:1080" || printf ''
+}
+
 # Отправить сообщение в Telegram (plain text, до 4096 символов)
+# Возвращает 0 если Telegram ответил "ok":true, иначе 1.
 _tg_send() {
     _tg_configured || return 0
     local text="$1"
     local token; token=$(_tg_token)
     local chat;  chat=$(_tg_chat)
     local url="https://api.telegram.org/bot${token}/sendMessage"
+    local resp
     if command -v curl >/dev/null 2>&1; then
-        curl -s -k --max-time 10 -X POST "$url" \
-            -F "chat_id=${chat}" \
-            -F "text=${text}" \
-            -F "parse_mode=HTML" >/dev/null 2>&1 || true
+        # --data-urlencode: правильное кодирование любых символов (emoji, кириллица)
+        # -x socks5://...: через Xray если запущен (иначе ISP может блокировать)
+        local proxy_arg; proxy_arg=$(_tg_proxy_args_curl)
+        resp=$(curl -s -k --max-time 10 $proxy_arg \
+            --data-urlencode "chat_id=${chat}" \
+            --data-urlencode "text=${text}" \
+            --data-urlencode "parse_mode=HTML" \
+            "$url" 2>/dev/null)
     else
-        # wget fallback — базовая замена спецсимволов
+        # wget fallback: базовое URL-кодирование + прокси если нужен
         local enc
         enc=$(printf '%s' "$text" | \
-            sed 's/%/%25/g; s/&/%26/g; s/+/%2B/g; s/#/%23/g' | \
+            sed 's/%/%25/g; s/&/%26/g; s/+/%2B/g; s/#/%23/g; s/ /+/g' | \
             awk '{printf "%s%s",(NR>1?"%0A":""),$0}')
-        wget --no-check-certificate -qO- \
-            --post-data="chat_id=${chat}&text=${enc}" \
-            "$url" >/dev/null 2>&1 || true
+        local proxy_env; proxy_env=$(_tg_proxy_env_wget)
+        resp=$(env $proxy_env wget --no-check-certificate -qO- \
+            --post-data="chat_id=${chat}&text=${enc}&parse_mode=HTML" \
+            "$url" 2>/dev/null)
     fi
+    # Успех только если Telegram вернул "ok":true
+    printf '%s' "$resp" | grep -q '"ok":true' && return 0
+    return 1
 }
 
 # Отправить длинный текст (вывод команды) — режет по 3800 символов
@@ -307,11 +327,16 @@ _tg_send_output() {
     local token; token=$(_tg_token)
     local chat;  chat=$(_tg_chat)
     local url="https://api.telegram.org/bot${token}/sendMessage"
+    local resp
     if command -v curl >/dev/null 2>&1; then
-        curl -s -k --max-time 15 -X POST "$url" \
-            -F "chat_id=${chat}" \
-            -F "text=${full}" \
-            -F "parse_mode=HTML" >/dev/null 2>&1 || true
+        local proxy_arg; proxy_arg=$(_tg_proxy_args_curl)
+        resp=$(curl -s -k --max-time 15 $proxy_arg \
+            --data-urlencode "chat_id=${chat}" \
+            --data-urlencode "text=${full}" \
+            --data-urlencode "parse_mode=HTML" \
+            "$url" 2>/dev/null)
+        printf '%s' "$resp" | grep -q '"ok":true' && return 0
+        return 1
     else
         _tg_send "$(printf '%s\n%s' "$header" "$body" | head -c 1000)"
     fi
@@ -328,8 +353,37 @@ cmd_tg_setup() {
         printf '  0  Назад\n'
         printf 'Выбор: '; read -r c
         case "$c" in
-            1) _tg_send "✅ Тест: роутер на связи. Xray $(pidof xray >/dev/null 2>&1 && echo запущен || echo остановлен)." \
-               && info "Отправлено" || warn "Ошибка отправки" ;;
+            1)
+                info "Отправляю тест..."
+                if _tg_send "✅ Тест: роутер на связи. Xray $( _xray_is_running && printf 'запущен' || printf 'остановлен')."; then
+                    info "Сообщение доставлено ✓"
+                else
+                    warn "Ошибка: сообщение не доставлено"
+                    # Диагностика
+                    local _tkn; _tkn=$(_tg_token)
+                    local _chat; _chat=$(_tg_chat)
+                    local _resp
+                    if command -v curl >/dev/null 2>&1; then
+                        local _parg; _parg=$(_tg_proxy_args_curl)
+                        _resp=$(curl -s -k --max-time 10 $_parg \
+                            "https://api.telegram.org/bot${_tkn}/getMe" 2>/dev/null)
+                    else
+                        local _penv; _penv=$(_tg_proxy_env_wget)
+                        _resp=$(env $_penv wget --no-check-certificate -qO- \
+                            "https://api.telegram.org/bot${_tkn}/getMe" 2>/dev/null)
+                    fi
+                    if printf '%s' "$_resp" | grep -q '"ok":true'; then
+                        warn "Токен верный, но сообщение не дошло"
+                        warn "Проверь: написал ли /start боту? Chat ID: $_chat"
+                    elif [ -z "$_resp" ]; then
+                        warn "Нет ответа от api.telegram.org"
+                        warn "Возможно Telegram заблокирован ISP и Xray не запущен"
+                        warn "Запусти Xray (пункт 1) и повтори тест"
+                    else
+                        warn "Ответ сервера: $(printf '%s' "$_resp" | head -c 200)"
+                    fi
+                fi
+                ;;
             2) _tg_configure_interactive ;;
             3) printf 'none' > "$XRAY_TG_TOKEN_FILE"; info "Telegram отключён" ;;
         esac
