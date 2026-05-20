@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260535"
+SCRIPT_VERSION="20260536"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -26,6 +26,8 @@ XRAY_WATCHDOG_PID="/tmp/xray-watchdog.pid"
 IPTABLES_CHAIN="XRAY_TP"
 FIREWALL_MARK="# xray-tproxy"
 FIREWALL_USER="/etc/firewall.user"
+WARP_CONF="/etc/xray/warp.conf"
+XRAY_SERVERS_FILE="/etc/xray/servers.txt"
 
 WORK_DIR=$(mktemp -d /tmp/xray-XXXXXX)
 trap 'rm -rf "$WORK_DIR" /tmp/xray_sv_*.env /tmp/xray_ping*.txt 2>/dev/null' EXIT INT TERM
@@ -481,6 +483,17 @@ gen_config() {
     ob2=$(gen_outbound "proxy2" "$([ -f /tmp/xray_sv_2.env ] && echo /tmp/xray_sv_2.env || echo /tmp/xray_sv_1.env)")
     ob3=$(gen_outbound "proxy3" "$([ -f /tmp/xray_sv_3.env ] && echo /tmp/xray_sv_3.env || echo /tmp/xray_sv_1.env)")
 
+    # WARP: опциональный outbound и правило маршрутизации
+    local warp_ob_line="" warp_rule_line=""
+    if warp_configured 2>/dev/null; then
+        local _wo
+        _wo=$(gen_warp_outbound) && {
+            warp_ob_line=$(printf '%s,' "$_wo")
+            warp_rule_line='      {"type":"field","domain":["domain:openai.com","domain:chatgpt.com","domain:oaistatic.com","domain:oaiusercontent.com","domain:sora.com"],"outboundTag":"warp"},'
+            info "WARP включён в конфиг (ChatGPT/OpenAI → Cloudflare)"
+        } || warn "WARP настроен, но gen_warp_outbound вернул ошибку — WARP пропущен"
+    fi
+
     cat > "$dest" << CFGEOF
 {
   "log": {"loglevel":"warning"},
@@ -497,6 +510,7 @@ gen_config() {
 ${ob1},
 ${ob2},
 ${ob3},
+${warp_ob_line}
     {"tag":"direct","protocol":"freedom","settings":{}},
     {"tag":"block","protocol":"blackhole","settings":{}}
   ],
@@ -507,6 +521,7 @@ ${ob3},
     "rules": [
       {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
       {"type":"field","ip":["geoip:ru","109.105.128.0/17"],"outboundTag":"direct"},
+${warp_rule_line}
       {"type":"field","domain":["geosite:ru-blocked"],"balancerTag":"balancer"},
       {"type":"field","network":"tcp,udp","outboundTag":"direct"}
     ]
@@ -601,6 +616,9 @@ update_subscription() {
         parse_vless "$line" "$i" || i=$((i - 1))
     done < "${WORK_DIR}/best.txt"
     [ "$i" -gt 0 ] || die "Не удалось распарсить ни один сервер"
+
+    # Сохраняем серверы для последующей перегенерации (WARP и т.д.)
+    cp "${WORK_DIR}/best.txt" "$XRAY_SERVERS_FILE" 2>/dev/null || true
 
     info "=== Генерация конфига ==="
     local new_cfg="${WORK_DIR}/config_new.json"
@@ -838,6 +856,194 @@ _unpersist_iptables() {
     printf '%s\n' "$tmp" > "$FIREWALL_USER"
 }
 
+# ─── Cloudflare WARP (обход VPN-детекции на OpenAI/ChatGPT) ─────────────────
+# Использует встроенную поддержку WireGuard в Xray — системный интерфейс не нужен.
+# wireguard-tools нужен только для генерации ключей (wg genkey / wg pubkey).
+
+warp_configured() {
+    [ -f "$WARP_CONF" ] || return 1
+    local _k; _k=$(grep '^WARP_CF_PUBKEY=' "$WARP_CONF" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    [ -n "$_k" ]
+}
+
+install_warp_tools() {
+    if command -v wg >/dev/null 2>&1; then
+        info "wireguard-tools уже установлен"
+        return 0
+    fi
+    info "Устанавливаю wireguard-tools через opkg..."
+    opkg update >/dev/null 2>&1 || true
+    opkg install wireguard-tools >/dev/null 2>&1 \
+        || die "Не удалось установить wireguard-tools — попробуйте вручную: opkg install wireguard-tools"
+    command -v wg >/dev/null 2>&1 \
+        || die "wg не найден после установки — проверьте репозитории opkg"
+    info "wireguard-tools установлен"
+}
+
+warp_register() {
+    install_warp_tools
+
+    info "Генерирую WireGuard ключи (Curve25519)..."
+    local priv pub
+    priv=$(wg genkey)                              || die "Ошибка: wg genkey"
+    pub=$(printf '%s' "$priv" | wg pubkey)         || die "Ошибка: wg pubkey"
+    info "Ключи сгенерированы"
+
+    info "Регистрируюсь в Cloudflare WARP API..."
+    local tos
+    tos=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z' 2>/dev/null || printf '2024-01-01T00:00:00.000Z')
+    local body
+    body=$(printf '{"key":"%s","install_id":"","fcm_token":"","tos":"%s","model":"OpenWrt","serial_number":"","locale":"en_US"}' \
+        "$pub" "$tos")
+
+    local resp
+    if command -v curl >/dev/null 2>&1; then
+        resp=$(curl -s -k --max-time 30 -X POST \
+            -H 'CF-Client-Version: a-6.11-2158' \
+            -H 'Content-Type: application/json' \
+            -d "$body" \
+            'https://api.cloudflareclient.com/v0a2158/reg' 2>/dev/null)
+    else
+        resp=$(wget --no-check-certificate -qO- \
+            --post-data="$body" \
+            --header='CF-Client-Version: a-6.11-2158' \
+            --header='Content-Type: application/json' \
+            'https://api.cloudflareclient.com/v0a2158/reg' 2>/dev/null)
+    fi
+    [ -n "$resp" ] || die "Нет ответа от WARP API — проверьте интернет-соединение"
+
+    # Парсим JSON без jq (убираем переносы строк для надёжного grep)
+    local resp1
+    resp1=$(printf '%s' "$resp" | tr -d '\n\r')
+
+    local cf_pubkey endpoint addr4 reserved_raw
+    cf_pubkey=$(printf '%s' "$resp1" | grep -o '"public_key":"[^"]*"' \
+        | head -1 | sed 's/"public_key":"\([^"]*\)"/\1/')
+    # endpoint содержит порт: "v4":"IP:PORT"
+    endpoint=$(printf '%s' "$resp1" | grep -o '"v4":"[0-9.]*:[0-9]*"' \
+        | head -1 | sed 's/"v4":"\([^"]*\)"/\1/')
+    # addr4 — только IP без порта: "v4":"IP"
+    addr4=$(printf '%s' "$resp1" | grep -o '"v4":"[0-9.]*"' \
+        | head -1 | sed 's/"v4":"\([^"]*\)"/\1/')
+    reserved_raw=$(printf '%s' "$resp1" | grep -o '"reserved":\[[^]]*\]' \
+        | sed 's/"reserved":\[//; s/\]//' | tr -d ' ')
+
+    [ -n "$cf_pubkey" ]    || die "Не удалось извлечь CF pubkey из ответа WARP API"
+    [ -n "$endpoint" ]     || { warn "endpoint не найден — использую 162.159.192.1:2408"; endpoint="162.159.192.1:2408"; }
+    [ -n "$addr4" ]        || { warn "адрес не найден — использую 172.16.0.2"; addr4="172.16.0.2"; }
+    [ -n "$reserved_raw" ] || { warn "reserved не найден — использую 0,0,0"; reserved_raw="0,0,0"; }
+
+    mkdir -p /etc/xray
+    cat > "$WARP_CONF" << WARPEOF
+WARP_PRIV_KEY="${priv}"
+WARP_PUB_KEY="${pub}"
+WARP_CF_PUBKEY="${cf_pubkey}"
+WARP_ENDPOINT="${endpoint}"
+WARP_ADDR4="${addr4}"
+WARP_RESERVED="${reserved_raw}"
+WARPEOF
+    chmod 600 "$WARP_CONF"
+    info "WARP зарегистрирован: endpoint=${endpoint}, адрес=${addr4}/32"
+    info "Конфиг WARP → $WARP_CONF"
+}
+
+# Возвращает JSON-объект outbound (без ведущей запятой)
+gen_warp_outbound() {
+    [ -f "$WARP_CONF" ] || return 1
+    . "$WARP_CONF" 2>/dev/null
+    [ -n "$WARP_PRIV_KEY" ] || return 1
+    local reserved_json
+    reserved_json=$(printf '[%s]' "$WARP_RESERVED")
+    cat << WARPJSON
+    {
+      "tag": "warp",
+      "protocol": "wireguard",
+      "settings": {
+        "secretKey": "${WARP_PRIV_KEY}",
+        "address": ["${WARP_ADDR4}/32"],
+        "peers": [{"publicKey": "${WARP_CF_PUBKEY}", "endpoint": "${WARP_ENDPOINT}"}],
+        "reserved": ${reserved_json},
+        "mtu": 1280
+      }
+    }
+WARPJSON
+}
+
+# Перегенерировать конфиг из сохранённых серверов (после смены WARP)
+_regen_config_from_saved() {
+    local sf="$XRAY_SERVERS_FILE"
+    [ -f "$sf" ] || {
+        warn "Нет сохранённых серверов ($sf) — запустите обновление подписки (пункт 1)"
+        return 1
+    }
+    local i=0
+    while IFS= read -r line && [ "$i" -lt 3 ]; do
+        [ -z "$line" ] && continue
+        i=$((i + 1))
+        parse_vless "$line" "$i" 2>/dev/null || i=$((i - 1))
+    done < "$sf"
+    [ "$i" -gt 0 ] || { warn "Не удалось распарсить серверы из $sf"; return 1; }
+    gen_config
+}
+
+cmd_warp_menu() {
+    printf '\n=== WARP / Cloudflare ===\n'
+    printf 'Обходит блокировку VPN на ChatGPT, OpenAI, Sora\n\n'
+    if warp_configured 2>/dev/null; then
+        . "$WARP_CONF" 2>/dev/null
+        printf '  Статус   : настроен ✓\n'
+        printf '  Endpoint : %s\n' "$WARP_ENDPOINT"
+        printf '  Адрес    : %s/32\n' "$WARP_ADDR4"
+        printf '  Домены   : openai.com, chatgpt.com, oaistatic.com\n'
+        printf '             oaiusercontent.com, sora.com\n\n'
+    else
+        printf '  Статус   : не настроен\n\n'
+    fi
+    printf '  1  Настроить WARP (регистрация в Cloudflare)\n'
+    printf '  2  Пересоздать (новая регистрация)\n'
+    printf '  3  Удалить WARP\n'
+    printf '  0  Назад\n\n'
+    printf 'Выбор: '; read -r ch
+    case "$ch" in
+        1)
+            if warp_configured 2>/dev/null; then
+                printf 'WARP уже настроен. Для пересоздания выберите 2.\n'; return
+            fi
+            warp_register || return 1
+            if _regen_config_from_saved 2>/dev/null; then
+                _fast_restart 2>/dev/null \
+                    && info "WARP подключён — ChatGPT/OpenAI теперь через Cloudflare" \
+                    || warn "Конфиг обновлён, перезапустите Xray вручную (пункт 3)"
+            else
+                info "WARP сохранён. Запустите обновление подписки (пункт 1) для применения."
+            fi
+            ;;
+        2)
+            warp_register || return 1
+            if _regen_config_from_saved 2>/dev/null; then
+                _fast_restart 2>/dev/null \
+                    && info "WARP пересоздан и применён" \
+                    || warn "Конфиг обновлён, перезапустите Xray вручную (пункт 3)"
+            else
+                info "WARP обновлён. Запустите обновление подписки (пункт 1) для применения."
+            fi
+            ;;
+        3)
+            rm -f "$WARP_CONF"
+            info "WARP удалён"
+            if [ -f "$XRAY_CONFIG" ]; then
+                if _regen_config_from_saved 2>/dev/null; then
+                    _fast_restart 2>/dev/null \
+                        && info "Конфиг обновлён (WARP отключён)" \
+                        || warn "Конфиг обновлён, перезапустите Xray вручную (пункт 3)"
+                else
+                    info "Запустите обновление подписки (пункт 1) для применения."
+                fi
+            fi
+            ;;
+    esac
+}
+
 cmd_tproxy_menu() {
     local cur; iptables_active && cur="включён" || cur="выключен"
     printf '\nПрозрачный прокси (весь LAN-трафик через Xray): %s\n\n' "$cur"
@@ -890,6 +1096,9 @@ apply_subscription() {
         parse_vless "$line" "$i" || i=$((i - 1))
     done < "${WORK_DIR}/best.txt"
     [ "$i" -gt 0 ] || die "Не удалось распарсить ни один сервер"
+
+    # Сохраняем серверы для последующей перегенерации (WARP и т.д.)
+    cp "${WORK_DIR}/best.txt" "$XRAY_SERVERS_FILE" 2>/dev/null || true
 
     info "=== Генерация конфига ==="
     gen_config
@@ -949,6 +1158,12 @@ cmd_status() {
     iptables_active \
         && printf '  TProxy      : включён (весь LAN через Xray)\n' \
         || printf '  TProxy      : выключен (только ручной прокси)\n'
+    if warp_configured 2>/dev/null; then
+        . "$WARP_CONF" 2>/dev/null
+        printf '  WARP        : настроен ✓ (%s)\n' "$WARP_ENDPOINT"
+    else
+        printf '  WARP        : выключен\n'
+    fi
     printf '  Скрипт      : v%s\n' "$SCRIPT_VERSION"
 
     if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
@@ -1018,7 +1233,7 @@ cmd_uninstall() {
 
     info "Удаляю файлы..."
     rm -f "$XRAY_BIN"
-    rm -rf /etc/xray
+    rm -rf /etc/xray       # удаляет config.json, warp.conf, servers.txt, geodata
     rm -f "$XRAY_LOG"
 
     printf '\nXray полностью удалён\n'
@@ -1156,6 +1371,11 @@ menu() {
         fi
         printf '║  g  Обновить геоданные           ║\n'
         printf '║  u  Обновить скрипт              ║\n'
+        if warp_configured 2>/dev/null; then
+        printf '║  p  WARP/ChatGPT (вкл) ✓        ║\n'
+        else
+        printf '║  p  WARP/ChatGPT (выкл)         ║\n'
+        fi
         if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
         printf '║  w  Отменить watchdog ⚠           ║\n'
         fi
@@ -1200,6 +1420,7 @@ menu() {
             9) cmd_tproxy_menu ;;
             g|G) update_geodata && info "Перезапустите Xray (пункт 3) чтобы применить" ;;
             u|U) cmd_self_update ;;
+            p|P) cmd_warp_menu ;;
             w|W) _cancel_watchdog ;;
             0|q|Q) printf 'Выход\n'; exit 0 ;;
             *) printf 'Неверный выбор\n' ;;
@@ -1214,6 +1435,7 @@ main() {
         test)        cmd_test ;;
         update)      update_subscription "" ;;
         geodata)     update_geodata && _fast_restart 2>/dev/null || true ;;
+        warp)        cmd_warp_menu ;;
         self-update) cmd_self_update ;;
         "")          menu ;;
         *)
