@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260591"
+SCRIPT_VERSION="20260592"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1366,7 +1366,7 @@ ${warp_ob_line}
                    "strategy":{"type":"leastPing"}}],
     "rules": [
       {"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4"],"outboundTag":"direct"},
-      {"type":"field","ip":["109.105.128.0/17"],"outboundTag":"direct"},
+      {"type":"field","ip":["109.105.128.0/17","geoip:ru"],"outboundTag":"direct"},
       {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$","regexp:[.]xn--p1ai$","domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
       {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"balancerTag":"balancer"},
 ${warp_rule_line}
@@ -1714,8 +1714,9 @@ setup_iptables() {
     iptables -t nat -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
     iptables -t nat -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
     iptables -t nat -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
-    # Lineage2/4game — GameGuard обнаруживает прокси
+    # Lineage2/4game/Innova — GameGuard обнаруживает прокси; RU IP диапазон
     iptables -t nat -A "$IPTABLES_CHAIN" -d 109.105.128.0/17 -j RETURN
+    # Остальные российские IP (Xray routing: geoip:ru → direct)
     # SSH — не трогаем управляющий трафик
     iptables -t nat -A "$IPTABLES_CHAIN" -p tcp --dport 22 -j RETURN
 
