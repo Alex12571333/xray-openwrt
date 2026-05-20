@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260548"
+SCRIPT_VERSION="20260549"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -1692,12 +1692,18 @@ main() {
     _selfheal_tproxy  # всегда первым: если tproxy завис без Xray — чиним сразу
     local arg="${1:-${XRAY_SUB_URL:-}}"
     case "$arg" in
-        test)        cmd_test ;;
-        update)      update_subscription "" ;;
-        geodata)     update_geodata && _fast_restart 2>/dev/null || true ;;
-        warp)        cmd_warp_menu ;;
-        self-update) cmd_self_update ;;
-        healthcheck) _selfheal_tproxy ;;
+        test)           cmd_test ;;
+        update)         update_subscription "" ;;
+        geodata)        update_geodata && _fast_restart 2>/dev/null || true ;;
+        warp)           cmd_warp_menu ;;
+        self-update)    cmd_self_update ;;
+        healthcheck)    _selfheal_tproxy ;;
+        autostart-on)   install_init_script && info "Автозапуск включён" ;;
+        autostart-off)  remove_init_script  && info "Автозапуск выключен" ;;
+        cron-on)        install_cron 6      && info "Автообновление включено" ;;
+        cron-off)       remove_cron         && info "Автообновление выключено" ;;
+        tproxy-on)      setup_iptables      && info "Прозрачный прокси включён" ;;
+        tproxy-off)     remove_iptables     && info "Прозрачный прокси выключен" ;;
         "")          menu ;;
         *)
             mkdir -p /etc/xray
