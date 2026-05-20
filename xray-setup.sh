@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260558"
+SCRIPT_VERSION="20260559"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -526,18 +526,23 @@ gen_config() {
     info "Генерирую конфиг: $dest"
     mkdir -p /etc/xray
 
-    # Проверяем geosite:ru-blocked; если недоступен — пробуем скачать geodata
+    # Проверяем geosite:ru-blocked; если недоступен — пробуем скачать geodata (3 попытки)
     local _has_ru_blocked=0
     if _has_geosite_ru_blocked; then
         _has_ru_blocked=1
     else
-        warn "geosite:ru-blocked не найден — обновляю geodata (runetfreedom)..."
-        if update_geodata 2>/dev/null && _has_geosite_ru_blocked; then
-            _has_ru_blocked=1
-            info "Geodata обновлена, geosite:ru-blocked доступен"
-        else
-            warn "geosite:ru-blocked по-прежнему недоступен — весь нероссийский трафик пойдёт через прокси (catch-all → balancer)"
-        fi
+        local _try=1
+        while [ "$_try" -le 3 ]; do
+            warn "geosite:ru-blocked не найден — попытка $_try/3, скачиваю geodata (runetfreedom)..."
+            if update_geodata 2>/dev/null && _has_geosite_ru_blocked; then
+                _has_ru_blocked=1
+                info "Geodata обновлена, geosite:ru-blocked доступен"
+                break
+            fi
+            [ "$_try" -lt 3 ] && { warn "Не удалось, жду 15 сек и повторяю..."; sleep 15; }
+            _try=$((_try + 1))
+        done
+        [ "$_has_ru_blocked" = 0 ] && warn "Geodata недоступна после 3 попыток — продолжаю без geosite:ru-blocked (только прямые маршруты)"
     fi
 
     # Правила маршрутизации в зависимости от наличия geosite:ru-blocked
