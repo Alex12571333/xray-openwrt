@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260562"
+SCRIPT_VERSION="20260563"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -44,6 +44,7 @@ domain:facebook.com,domain:fb.com,domain:fbsbx.com,domain:fbcdn.com,\
 domain:twitter.com,domain:x.com,domain:twimg.com,domain:t.co,\
 domain:tiktok.com,domain:tiktokcdn.com,domain:tiktokv.com,\
 domain:threads.net,\
+domain:telegram.org,domain:t.me,domain:telegram.me,domain:telegra.ph,\
 domain:linkedin.com,domain:licdn.com,\
 domain:pinterest.com,domain:pinimg.com,\
 domain:discord.com,domain:discordapp.com,domain:discordapp.net,\
@@ -55,6 +56,13 @@ domain:patreon.com,\
 domain:soundcloud.com,\
 domain:behance.net,\
 domain:quora.com"
+
+# Встроенные IP-диапазоны Telegram — работают для UDP и TCP без geodata.
+# Официальные ASN Telegram: AS62041, AS59930, AS44907
+PROXY_IPS_BUILTIN="\
+91.108.4.0/22,91.108.8.0/22,91.108.12.0/22,91.108.16.0/22,\
+91.108.56.0/22,91.105.192.0/23,185.76.151.0/24,\
+149.154.160.0/20"
 
 WORK_DIR=$(mktemp -d /tmp/xray-XXXXXX)
 trap 'rm -rf "$WORK_DIR" /tmp/xray_sv_*.env /tmp/xray_ping*.txt 2>/dev/null' EXIT INT TERM
@@ -328,6 +336,24 @@ install_xray() {
     update_geodata || warn "Geodata не скачаны — запустите g из меню после установки"
 }
 
+# ─── Скачать файл с попыткой нескольких зеркал ───────────────────────────────
+_dl_mirrors() {
+    # $1 = имя файла (geoip.dat / geosite.dat), $2 = путь назначения
+    local name="$1" dest="$2"
+    local base="runetfreedom/russia-v2ray-rules-dat/releases/latest/download/${name}"
+    local mirrors="\
+https://github.com/${base}
+https://mirror.ghproxy.com/https://github.com/${base}
+https://ghfast.top/https://github.com/${base}
+https://gh.llkk.cc/https://github.com/${base}"
+    printf '%s\n' "$mirrors" | while IFS= read -r url; do
+        [ -z "$url" ] && continue
+        info "  Пробую: $url"
+        _dl "$url" "$dest" && [ -s "$dest" ] && return 0
+    done
+    return 1
+}
+
 # ─── Обновление геоданных (runetfreedom: geosite:ru-blocked) ─────────────────
 update_geodata() {
     info "Обновляю геоданные (runetfreedom/russia-v2ray-rules-dat)..."
@@ -337,20 +363,20 @@ update_geodata() {
     local tmp_ip="${WORK_DIR}/geoip.dat"
     local tmp_site="${WORK_DIR}/geosite.dat"
 
-    if _dl "$GEODATA_GEOIP" "$tmp_ip" && [ -s "$tmp_ip" ]; then
+    if _dl_mirrors "geoip.dat" "$tmp_ip" && [ -s "$tmp_ip" ]; then
         mv "$tmp_ip" /etc/xray/geoip.dat
         info "geoip.dat обновлён ($(wc -c < /etc/xray/geoip.dat | tr -d ' ') байт)"
         ok=$((ok + 1))
     else
-        warn "Не удалось скачать geoip.dat — используется текущий"
+        warn "Не удалось скачать geoip.dat (все зеркала недоступны)"
     fi
 
-    if _dl "$GEODATA_GEOSITE" "$tmp_site" && [ -s "$tmp_site" ]; then
+    if _dl_mirrors "geosite.dat" "$tmp_site" && [ -s "$tmp_site" ]; then
         mv "$tmp_site" /etc/xray/geosite.dat
         info "geosite.dat обновлён ($(wc -c < /etc/xray/geosite.dat | tr -d ' ') байт)"
         ok=$((ok + 1))
     else
-        warn "Не удалось скачать geosite.dat — используется текущий"
+        warn "Не удалось скачать geosite.dat (все зеркала недоступны)"
     fi
 
     [ "$ok" -gt 0 ] && return 0 || return 1
@@ -574,6 +600,12 @@ gen_config() {
     # catch-all ВСЕГДА direct — иначе при недоступных прокси весь интернет ломается
     local catchall_tag='"outboundTag":"direct"'
 
+    # Встроенные IP Telegram → JSON-массив
+    local tg_ip_json
+    tg_ip_json=$(printf '%s' "$PROXY_IPS_BUILTIN" | tr -d ' \\' | awk -F',' '{
+        printf "["; for(i=1;i<=NF;i++){if(i>1)printf ","; printf "\"%s\"",$i}; printf "]"
+    }')
+
     local ob1 ob2 ob3
     ob1=$(gen_outbound "proxy1" "/tmp/xray_sv_1.env")
     ob2=$(gen_outbound "proxy2" "$([ -f /tmp/xray_sv_2.env ] && echo /tmp/xray_sv_2.env || echo /tmp/xray_sv_1.env)")
@@ -636,6 +668,7 @@ ${warp_ob_line}
       {"type":"field","ip":["geoip:ru","109.105.128.0/17"],"outboundTag":"direct"},
       {"type":"field","domain":["domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
 ${warp_rule_line}
+      {"type":"field","ip":${tg_ip_json},"balancerTag":"balancer"},
       {"type":"field","domain":${builtin_json},"balancerTag":"balancer"},
 ${ru_blocked_rule}
       {"type":"field","port":"2106,7777,9014,2009","balancerTag":"balancer"},
