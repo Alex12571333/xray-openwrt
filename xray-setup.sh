@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260552"
+SCRIPT_VERSION="20260553"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -197,9 +197,9 @@ cmd_self_update() {
         fi
     fi
 
-    # Перезапускаем с новой версией (только в интерактивном режиме)
-    [ -t 0 ] && exec sh "$XRAY_SELF"
-    info "Перезапустите: sh $XRAY_SELF"
+    # Перезапускаем процесс с новой версией скрипта
+    # exec заменяет текущий процесс — меню сразу покажет новый код
+    exec sh "$XRAY_SELF"
 }
 
 # ─── Скачивание файла: curl (с редиректами) или wget ─────────────────────────
