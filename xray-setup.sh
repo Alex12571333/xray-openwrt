@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260585"
+SCRIPT_VERSION="20260586"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -278,6 +278,16 @@ _updater_daemon() {
         if [ "$ok" = 0 ]; then
             rm -f "$tmp"
             logger -t xray-upd "Не удалось скачать скрипт — повтор через 10 сек"
+            continue
+        fi
+
+        # Проверяем версию внутри скачанного файла (защита от CDN-кэша)
+        local file_ver
+        file_ver=$(grep '^SCRIPT_VERSION=' "$tmp" 2>/dev/null \
+            | head -1 | sed 's/SCRIPT_VERSION="\(.*\)"/\1/')
+        if [ -z "$file_ver" ] || [ "$file_ver" -lt "$remote_ver" ] 2>/dev/null; then
+            rm -f "$tmp"
+            logger -t xray-upd "CDN кэш: скачан $file_ver, ожидаем $remote_ver — повтор через 10 сек"
             continue
         fi
 
@@ -2033,6 +2043,7 @@ cmd_status() {
         printf '  Демон апдейт: запущен (PID %s)\n' "$(cat "$XRAY_UPDATER_PID")"
     else
         printf '  Демон апдейт: не запущен\n'
+        printf '  Последний лог: %s\n' "$(logread 2>/dev/null | grep 'xray-upd' | tail -1 | sed 's/.*xray-upd: //')"
     fi
     printf '  SSH туннель : %s\n' "$(_tunnel_status)"
 
