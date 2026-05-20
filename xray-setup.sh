@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260587"
+SCRIPT_VERSION="20260588"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -11,6 +11,7 @@ XRAY_LAST_CMD_FILE="/tmp/xray-last-cmd"
 XRAY_REMOTE_LOG="/var/log/xray-remote.log"
 XRAY_TUNNEL_PID="/tmp/xray-sstunnel.pid"
 XRAY_TUNNEL_CONF="/etc/xray/ssh_tunnel.conf"
+XRAY_TUNNEL_KEY="/etc/xray/tunnel_id_rsa"
 XRAY_TG_TOKEN_FILE="/etc/xray/tg_token"
 XRAY_TG_CHAT_FILE="/etc/xray/tg_chat"
 # Дефолтные значения (перекрываются файлами)
@@ -548,87 +549,87 @@ _check_remote_cmd() {
 # Роутер подключается к serveo.net и создаёт обратный туннель.
 # serveo назначает случайный порт и сообщает его в stdout.
 # Снаружи: ssh -p PORT root@serveo.net
-# Если Xray запущен — соединение с serveo идёт через его SOCKS5 (порт 1080).
-# После подключения адрес отправляется в Telegram.
 # Флаг XRAY_TUNNEL_CONF (/etc/xray/ssh_tunnel.conf) включает автозапуск —
 # healthcheck (cron */5) перезапустит туннель при перезагрузке роутера.
+# Использует Dropbear-совместимые флаги (-y, -K).
+
+_ensure_tunnel_key() {
+    [ -f "$XRAY_TUNNEL_KEY" ] && return 0
+    mkdir -p /etc/xray
+    if command -v dropbearkey >/dev/null 2>&1; then
+        dropbearkey -t rsa -s 2048 -f "$XRAY_TUNNEL_KEY" >/dev/null 2>&1 && return 0
+    fi
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        ssh-keygen -t rsa -b 2048 -f "$XRAY_TUNNEL_KEY" -N "" >/dev/null 2>&1 && return 0
+    fi
+    logger -t xray-tunnel "Не удалось создать SSH-ключ (нет dropbearkey/ssh-keygen)"
+    return 1
+}
 
 _tunnel_daemon() {
     printf '%s\n' "$$" > "$XRAY_TUNNEL_PID"
+    _ensure_tunnel_key || { logger -t xray-tunnel "Нет SSH-ключа — выход"; return 1; }
+
     local attempt=0
     local last_addr=""
 
     while true; do
         attempt=$((attempt + 1))
         local tmpout; tmpout="/tmp/xray-tunnel-out-$$.txt"
-        > "$tmpout"
+        : > "$tmpout"
 
-        # Проверяем доступность SOCKS5 (Xray) и поддержку прокси в nc
-        local use_proxy=0
-        if nc -z 127.0.0.1 1080 2>/dev/null; then
-            if nc --help 2>&1 | grep -q '\-x'; then
-                use_proxy=1
-            fi
-        fi
-
-        # Запускаем SSH с захватом stdout — serveo.net пишет адрес туда
-        if [ "$use_proxy" = 1 ]; then
-            ssh -T -n \
-                -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null \
-                -o ServerAliveInterval=30 \
-                -o ServerAliveCountMax=3 \
-                -o ExitOnForwardFailure=yes \
-                -o "ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p" \
-                -R "0:localhost:22" \
-                serveo.net > "$tmpout" 2>&1 &
-        else
-            ssh -T -n \
-                -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null \
-                -o ServerAliveInterval=30 \
-                -o ServerAliveCountMax=3 \
-                -o ExitOnForwardFailure=yes \
-                -R "0:localhost:22" \
-                serveo.net > "$tmpout" 2>&1 &
-        fi
+        # Dropbear-совместимые флаги:
+        #   -y    = принять любой host key (нет -o StrictHostKeyChecking)
+        #   -K 30 = keepalive 30 сек (нет -o ServerAliveInterval)
+        #   -i    = ключ для авторизации (serveo.net требует ключ)
+        #   < /dev/null = не читать stdin (нет флага -n в Dropbear)
+        ssh -y -K 30 \
+            -i "$XRAY_TUNNEL_KEY" \
+            -R "0:localhost:22" \
+            serveo.net \
+            < /dev/null > "$tmpout" 2>&1 &
         local ssh_pid=$!
 
-        # Ждём появления адреса (до 15 сек, шаг 1 сек)
+        # Ждём появления адреса (до 20 сек)
         local i=0
-        while [ "$i" -lt 15 ]; do
+        while [ "$i" -lt 20 ]; do
             sleep 1
-            grep -q 'Forwarding TCP\|tcp://' "$tmpout" 2>/dev/null && break
+            grep -q 'Forwarding TCP\|tcp://\|Allocated port' "$tmpout" 2>/dev/null && break
             kill -0 "$ssh_pid" 2>/dev/null || break
             i=$((i + 1))
         done
 
-        # Парсим назначенный адрес
-        local addr
-        addr=$(grep -o 'tcp://[^ ]*\|serveo\.net:[0-9]*' "$tmpout" 2>/dev/null | head -1)
-        local port
+        # Парсим назначенный порт — serveo.net выдаёт одно из:
+        #   "Forwarding TCP connections from tcp://serveo.net:PORT"
+        #   "Allocated port PORT for remote forward to localhost:22"
+        local addr port
+        addr=$(grep -o 'tcp://[^ ]*' "$tmpout" 2>/dev/null | head -1)
         port=$(printf '%s' "$addr" | grep -o '[0-9]*$')
+        if [ -z "$port" ]; then
+            port=$(grep -o 'Allocated port [0-9]*' "$tmpout" 2>/dev/null \
+                | grep -o '[0-9]*$' | head -1)
+            [ -n "$port" ] && addr="tcp://serveo.net:${port}"
+        fi
 
-        if [ -n "$addr" ] && [ "$addr" != "$last_addr" ]; then
+        if [ -n "$port" ] && [ "$addr" != "$last_addr" ]; then
             last_addr="$addr"
             logger -t xray-tunnel "Туннель открыт: $addr"
             _tg_send "🔐 SSH туннель открыт!
-  Адрес: $addr
   Команда: ssh -p ${port} root@serveo.net
   (работает из любой точки мира)"
         elif kill -0 "$ssh_pid" 2>/dev/null; then
             : # SSH работает, адрес тот же — не спамим Telegram
         else
-            logger -t xray-tunnel "Туннель: нет ответа от serveo.net (попытка $attempt)"
-            _tg_send "⚠️ SSH туннель: нет ответа от serveo.net (попытка $attempt)" 2>/dev/null || true
+            local err; err=$(tr '\n' ' ' < "$tmpout" 2>/dev/null | cut -c1-200)
+            logger -t xray-tunnel "Нет ответа от serveo.net (попытка $attempt): $err"
+            [ "$attempt" -le 3 ] && \
+                _tg_send "⚠️ SSH туннель: нет ответа (попытка $attempt): $err" 2>/dev/null || true
         fi
 
-        # Ждём завершения SSH
         wait "$ssh_pid" 2>/dev/null
         rm -f "$tmpout"
-
         logger -t xray-tunnel "Туннель закрыт, повтор через 30 сек."
-        last_addr=""   # сбрасываем — при переподключении пришлём новый адрес
+        last_addr=""
         sleep 30
     done
 }
