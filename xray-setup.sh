@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260545"
+SCRIPT_VERSION="20260546"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -555,6 +555,7 @@ ${warp_ob_line}
     "rules": [
       {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
       {"type":"field","ip":["geoip:ru","109.105.128.0/17"],"outboundTag":"direct"},
+      {"type":"field","domain":["domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
 ${warp_rule_line}
       {"type":"field","domain":["geosite:ru-blocked"],"balancerTag":"balancer"},
       {"type":"field","port":"2106,7777,9014,2009","balancerTag":"balancer"},
