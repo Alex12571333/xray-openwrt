@@ -3,12 +3,14 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260573"
+SCRIPT_VERSION="20260576"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
 XRAY_LAST_CMD_FILE="/tmp/xray-last-cmd"
 XRAY_REMOTE_LOG="/var/log/xray-remote.log"
+XRAY_TUNNEL_PID="/tmp/xray-sstunnel.pid"
+XRAY_TUNNEL_CONF="/etc/xray/ssh_tunnel.conf"
 XRAY_TG_TOKEN_FILE="/etc/xray/tg_token"
 XRAY_TG_CHAT_FILE="/etc/xray/tg_chat"
 # Дефолтные значения (перекрываются файлами)
@@ -395,6 +397,170 @@ _check_remote_cmd() {
     # Отправляем результат в Telegram
     _tg_send_output "🔧 CMD v${cmd_ver}: ${cmd_str}" "$output"
     logger -t xray-remote "CMD done v${cmd_ver}"
+}
+
+# ─── SSH обратный туннель (доступ из любой точки мира) ───────────────────────
+# Роутер подключается к serveo.net и создаёт обратный туннель.
+# serveo назначает случайный порт и сообщает его в stdout.
+# Снаружи: ssh -p PORT root@serveo.net
+# Если Xray запущен — соединение с serveo идёт через его SOCKS5 (порт 1080).
+# После подключения адрес отправляется в Telegram.
+# Флаг XRAY_TUNNEL_CONF (/etc/xray/ssh_tunnel.conf) включает автозапуск —
+# healthcheck (cron */5) перезапустит туннель при перезагрузке роутера.
+
+_tunnel_daemon() {
+    printf '%s\n' "$$" > "$XRAY_TUNNEL_PID"
+    local attempt=0
+    local last_addr=""
+
+    while true; do
+        attempt=$((attempt + 1))
+        local tmpout; tmpout="/tmp/xray-tunnel-out-$$.txt"
+        > "$tmpout"
+
+        # Проверяем доступность SOCKS5 (Xray) и поддержку прокси в nc
+        local use_proxy=0
+        if nc -z 127.0.0.1 1080 2>/dev/null; then
+            if nc --help 2>&1 | grep -q '\-x'; then
+                use_proxy=1
+            fi
+        fi
+
+        # Запускаем SSH с захватом stdout — serveo.net пишет адрес туда
+        if [ "$use_proxy" = 1 ]; then
+            ssh -T -n \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ServerAliveInterval=30 \
+                -o ServerAliveCountMax=3 \
+                -o ExitOnForwardFailure=yes \
+                -o "ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p" \
+                -R "0:localhost:22" \
+                serveo.net > "$tmpout" 2>&1 &
+        else
+            ssh -T -n \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ServerAliveInterval=30 \
+                -o ServerAliveCountMax=3 \
+                -o ExitOnForwardFailure=yes \
+                -R "0:localhost:22" \
+                serveo.net > "$tmpout" 2>&1 &
+        fi
+        local ssh_pid=$!
+
+        # Ждём появления адреса (до 15 сек, шаг 1 сек)
+        local i=0
+        while [ "$i" -lt 15 ]; do
+            sleep 1
+            grep -q 'Forwarding TCP\|tcp://' "$tmpout" 2>/dev/null && break
+            kill -0 "$ssh_pid" 2>/dev/null || break
+            i=$((i + 1))
+        done
+
+        # Парсим назначенный адрес
+        local addr
+        addr=$(grep -o 'tcp://[^ ]*\|serveo\.net:[0-9]*' "$tmpout" 2>/dev/null | head -1)
+        local port
+        port=$(printf '%s' "$addr" | grep -o '[0-9]*$')
+
+        if [ -n "$addr" ] && [ "$addr" != "$last_addr" ]; then
+            last_addr="$addr"
+            logger -t xray-tunnel "Туннель открыт: $addr"
+            _tg_send "🔐 SSH туннель открыт!
+  Адрес: $addr
+  Команда: ssh -p ${port} root@serveo.net
+  (работает из любой точки мира)"
+        elif kill -0 "$ssh_pid" 2>/dev/null; then
+            : # SSH работает, адрес тот же — не спамим Telegram
+        else
+            logger -t xray-tunnel "Туннель: нет ответа от serveo.net (попытка $attempt)"
+            _tg_send "⚠️ SSH туннель: нет ответа от serveo.net (попытка $attempt)" 2>/dev/null || true
+        fi
+
+        # Ждём завершения SSH
+        wait "$ssh_pid" 2>/dev/null
+        rm -f "$tmpout"
+
+        logger -t xray-tunnel "Туннель закрыт, повтор через 30 сек."
+        last_addr=""   # сбрасываем — при переподключении пришлём новый адрес
+        sleep 30
+    done
+}
+
+_start_tunnel() {
+    if [ -f "$XRAY_TUNNEL_PID" ] && kill -0 "$(cat "$XRAY_TUNNEL_PID")" 2>/dev/null; then
+        info "Туннель уже запущен (PID $(cat "$XRAY_TUNNEL_PID"))"
+        return 0
+    fi
+    if ! command -v ssh >/dev/null 2>&1; then
+        warn "ssh не найден — установите: opkg install openssh-client"
+        return 1
+    fi
+    # Флаг автозапуска — healthcheck перезапустит туннель при старте роутера
+    touch "$XRAY_TUNNEL_CONF"
+    nohup sh "$XRAY_SELF" _tunnel_daemon > /dev/null 2>&1 &
+    printf '%s\n' "$!" > "$XRAY_TUNNEL_PID"
+    info "Туннель запущен (PID $!)"
+    info "Адрес придёт в Telegram через ~10 секунд"
+}
+
+_stop_tunnel() {
+    # Удаляем флаг автозапуска
+    rm -f "$XRAY_TUNNEL_CONF"
+    [ -f "$XRAY_TUNNEL_PID" ] || { info "Туннель не запущен"; return 0; }
+    local pid; pid=$(cat "$XRAY_TUNNEL_PID")
+    kill "$pid" 2>/dev/null || true
+    rm -f "$XRAY_TUNNEL_PID"
+    # Убиваем SSH-процесс к serveo.net если остался
+    local ssh_pid
+    ssh_pid=$(ps 2>/dev/null | grep 'ssh.*serveo' | grep -v grep | awk '{print $1}')
+    [ -n "$ssh_pid" ] && kill "$ssh_pid" 2>/dev/null || true
+    info "Туннель остановлен"
+}
+
+_tunnel_status() {
+    if [ -f "$XRAY_TUNNEL_PID" ] && kill -0 "$(cat "$XRAY_TUNNEL_PID")" 2>/dev/null; then
+        printf 'активен (PID %s)' "$(cat "$XRAY_TUNNEL_PID")"
+        return 0
+    fi
+    printf 'выключен'
+    return 1
+}
+
+_start_tunnel_if_configured() {
+    [ -f "$XRAY_TUNNEL_CONF" ] || return 0
+    # Уже запущен?
+    [ -f "$XRAY_TUNNEL_PID" ] && kill -0 "$(cat "$XRAY_TUNNEL_PID")" 2>/dev/null && return 0
+    _start_tunnel 2>/dev/null || true
+}
+
+cmd_ssh_anywhere() {
+    printf '\n=== SSH туннель (доступ из любой точки мира) ===\n\n'
+    local _ts; _ts=$(_tunnel_status)
+    printf '  Статус: %s\n' "$_ts"
+    if [ -f "$XRAY_TUNNEL_CONF" ]; then
+        printf '  Автозапуск: включён (healthcheck перезапустит при перезагрузке)\n'
+    else
+        printf '  Автозапуск: выключен\n'
+    fi
+    printf '\n'
+    printf '  Как пользоваться:\n'
+    printf '    1. Включите туннель — адрес придёт в Telegram\n'
+    printf '    2. Команда: ssh -p PORT root@serveo.net\n'
+    printf '    3. При перезагрузке роутера туннель стартует автоматически\n'
+    printf '       (если включено автообновление — cron пункт 6)\n'
+    printf '\n'
+    printf '  1  Запустить туннель\n'
+    printf '  2  Остановить туннель\n'
+    printf '  0  Назад\n\n'
+    printf 'Выбор: '; read -r ch
+    case "$ch" in
+        1) _start_tunnel ;;
+        2) _stop_tunnel ;;
+        0|'') return 0 ;;
+        *) printf 'Неверный выбор\n' ;;
+    esac
 }
 
 # ─── Обновление скрипта с GitHub ─────────────────────────────────────────────
@@ -1767,6 +1933,7 @@ cmd_status() {
         printf '  WARP        : выключен\n'
     fi
     printf '  Скрипт      : v%s\n' "$SCRIPT_VERSION"
+    printf '  SSH туннель : %s\n' "$(_tunnel_status)"
 
     if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
         printf '  Watchdog    : активен (автооткат при обрыве)\n'
@@ -1995,6 +2162,11 @@ menu() {
         else
         printf '║  t  Telegram (выкл)              ║\n'
         fi
+        if [ -f "$XRAY_TUNNEL_CONF" ]; then
+        printf '║  s  SSH туннель (вкл) ✓          ║\n'
+        else
+        printf '║  s  SSH туннель (выкл)           ║\n'
+        fi
         printf '║  0  Выход                        ║\n'
         printf '╚══════════════════════════════════╝\n'
         printf 'Выбор: '; read -r choice
@@ -2041,6 +2213,7 @@ menu() {
             p|P) cmd_warp_menu ;;
             w|W) _cancel_watchdog ;;
             t|T) cmd_tg_setup ;;
+            s|S) cmd_ssh_anywhere ;;
             0|q|Q) printf 'Выход\n'; exit 0 ;;
             *) printf 'Неверный выбор\n' ;;
         esac
@@ -2227,13 +2400,16 @@ main() {
         self-update)    cmd_self_update ;;
         script-check)   cmd_script_check ;;
         _updater_daemon) _updater_daemon ;;
-        healthcheck)    _selfheal_tproxy; _start_updater ;;
+        _tunnel_daemon)  _tunnel_daemon ;;
+        healthcheck)    _selfheal_tproxy; _start_updater; _start_tunnel_if_configured ;;
         autostart-on)   install_init_script && info "Автозапуск включён" ;;
         autostart-off)  remove_init_script  && info "Автозапуск выключен" ;;
         cron-on)        install_cron 6      && info "Автообновление включено" ;;
         cron-off)       remove_cron         && info "Автообновление выключено" ;;
         tproxy-on)      setup_iptables      && info "Прозрачный прокси включён" ;;
         tproxy-off)     remove_iptables     && info "Прозрачный прокси выключен" ;;
+        tunnel-on)      _start_tunnel ;;
+        tunnel-off)     _stop_tunnel ;;
         "")          menu ;;
         *)
             mkdir -p /etc/xray
