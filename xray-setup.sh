@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260564"
+SCRIPT_VERSION="20260565"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL=""  # Хранится локально в /etc/xray/sub_url — не нужно указывать здесь
 
@@ -30,6 +30,7 @@ FIREWALL_USER="/etc/firewall.user"
 WARP_CONF="/etc/xray/warp.conf"
 WARP_DOMAINS_FILE="/etc/xray/warp_domains.txt"
 XRAY_SERVERS_FILE="/etc/xray/servers.txt"
+XRAY_EXCLUDED_IPS_FILE="/etc/xray/excluded_ips"
 
 # Домены, которые всегда идут через WARP (детектируют VPN)
 # AI-сервисы, дизайн, заметки — datacenter IP блокируют
@@ -980,6 +981,16 @@ _tproxy_attach() {
     iptables -t mangle -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
 }
 
+# Добавляет RETURN-правила для IP из файла исключений (обходят tproxy полностью)
+_apply_excluded_ips() {
+    [ -f "$XRAY_EXCLUDED_IPS_FILE" ] || return 0
+    while IFS= read -r _ip; do
+        [ -z "$_ip" ] && continue
+        case "$_ip" in '#'*) continue ;; esac
+        iptables -t mangle -A "$IPTABLES_CHAIN" -s "$_ip" -j RETURN 2>/dev/null || true
+    done < "$XRAY_EXCLUDED_IPS_FILE"
+}
+
 setup_iptables() {
     local iface; iface=$(_lan_iface)
     info "Настраиваю TPROXY (TCP+UDP, $iface → :12345)..."
@@ -998,6 +1009,9 @@ setup_iptables() {
 
     # Цепочка в таблице mangle
     iptables -t mangle -N "$IPTABLES_CHAIN" 2>/dev/null || true
+
+    # ── Исключённые устройства (не трогаем их трафик вообще) ─────────────────
+    _apply_excluded_ips
 
     # Пропускаем приватные/зарезервированные адреса
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 0.0.0.0/8      -j RETURN
@@ -1081,6 +1095,14 @@ _persist_iptables() {
     {
         printf '%s\n' "$FIREWALL_MARK"
         printf 'iptables -t mangle -N XRAY_TP 2>/dev/null || true\n'
+        # Исключённые устройства
+        if [ -f "$XRAY_EXCLUDED_IPS_FILE" ]; then
+            while IFS= read -r _eip; do
+                [ -z "$_eip" ] && continue
+                case "$_eip" in '#'*) continue ;; esac
+                printf 'iptables -t mangle -A XRAY_TP -s %s -j RETURN\n' "$_eip"
+            done < "$XRAY_EXCLUDED_IPS_FILE"
+        fi
         printf 'iptables -t mangle -A XRAY_TP -d 0.0.0.0/8 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 10.0.0.0/8 -j RETURN\n'
         printf 'iptables -t mangle -A XRAY_TP -d 127.0.0.0/8 -j RETURN\n'
@@ -1729,6 +1751,13 @@ menu() {
         fi
         printf '║  r  Восстановить всё             ║\n'
         printf '║  c  Сброс сети (iptables+conntrack)║\n'
+        local excl_count=0
+        [ -s "$XRAY_EXCLUDED_IPS_FILE" ] && excl_count=$(grep -c '[0-9]' "$XRAY_EXCLUDED_IPS_FILE" 2>/dev/null || printf '0')
+        if [ "$excl_count" -gt 0 ] 2>/dev/null; then
+        printf '║  x  Исключить ПК из прокси [%s]   ║\n' "$excl_count"
+        else
+        printf '║  x  Исключить ПК из прокси       ║\n'
+        fi
         printf '║  g  Обновить геоданные           ║\n'
         printf '║  u  Обновить скрипт              ║\n'
         if warp_configured 2>/dev/null; then
@@ -1779,6 +1808,7 @@ menu() {
             9) cmd_tproxy_menu ;;
             r|R) cmd_recover ;;
             c|C) cmd_netreset ;;
+            x|X) cmd_exclude_pc ;;
             g|G) update_geodata && info "Перезапустите Xray (пункт 3) чтобы применить" ;;
             u|U) cmd_self_update ;;
             p|P) cmd_warp_menu ;;
@@ -1821,6 +1851,99 @@ cmd_netreset() {
 
     info "=== Готово: сеть сброшена, трафик идёт напрямую ==="
     info "Для запуска Xray нажмите r"
+}
+
+# ─── Исключить ПК из tproxy (авто-определение по SSH_CLIENT) ─────────────────
+# Запускать по SSH с того компьютера который нужно исключить.
+# IP определяется автоматически из $SSH_CLIENT — не нужно вводить вручную.
+cmd_exclude_pc() {
+    printf '\n'
+    info "=== Исключение устройства из прозрачного прокси ==="
+
+    # Показываем текущий список
+    if [ -s "$XRAY_EXCLUDED_IPS_FILE" ]; then
+        info "Текущие исключения:"
+        local n=0
+        while IFS= read -r _ip; do
+            [ -z "$_ip" ] && continue
+            case "$_ip" in '#'*) continue ;; esac
+            n=$((n+1))
+            printf '   %d. %s\n' "$n" "$_ip"
+        done < "$XRAY_EXCLUDED_IPS_FILE"
+    else
+        info "Список исключений пуст"
+    fi
+
+    printf '\n'
+    printf '  a  Добавить этот компьютер (авто)\n'
+    printf '  d  Ввести IP вручную\n'
+    printf '  c  Очистить весь список\n'
+    printf '  0  Назад\n'
+    printf 'Выбор: '; read -r xchoice
+
+    case "$xchoice" in
+        a|A)
+            # Авто-определяем IP из SSH-сессии
+            local pc_ip=""
+            pc_ip=$(printf '%s' "$SSH_CLIENT" | awk '{print $1}')
+            # Fallback через who (некоторые системы)
+            if [ -z "$pc_ip" ] || [ "$pc_ip" = "?" ]; then
+                pc_ip=$(who 2>/dev/null | awk 'NR==1{gsub(/[()]/,"",$NF); print $NF}')
+            fi
+            if [ -z "$pc_ip" ] || [ "$pc_ip" = "?" ]; then
+                warn "Не удалось определить IP автоматически"
+                warn "Убедитесь что скрипт запущен по SSH, или используйте вариант 'd'"
+                return 1
+            fi
+            _add_excluded_ip "$pc_ip"
+            ;;
+        d|D)
+            printf 'Введите IP устройства (например 192.168.8.100): '
+            read -r manual_ip
+            [ -z "$manual_ip" ] && return 0
+            _add_excluded_ip "$manual_ip"
+            ;;
+        c|C)
+            printf 'Точно очистить список? (y/N): '; read -r confirm
+            case "$confirm" in y|Y)
+                rm -f "$XRAY_EXCLUDED_IPS_FILE"
+                info "Список исключений очищен"
+                # Перестраиваем iptables если активны
+                if iptables_active 2>/dev/null; then
+                    local iface; iface=$(_lan_iface)
+                    setup_iptables
+                fi
+                ;;
+            esac
+            ;;
+        0|'') return 0 ;;
+    esac
+}
+
+_add_excluded_ip() {
+    local pc_ip="$1"
+    mkdir -p /etc/xray
+    info "IP устройства: $pc_ip"
+    # Без дублей
+    if grep -qF "$pc_ip" "$XRAY_EXCLUDED_IPS_FILE" 2>/dev/null; then
+        info "IP $pc_ip уже в списке исключений"
+    else
+        printf '%s\n' "$pc_ip" >> "$XRAY_EXCLUDED_IPS_FILE"
+        info "Добавлен в список: $pc_ip"
+    fi
+    # Применяем сразу если tproxy активен
+    if iptables_active 2>/dev/null; then
+        # Вставляем в начало цепочки (перед всеми правилами)
+        iptables -t mangle -I "$IPTABLES_CHAIN" 1 -s "$pc_ip" -j RETURN 2>/dev/null && \
+            info "✓ Правило применено — трафик с $pc_ip обходит прокси" || \
+            warn "Не удалось применить правило — переключите прокси (9→выкл→вкл)"
+        # Обновляем persist
+        local iface; iface=$(_lan_iface)
+        _persist_iptables "$iface"
+    else
+        info "Сохранено — правило применится при включении прокси (пункт 9)"
+    fi
+    info "Совет: зафиксируйте IP $pc_ip в DHCP-резервации роутера чтобы он не менялся"
 }
 
 # ─── Полное восстановление без ввода URL ─────────────────────────────────────
