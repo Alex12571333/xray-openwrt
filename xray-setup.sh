@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260566"
+SCRIPT_VERSION="20260567"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL=""  # Хранится локально в /etc/xray/sub_url — не нужно указывать здесь
 
@@ -188,6 +188,28 @@ _cancel_watchdog() {
 }
 
 # ─── Обновление скрипта с GitHub ─────────────────────────────────────────────
+# Быстрая проверка версии для cron — скачивает только первые строки скрипта.
+# Если версия новее — применяет без перезапуска Xray (скрипт это просто файл).
+# Вызывается из cron каждые 15 минут.
+cmd_script_check() {
+    local tmp="${WORK_DIR}/setup_ver.sh"
+    # Скачиваем только начало файла для извлечения версии
+    _dl "$SCRIPT_URL" "$tmp" 2>/dev/null || return 0
+    [ -s "$tmp" ] || return 0
+    local new_ver
+    new_ver=$(grep '^SCRIPT_VERSION=' "$tmp" | head -1 | sed 's/SCRIPT_VERSION="\(.*\)"/\1/')
+    [ -n "$new_ver" ] || return 0
+    if [ "$new_ver" -le "$SCRIPT_VERSION" ] 2>/dev/null; then
+        return 0  # Актуально — ничего не делаем
+    fi
+    # Проверяем синтаксис нового скрипта
+    sh -n "$tmp" 2>/dev/null || { warn "script-check: новый скрипт не прошёл синтаксис"; return 1; }
+    # Применяем — просто заменяем файл, Xray не трогаем
+    cp "$tmp" "$XRAY_SELF" && chmod +x "$XRAY_SELF" \
+        || { warn "script-check: не удалось записать скрипт"; return 1; }
+    info "Скрипт обновлён автоматически: $SCRIPT_VERSION → $new_ver (Xray не перезапускался)"
+}
+
 cmd_self_update() {
     info "Текущая версия: $SCRIPT_VERSION"
     info "Проверяю обновления..."
@@ -217,19 +239,14 @@ cmd_self_update() {
         || { warn "Не удалось записать скрипт в $XRAY_SELF"; return 1; }
     info "Скрипт обновлён: $SCRIPT_VERSION → $new_ver"
 
-    # Немедленно применяем самовосстановление:
-    # если tproxy активен а Xray не запущен — интернет сломан, чиним сразу
-    if iptables -t mangle -L XRAY_TP >/dev/null 2>&1; then
-        if ! pidof xray >/dev/null 2>&1; then
-            local _iface; _iface=$(_lan_iface)
-            iptables -t mangle -D PREROUTING -i "$_iface" -j XRAY_TP 2>/dev/null || true
-            warn "tproxy снят — интернет восстановлен"
-        fi
-    fi
+    # Обновление скрипта НЕ требует перезапуска Xray — просто новый файл на диске.
+    # Xray продолжает работать, соединения (RustDesk и др.) не прерываются.
 
-    # Перезапускаем процесс с новой версией скрипта
-    # exec заменяет текущий процесс — меню сразу покажет новый код
-    exec sh "$XRAY_SELF"
+    # В интерактивном режиме (терминал) — перезапускаем скрипт чтобы меню
+    # сразу работало с новым кодом. В cron — просто выходим.
+    if [ -t 0 ]; then
+        exec sh "$XRAY_SELF"
+    fi
 }
 
 # ─── Скачивание файла: curl (с редиректами) или wget ─────────────────────────
@@ -900,17 +917,19 @@ install_cron() {
     local hours="${1:-6}"
     mkdir -p /etc/crontabs
     remove_cron
-    # Самовосстановление tproxy — каждые 5 минут
+    # Самовосстановление tproxy — каждые 5 минут (без сети, мгновенно)
     printf '*/5 * * * * sh %s healthcheck %s\n' \
         "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
-    # Обновление скрипта с GitHub + обновление подписки — каждые N часов
-    printf '0 */%s * * * sh %s self-update >> /var/log/xray-update.log 2>&1; sh %s update >> /var/log/xray-update.log 2>&1 %s\n' \
-        "$hours" "$XRAY_SELF" "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
-    # Обновление геоданных — раз в сутки в 4:00
-    printf '0 4 * * * sh %s geodata >> /var/log/xray-update.log 2>&1 %s\n' \
+    # Проверка новой версии скрипта на GitHub — каждые 15 минут.
+    # Если версия новее — скачивает и заменяет файл БЕЗ перезапуска Xray.
+    # Соединения (RustDesk, браузер) не прерываются.
+    printf '*/15 * * * * sh %s script-check >> /var/log/xray-update.log 2>&1 %s\n' \
         "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
+    # Обновление серверов подписки — каждые N часов через SIGHUP (без обрыва соединений)
+    printf '0 */%s * * * sh %s update >> /var/log/xray-update.log 2>&1 %s\n' \
+        "$hours" "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
     /etc/init.d/cron restart 2>/dev/null || true
-    info "Автообновление: скрипт+подписка каждые ${hours} ч., healthcheck каждые 5 мин."
+    info "Автообновление: скрипт каждые 15 мин., подписка каждые ${hours} ч., healthcheck каждые 5 мин."
 }
 
 remove_cron() {
@@ -1969,6 +1988,7 @@ main() {
         geodata)        update_geodata && _fast_restart 2>/dev/null || true ;;
         warp)           cmd_warp_menu ;;
         self-update)    cmd_self_update ;;
+        script-check)   cmd_script_check ;;
         healthcheck)    _selfheal_tproxy ;;
         autostart-on)   install_init_script && info "Автозапуск включён" ;;
         autostart-off)  remove_init_script  && info "Автозапуск выключен" ;;
