@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260560"
+SCRIPT_VERSION="20260561"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -1022,17 +1022,22 @@ setup_iptables() {
 
 remove_iptables() {
     local iface; iface=$(_lan_iface)
-    # mangle
-    iptables -t mangle -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    # Удаляем PREROUTING-хук для всех возможных интерфейсов (на случай переименования)
+    for _if in "$iface" br-lan eth0 eth1; do
+        iptables -t mangle -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+        iptables -t nat   -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    done
+    # Чистим и удаляем цепочку
     iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
-    # nat (старые правила)
-    iptables -t nat -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -t nat -F "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -t nat -X "$IPTABLES_CHAIN" 2>/dev/null || true
-    # ip rule/route
-    ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
+    iptables -t nat    -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t nat    -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    # ip rule/route — удаляем ВСЕ дубли (могли накопиться от нескольких вызовов setup)
+    while ip rule del fwmark 0x1 lookup 100    2>/dev/null; do :; done
+    while ip rule del fwmark 0x1/0x1 lookup 100 2>/dev/null; do :; done
     ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+    # Сбрасываем conntrack — убираем зависшие соединения (нужен пакет conntrack-tools)
+    conntrack -F 2>/dev/null || true
     _unpersist_iptables
     info "Прозрачный прокси отключён"
 }
