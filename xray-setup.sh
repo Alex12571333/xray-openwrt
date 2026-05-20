@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260539"
+SCRIPT_VERSION="20260540"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -61,16 +61,22 @@ _test_proxy() {
 # Остановить Xray и восстановить резервный конфиг (или просто остановить)
 _do_rollback() {
     warn "=== ОТКАТ ==="
-    [ -f "$XRAY_PID" ] && kill "$(cat "$XRAY_PID")" 2>/dev/null; rm -f "$XRAY_PID"
-    killall xray 2>/dev/null || true
+    _stop_xray 2>/dev/null || {
+        [ -f "$XRAY_PID" ] && kill "$(cat "$XRAY_PID")" 2>/dev/null
+        killall xray 2>/dev/null || true
+        rm -f "$XRAY_PID"
+    }
     sleep 1
     if [ -f "$XRAY_CONFIG_BAK" ]; then
         cp "$XRAY_CONFIG_BAK" "$XRAY_CONFIG"
         warn "Восстановлен старый конфиг, перезапускаю Xray..."
-        XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
-        local pid=$!
+        _start_xray_proc 2>/dev/null || {
+            XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
+            printf '%s\n' "$!" > "$XRAY_PID"
+        }
         sleep 1
-        kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid" > "$XRAY_PID" \
+        local pid; pid=$(_find_xray_pid 2>/dev/null)
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
             && warn "Xray запущен со старым конфигом (PID $pid)" \
             || warn "Старый Xray тоже не запустился — процесс остановлен"
     else
@@ -558,43 +564,80 @@ CFGEOF
     info "Конфиг записан"
 }
 
-# ─── Запуск Xray (полный — kill + sleep + start) ──────────────────────────────
-start_xray() {
-    mkdir -p /var/run
-    if [ -f "$XRAY_PID" ]; then
-        kill "$(cat "$XRAY_PID")" 2>/dev/null || true
-        rm -f "$XRAY_PID"
+# ─── Найти PID запущенного Xray (procd или ручной запуск) ────────────────────
+_find_xray_pid() {
+    # 1. Наш PID-файл ещё актуален?
+    if [ -f "$XRAY_PID" ] && kill -0 "$(cat "$XRAY_PID")" 2>/dev/null; then
+        cat "$XRAY_PID"; return 0
     fi
+    # 2. Ищем через pidof (BusyBox)
+    local p; p=$(pidof xray 2>/dev/null | awk '{print $1}')
+    [ -n "$p" ] && printf '%s' "$p"
+}
+
+# Проверка: запущен ли Xray (порт + PID)
+_xray_is_running() {
+    local pid; pid=$(_find_xray_pid)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# ─── Остановить Xray с учётом procd ──────────────────────────────────────────
+_stop_xray() {
+    # Если procd управляет Xray — используем init-скрипт чтобы procd не respawn'ил
+    if autostart_enabled 2>/dev/null; then
+        "$XRAY_INIT" stop 2>/dev/null || true
+        sleep 1
+    fi
+    # Добиваем на случай если procd ещё не успел или автозапуск выключен
+    local pid; pid=$(_find_xray_pid)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     killall xray 2>/dev/null || true
-    sleep 1
-    mkdir -p "$(dirname "$XRAY_LOG")"
+    rm -f "$XRAY_PID"
+}
+
+# ─── Запустить Xray с учётом procd ───────────────────────────────────────────
+_start_xray_proc() {
+    mkdir -p /var/run "$(dirname "$XRAY_LOG")"
     _rotate_log
-    XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
-    local pid=$!
-    sleep 1
-    kill -0 "$pid" 2>/dev/null || die "Xray упал сразу — проверьте лог: $XRAY_LOG"
-    printf '%s\n' "$pid" > "$XRAY_PID"
+    if autostart_enabled 2>/dev/null; then
+        # procd запускает и отслеживает процесс сам
+        "$XRAY_INIT" start 2>/dev/null
+        sleep 2
+    else
+        XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
+        printf '%s\n' "$!" > "$XRAY_PID"
+        sleep 1
+    fi
+    # Обновляем PID-файл (нужно если procd стартовал процесс)
+    local pid; pid=$(_find_xray_pid)
+    [ -n "$pid" ] && printf '%s\n' "$pid" > "$XRAY_PID"
+}
+
+# ─── Запуск Xray (полный — stop + start) ─────────────────────────────────────
+start_xray() {
+    _stop_xray
+    _start_xray_proc
+    local pid; pid=$(_find_xray_pid)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+        || die "Xray упал сразу — проверьте лог: $XRAY_LOG"
     info "Xray запущен, PID $pid"
 }
 
 # ─── Быстрый рестарт — минимальный разрыв (~300 мс) ─────────────────────────
 # Используется при обновлении подписки когда серверы изменились.
-# Старый процесс убивается немедленно, новый стартует без sleep 1.
-# Ждём готовности через nc -z (до 5 с).
+# При включённом автозапуске использует init-скрипт — исключает race с procd.
 _fast_restart() {
-    [ -f "$XRAY_PID" ] && kill "$(cat "$XRAY_PID")" 2>/dev/null; rm -f "$XRAY_PID"
-    killall xray 2>/dev/null || true
-    mkdir -p /var/run "$(dirname "$XRAY_LOG")"
-    _rotate_log
-    XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
-    local pid=$!
+    _stop_xray
+    _start_xray_proc
+    # Ждём готовности порта (до 5 с)
     local i=0
     while [ $i -lt 5 ]; do
-        sleep 1
         nc -z 127.0.0.1 1080 2>/dev/null && break
-        i=$((i + 1))
+        sleep 1; i=$((i + 1))
     done
-    kill -0 "$pid" 2>/dev/null || die "Xray не запустился — проверьте лог: $XRAY_LOG"
+    local pid; pid=$(_find_xray_pid)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+        || die "Xray не запустился — проверьте лог: $XRAY_LOG"
     printf '%s\n' "$pid" > "$XRAY_PID"
     info "Xray перезапущен, PID $pid"
 }
@@ -1254,8 +1297,9 @@ cmd_status() {
         printf '  Xray        : не установлен\n'
     fi
 
-    if [ -f "$XRAY_PID" ] && kill -0 "$(cat "$XRAY_PID")" 2>/dev/null; then
-        printf '  Процесс     : запущен (PID %s)\n' "$(cat "$XRAY_PID")"
+    local _pid; _pid=$(_find_xray_pid)
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+        printf '  Процесс     : запущен (PID %s)\n' "$_pid"
     else
         printf '  Процесс     : не запущен\n'
     fi
@@ -1452,8 +1496,8 @@ cmd_test() {
 # ─── Меню ─────────────────────────────────────────────────────────────────────
 menu() {
     while true; do
-        local run_status="●" pid_info=""
-        if [ -f "$XRAY_PID" ] && kill -0 "$(cat "$XRAY_PID")" 2>/dev/null; then
+        local run_status="●"
+        if _xray_is_running 2>/dev/null; then
             run_status="▶ запущен"
         else
             run_status="■ остановлен"
@@ -1526,8 +1570,7 @@ menu() {
                 ;;
             4)
                 info "Останавливаю xray..."
-                [ -f "$XRAY_PID" ] && kill "$(cat "$XRAY_PID")" 2>/dev/null || true
-                killall xray 2>/dev/null || true; rm -f "$XRAY_PID"
+                _stop_xray
                 printf 'Xray остановлен\n'
                 ;;
             5) cmd_autostart_menu ;;
