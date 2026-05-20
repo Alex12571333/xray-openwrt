@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260580"
+SCRIPT_VERSION="20260581"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -225,18 +225,19 @@ _updater_daemon() {
         # ── Шаг 1: качаем version (10 байт) — почти нет трафика ─────────────
         # Пробуем через SOCKS5 Xray (если ISP блокирует raw.githubusercontent.com),
         # при неудаче — напрямую. Та же логика что и в _tg_send.
+        # Прямо → SOCKS5 (GitHub обычно доступен напрямую, SOCKS5 как резерв)
         if command -v curl >/dev/null 2>&1; then
-            remote_ver=$(curl -s -k --max-time 6 -x socks5://127.0.0.1:1080 \
+            remote_ver=$(curl -s -k --max-time 8 \
                 "$SCRIPT_VERSION_URL" 2>/dev/null | tr -d ' \r\n')
             [ -z "$remote_ver" ] && \
-                remote_ver=$(curl -s -k --max-time 8 "$SCRIPT_VERSION_URL" 2>/dev/null \
-                    | tr -d ' \r\n')
+                remote_ver=$(curl -s -k --max-time 10 -x socks5://127.0.0.1:1080 \
+                "$SCRIPT_VERSION_URL" 2>/dev/null | tr -d ' \r\n')
         else
-            remote_ver=$(https_proxy=http://127.0.0.1:1081 wget --no-check-certificate \
-                -qO- "$SCRIPT_VERSION_URL" 2>/dev/null | tr -d ' \r\n')
+            remote_ver=$(wget --no-check-certificate -qO- "$SCRIPT_VERSION_URL" \
+                2>/dev/null | tr -d ' \r\n')
             [ -z "$remote_ver" ] && \
-                remote_ver=$(wget --no-check-certificate -qO- "$SCRIPT_VERSION_URL" \
-                    2>/dev/null | tr -d ' \r\n')
+                remote_ver=$(https_proxy=http://127.0.0.1:1081 wget --no-check-certificate \
+                -qO- "$SCRIPT_VERSION_URL" 2>/dev/null | tr -d ' \r\n')
         fi
 
         # Не удалось получить версию — пробуем в следующую итерацию
@@ -258,19 +259,20 @@ _updater_daemon() {
         # ── Шаг 2: новая версия — качаем полный скрипт (~60KB, редко) ────────
         tmp=$(mktemp /tmp/xray-upd-XXXXXX.sh 2>/dev/null) || tmp="/tmp/xray-upd-$$.sh"
 
+        # Прямо → SOCKS5 (GitHub обычно доступен напрямую, SOCKS5 как резерв)
         local ok=0
         if command -v curl >/dev/null 2>&1; then
-            curl -L -s -k --max-time 30 -x socks5://127.0.0.1:1080 \
+            curl -L -s -k --max-time 30 \
                 -o "$tmp" "$SCRIPT_URL" 2>/dev/null && [ -s "$tmp" ] && ok=1
             [ "$ok" = 0 ] && \
-                curl -L -s -k --max-time 30 -o "$tmp" "$SCRIPT_URL" 2>/dev/null \
-                    && [ -s "$tmp" ] && ok=1
+                curl -L -s -k --max-time 30 -x socks5://127.0.0.1:1080 \
+                -o "$tmp" "$SCRIPT_URL" 2>/dev/null && [ -s "$tmp" ] && ok=1
         else
-            https_proxy=http://127.0.0.1:1081 wget --no-check-certificate \
+            wget --no-check-certificate \
                 -qO "$tmp" "$SCRIPT_URL" 2>/dev/null && [ -s "$tmp" ] && ok=1
             [ "$ok" = 0 ] && \
-                wget --no-check-certificate -qO "$tmp" "$SCRIPT_URL" 2>/dev/null \
-                    && [ -s "$tmp" ] && ok=1
+                https_proxy=http://127.0.0.1:1081 wget --no-check-certificate \
+                -qO "$tmp" "$SCRIPT_URL" 2>/dev/null && [ -s "$tmp" ] && ok=1
         fi
 
         if [ "$ok" = 0 ]; then
@@ -772,16 +774,19 @@ cmd_self_update() {
 # ─── Скачивание файла: curl (с редиректами) или wget ─────────────────────────
 _dl() {
     # $1 = URL, $2 = путь назначения ("-" для stdout)
-    # Стратегия: SOCKS5 (Xray) → прямо. Если SOCKS5 не слушает — curl сразу
-    # получает connection refused и переходит к прямому без задержки.
+    # Стратегия: прямо → SOCKS5 (Xray).
+    # GitHub/raw.githubusercontent.com обычно доступен напрямую.
+    # SOCKS5 как резерв — если прямой путь заблокирован ISP.
+    # (Telegram наоборот: в _tg_send сначала SOCKS5 — там ISP блокирует напрямую.)
     if command -v curl >/dev/null 2>&1; then
-        curl -L -k -s -f -x socks5://127.0.0.1:1080 --max-time 15 -o "$2" "$1" 2>/dev/null \
-            && return 0
-        curl -L -k -s -f --max-time 20 -o "$2" "$1"
+        curl -L -k -s -f --max-time 15 -o "$2" "$1" 2>/dev/null && return 0
+        curl -L -k -s -f -x socks5://127.0.0.1:1080 --max-time 20 -o "$2" "$1" 2>/dev/null && return 0
+        return 1
     else
+        wget --no-check-certificate -qO "$2" "$1" 2>/dev/null && return 0
         https_proxy=http://127.0.0.1:1081 \
             wget --no-check-certificate -qO "$2" "$1" 2>/dev/null && return 0
-        wget --no-check-certificate -qO "$2" "$1"
+        return 1
     fi
 }
 
