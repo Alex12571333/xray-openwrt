@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260547"
+SCRIPT_VERSION="20260548"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -185,6 +185,19 @@ cmd_self_update() {
     cp "$tmp" "$XRAY_SELF" && chmod +x "$XRAY_SELF" \
         || { warn "Не удалось записать скрипт в $XRAY_SELF"; return 1; }
     info "Скрипт обновлён: $SCRIPT_VERSION → $new_ver"
+
+    # Немедленно применяем самовосстановление:
+    # если tproxy активен а Xray не запущен — интернет сломан, чиним сразу
+    if iptables -t mangle -L XRAY_TP >/dev/null 2>&1; then
+        if ! pidof xray >/dev/null 2>&1; then
+            local _iface; _iface=$(_lan_iface)
+            iptables -t mangle -D PREROUTING -i "$_iface" -j XRAY_TP 2>/dev/null || true
+            warn "tproxy снят — интернет восстановлен"
+        fi
+    fi
+
+    # Перезапускаем с новой версией (только в интерактивном режиме)
+    [ -t 0 ] && exec sh "$XRAY_SELF"
     info "Перезапустите: sh $XRAY_SELF"
 }
 
