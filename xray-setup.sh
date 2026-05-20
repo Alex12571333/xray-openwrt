@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260546"
+SCRIPT_VERSION="20260547"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -812,14 +812,17 @@ install_cron() {
     local hours="${1:-6}"
     mkdir -p /etc/crontabs
     remove_cron
-    # Обновление подписки
-    printf '0 */%s * * * sh %s update >> /var/log/xray-update.log 2>&1 %s\n' \
-        "$hours" "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
+    # Самовосстановление tproxy — каждые 5 минут
+    printf '*/5 * * * * sh %s healthcheck %s\n' \
+        "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
+    # Обновление скрипта с GitHub + обновление подписки — каждые N часов
+    printf '0 */%s * * * sh %s self-update >> /var/log/xray-update.log 2>&1; sh %s update >> /var/log/xray-update.log 2>&1 %s\n' \
+        "$hours" "$XRAY_SELF" "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
     # Обновление геоданных — раз в сутки в 4:00
     printf '0 4 * * * sh %s geodata >> /var/log/xray-update.log 2>&1 %s\n' \
         "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
     /etc/init.d/cron restart 2>/dev/null || true
-    info "Автообновление подписки: каждые ${hours} часов, геоданные: раз в сутки"
+    info "Автообновление: скрипт+подписка каждые ${hours} ч., healthcheck каждые 5 мин."
 }
 
 remove_cron() {
@@ -1661,8 +1664,19 @@ menu() {
     done
 }
 
+# ─── Самовосстановление: tproxy активен но Xray не запущен → убрать хук ──────
+# Вызывается при каждом запуске скрипта — до любых других действий.
+_selfheal_tproxy() {
+    iptables_active 2>/dev/null || return 0   # tproxy не активен — всё ок
+    _xray_is_running 2>/dev/null && return 0  # Xray жив — всё ок
+    # tproxy перехватывает трафик, Xray мёртв → интернет у всех сломан
+    warn "Авторемонт: tproxy активен, Xray не запущен — снимаю перехват трафика"
+    _tproxy_detach 2>/dev/null || true
+}
+
 # ─── Точка входа ──────────────────────────────────────────────────────────────
 main() {
+    _selfheal_tproxy  # всегда первым: если tproxy завис без Xray — чиним сразу
     local arg="${1:-${XRAY_SUB_URL:-}}"
     case "$arg" in
         test)        cmd_test ;;
@@ -1670,6 +1684,7 @@ main() {
         geodata)     update_geodata && _fast_restart 2>/dev/null || true ;;
         warp)        cmd_warp_menu ;;
         self-update) cmd_self_update ;;
+        healthcheck) _selfheal_tproxy ;;
         "")          menu ;;
         *)
             mkdir -p /etc/xray
