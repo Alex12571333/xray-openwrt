@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260569"
+SCRIPT_VERSION="20260570"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 DEFAULT_SUB_URL=""  # Хранится локально в /etc/xray/sub_url — не нужно указывать здесь
@@ -20,7 +20,9 @@ GITHUB_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 GEODATA_GEOIP="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"
 GEODATA_GEOSITE="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat"
 XRAY_LOG="/var/log/xray.log"
-XRAY_LOG_MAX=262144   # 256 КБ — при превышении оставляем последние 128 КБ
+XRAY_LOG_MAX=262144    # 256 КБ — при превышении оставляем последние 128 КБ
+XRAY_UPDLOG="/var/log/xray-update.log"
+XRAY_UPDLOG_MAX=51200  # 50 КБ — ротируем до 25 КБ
 XRAY_CONFIG_BAK="${XRAY_CONFIG}.bak"
 XRAY_WATCHDOG_SCRIPT="/tmp/xray-watchdog.sh"
 XRAY_WATCHDOG_OK="/tmp/xray-watchdog-ok"
@@ -250,6 +252,7 @@ _stop_updater() {
 # Шаг 2: только если версия новее — качает полный скрипт и применяет.
 # Xray НЕ перезапускается — RustDesk и все соединения продолжают работать.
 cmd_script_check() {
+    _rotate_updlog
     # Шаг 1: лёгкая проверка версии (10 байт)
     local remote_ver
     remote_ver=$(_dl "$SCRIPT_VERSION_URL" - 2>/dev/null | tr -d ' \r\n')
@@ -335,13 +338,21 @@ _b64d() {
     fi
 }
 
-# ─── Ротация лога: обрезаем до 128 КБ при превышении 256 КБ ──────────────────
+# ─── Ротация логов ────────────────────────────────────────────────────────────
 _rotate_log() {
     [ -f "$XRAY_LOG" ] || return 0
     local sz; sz=$(wc -c < "$XRAY_LOG" | tr -d ' ')
     [ "$sz" -le "$XRAY_LOG_MAX" ] && return 0
     tail -c 131072 "$XRAY_LOG" > "${XRAY_LOG}.tmp" \
         && mv "${XRAY_LOG}.tmp" "$XRAY_LOG" || true
+}
+
+_rotate_updlog() {
+    [ -f "$XRAY_UPDLOG" ] || return 0
+    local sz; sz=$(wc -c < "$XRAY_UPDLOG" | tr -d ' ')
+    [ "$sz" -le "$XRAY_UPDLOG_MAX" ] && return 0
+    tail -c 25600 "$XRAY_UPDLOG" > "${XRAY_UPDLOG}.tmp" \
+        && mv "${XRAY_UPDLOG}.tmp" "$XRAY_UPDLOG" || true
 }
 
 # ─── URL-decode ───────────────────────────────────────────────────────────────
@@ -987,14 +998,9 @@ install_cron() {
     # Самовосстановление tproxy — каждые 5 минут (без сети, мгновенно)
     printf '*/5 * * * * sh %s healthcheck %s\n' \
         "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
-    # Проверка новой версии скрипта на GitHub — каждую минуту.
-    # Сначала качает version (10 байт), только при изменении — полный скрипт.
-    # Xray не перезапускается, соединения (RustDesk и др.) не прерываются.
-    printf '* * * * * sh %s script-check >> /var/log/xray-update.log 2>&1 %s\n' \
-        "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
     # Обновление серверов подписки — каждые N часов через SIGHUP (без обрыва соединений)
-    printf '0 */%s * * * sh %s update >> /var/log/xray-update.log 2>&1 %s\n' \
-        "$hours" "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
+    printf '0 */%s * * * sh %s update >> %s 2>&1 %s\n' \
+        "$hours" "$XRAY_SELF" "$XRAY_UPDLOG" "$CRON_MARKER" >> "$XRAY_CRON"
     /etc/init.d/cron restart 2>/dev/null || true
     # Запускаем демон немедленно — не ждём первого healthcheck
     _start_updater
