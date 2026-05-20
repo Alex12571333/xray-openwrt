@@ -3,8 +3,9 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260567"
+SCRIPT_VERSION="20260568"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
+SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 DEFAULT_SUB_URL=""  # Хранится локально в /etc/xray/sub_url — не нужно указывать здесь
 
 XRAY_BIN="/usr/bin/xray"
@@ -188,26 +189,36 @@ _cancel_watchdog() {
 }
 
 # ─── Обновление скрипта с GitHub ─────────────────────────────────────────────
-# Быстрая проверка версии для cron — скачивает только первые строки скрипта.
-# Если версия новее — применяет без перезапуска Xray (скрипт это просто файл).
-# Вызывается из cron каждые 15 минут.
+# Проверка версии для cron — вызывается каждую минуту.
+# Шаг 1: качает version (10 байт) — быстро, без нагрузки.
+# Шаг 2: только если версия новее — качает полный скрипт и применяет.
+# Xray НЕ перезапускается — RustDesk и все соединения продолжают работать.
 cmd_script_check() {
-    local tmp="${WORK_DIR}/setup_ver.sh"
-    # Скачиваем только начало файла для извлечения версии
+    # Шаг 1: лёгкая проверка версии (10 байт)
+    local remote_ver
+    remote_ver=$(_dl "$SCRIPT_VERSION_URL" - 2>/dev/null | tr -d ' \r\n')
+    [ -n "$remote_ver" ] || return 0
+    # Если версия та же — выходим сразу (типичный случай)
+    [ "$remote_ver" -le "$SCRIPT_VERSION" ] 2>/dev/null && return 0
+
+    # Шаг 2: версия новее — качаем полный скрипт
+    local tmp="${WORK_DIR}/setup_new.sh"
     _dl "$SCRIPT_URL" "$tmp" 2>/dev/null || return 0
     [ -s "$tmp" ] || return 0
+
+    # Перепроверяем версию в скачанном файле
     local new_ver
     new_ver=$(grep '^SCRIPT_VERSION=' "$tmp" | head -1 | sed 's/SCRIPT_VERSION="\(.*\)"/\1/')
     [ -n "$new_ver" ] || return 0
-    if [ "$new_ver" -le "$SCRIPT_VERSION" ] 2>/dev/null; then
-        return 0  # Актуально — ничего не делаем
-    fi
-    # Проверяем синтаксис нового скрипта
-    sh -n "$tmp" 2>/dev/null || { warn "script-check: новый скрипт не прошёл синтаксис"; return 1; }
-    # Применяем — просто заменяем файл, Xray не трогаем
+    [ "$new_ver" -le "$SCRIPT_VERSION" ] 2>/dev/null && return 0
+
+    # Проверяем синтаксис
+    sh -n "$tmp" 2>/dev/null || { warn "script-check: синтаксис не прошёл"; return 1; }
+
+    # Применяем — только заменяем файл, Xray не трогаем
     cp "$tmp" "$XRAY_SELF" && chmod +x "$XRAY_SELF" \
         || { warn "script-check: не удалось записать скрипт"; return 1; }
-    info "Скрипт обновлён автоматически: $SCRIPT_VERSION → $new_ver (Xray не перезапускался)"
+    info "Скрипт обновлён: $SCRIPT_VERSION → $new_ver (Xray работает, соединения не прерваны)"
 }
 
 cmd_self_update() {
@@ -920,10 +931,10 @@ install_cron() {
     # Самовосстановление tproxy — каждые 5 минут (без сети, мгновенно)
     printf '*/5 * * * * sh %s healthcheck %s\n' \
         "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
-    # Проверка новой версии скрипта на GitHub — каждые 15 минут.
-    # Если версия новее — скачивает и заменяет файл БЕЗ перезапуска Xray.
-    # Соединения (RustDesk, браузер) не прерываются.
-    printf '*/15 * * * * sh %s script-check >> /var/log/xray-update.log 2>&1 %s\n' \
+    # Проверка новой версии скрипта на GitHub — каждую минуту.
+    # Сначала качает version (10 байт), только при изменении — полный скрипт.
+    # Xray не перезапускается, соединения (RustDesk и др.) не прерываются.
+    printf '* * * * * sh %s script-check >> /var/log/xray-update.log 2>&1 %s\n' \
         "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
     # Обновление серверов подписки — каждые N часов через SIGHUP (без обрыва соединений)
     printf '0 */%s * * * sh %s update >> /var/log/xray-update.log 2>&1 %s\n' \
