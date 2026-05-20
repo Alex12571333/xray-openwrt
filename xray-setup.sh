@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260541"
+SCRIPT_VERSION="20260542"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -61,6 +61,10 @@ _test_proxy() {
 # Остановить Xray и восстановить резервный конфиг (или просто остановить)
 _do_rollback() {
     warn "=== ОТКАТ ==="
+    # Снимаем TPROXY-хук на время переключения конфигов
+    local _tp=0
+    iptables_active 2>/dev/null && _tp=1
+    [ "$_tp" = 1 ] && _tproxy_detach
     _stop_xray 2>/dev/null || {
         [ -f "$XRAY_PID" ] && kill "$(cat "$XRAY_PID")" 2>/dev/null
         killall xray 2>/dev/null || true
@@ -82,6 +86,8 @@ _do_rollback() {
     else
         warn "Резервной копии нет — Xray остановлен"
     fi
+    # Возвращаем TPROXY-хук
+    [ "$_tp" = 1 ] && _tproxy_attach
     rm -f "$XRAY_WATCHDOG_SCRIPT" "$XRAY_WATCHDOG_OK" "$XRAY_WATCHDOG_PID"
 }
 
@@ -615,8 +621,13 @@ _start_xray_proc() {
 
 # ─── Запуск Xray (полный — stop + start) ─────────────────────────────────────
 start_xray() {
+    # Временно снимаем TPROXY-хук чтобы LAN-трафик не прерывался пока Xray не запущен
+    local _tp=0
+    iptables_active 2>/dev/null && _tp=1
+    [ "$_tp" = 1 ] && _tproxy_detach
     _stop_xray
     _start_xray_proc
+    [ "$_tp" = 1 ] && _tproxy_attach
     local pid; pid=$(_find_xray_pid)
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
         || die "Xray упал сразу — проверьте лог: $XRAY_LOG"
@@ -627,6 +638,10 @@ start_xray() {
 # Используется при обновлении подписки когда серверы изменились.
 # При включённом автозапуске использует init-скрипт — исключает race с procd.
 _fast_restart() {
+    # Временно снимаем TPROXY-хук чтобы LAN-трафик не прерывался пока Xray не запущен
+    local _tp=0
+    iptables_active 2>/dev/null && _tp=1
+    [ "$_tp" = 1 ] && _tproxy_detach
     _stop_xray
     _start_xray_proc
     # Ждём готовности порта (до 5 с)
@@ -635,6 +650,8 @@ _fast_restart() {
         nc -z 127.0.0.1 1080 2>/dev/null && break
         sleep 1; i=$((i + 1))
     done
+    # Возвращаем TPROXY-хук (Xray готов принимать трафик)
+    [ "$_tp" = 1 ] && _tproxy_attach
     local pid; pid=$(_find_xray_pid)
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
         || die "Xray не запустился — проверьте лог: $XRAY_LOG"
@@ -827,6 +844,19 @@ _lan_iface() {
 
 iptables_active() {
     iptables -t mangle -L "$IPTABLES_CHAIN" >/dev/null 2>&1
+}
+
+# Быстро отцепить / прицепить TPROXY-цепочку от PREROUTING.
+# Используется при перезапуске Xray чтобы не прерывать LAN-трафик.
+_tproxy_detach() {
+    local iface; iface=$(_lan_iface)
+    iptables -t mangle -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+}
+_tproxy_attach() {
+    local iface; iface=$(_lan_iface)
+    # Удаляем дубль (если вдруг есть), затем добавляем
+    iptables -t mangle -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t mangle -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
 }
 
 setup_iptables() {
