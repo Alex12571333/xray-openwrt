@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260584"
+SCRIPT_VERSION="20260585"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -736,6 +736,18 @@ cmd_self_update() {
     info "Текущая версия: $SCRIPT_VERSION"
     info "Проверяю обновления..."
 
+    # Шаг 1: лёгкая проверка version-файла (10 байт, без CDN-кэша полного скрипта)
+    local remote_ver
+    remote_ver=$(_dl "$SCRIPT_VERSION_URL" - 2>/dev/null | tr -d ' \r\n')
+    if [ -n "$remote_ver" ]; then
+        info "Доступная версия: $remote_ver"
+        if [ "$remote_ver" -le "$SCRIPT_VERSION" ] 2>/dev/null; then
+            info "Скрипт актуален — обновление не требуется"
+            return 0
+        fi
+    fi
+
+    # Шаг 2: качаем полный скрипт
     local tmp="${WORK_DIR}/setup_new.sh"
     _dl "$SCRIPT_URL" "$tmp" \
         || { warn "Не удалось скачать скрипт с GitHub"; return 1; }
@@ -746,10 +758,9 @@ cmd_self_update() {
     new_ver=$(grep '^SCRIPT_VERSION=' "$tmp" | head -1 | sed 's/SCRIPT_VERSION="\(.*\)"/\1/')
     [ -n "$new_ver" ] || { warn "Не удалось определить версию нового скрипта"; return 1; }
 
-    info "Доступная версия: $new_ver"
-
+    # Финальная проверка версии в скачанном файле
     if [ "$new_ver" -le "$SCRIPT_VERSION" ] 2>/dev/null; then
-        info "Скрипт актуален — обновление не требуется"
+        info "Скрипт актуален (версия в файле: $new_ver)"
         return 0
     fi
 
@@ -2487,7 +2498,7 @@ main() {
         update)         update_subscription "" ;;
         geodata)        update_geodata && _fast_restart 2>/dev/null || true ;;
         warp)           cmd_warp_menu ;;
-        self-update)    cmd_self_update ;;
+        u|U|self-update) cmd_self_update ;;
         script-check)   cmd_script_check ;;
         _updater_daemon) _updater_daemon ;;
         _tunnel_daemon)  _tunnel_daemon ;;
