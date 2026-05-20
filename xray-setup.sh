@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260550"
+SCRIPT_VERSION="20260551"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -195,22 +195,6 @@ cmd_self_update() {
             iptables -t mangle -D PREROUTING -i "$_iface" -j XRAY_TP 2>/dev/null || true
             warn "tproxy снят — интернет восстановлен"
         fi
-    fi
-
-    # Проверяем URL подписки — если некорректный (например случайно введено "5"),
-    # восстанавливаем из DEFAULT_SUB_URL и запускаем полную установку
-    local _saved_url
-    _saved_url=$(cat "$XRAY_SUB_FILE" 2>/dev/null | tr -d '\n\r ')
-    if ! printf '%s' "$_saved_url" | grep -q '^https\?://'; then
-        warn "URL подписки некорректен ($_saved_url) — восстанавливаю и устанавливаю..."
-        printf '%s\n' "$DEFAULT_SUB_URL" > "$XRAY_SUB_FILE"
-        # Полная автоустановка: Xray + подписка + автозапуск + автообновление
-        sh "$XRAY_SELF" "$DEFAULT_SUB_URL" && \
-        sh "$XRAY_SELF" autostart-on && \
-        sh "$XRAY_SELF" cron-on && \
-        info "=== Автоустановка завершена ===" || \
-        warn "Автоустановка не завершена — откройте меню и нажмите 1"
-        return 0
     fi
 
     # Перезапускаем с новой версией (только в интерактивном режиме)
@@ -1694,6 +1678,23 @@ menu() {
     done
 }
 
+# ─── Автовосстановление URL подписки при старте ──────────────────────────────
+# Если /etc/xray/sub_url содержит не-URL (например "5") — исправляем и
+# запускаем полную установку автоматически, без участия пользователя.
+_autofix_sub_url() {
+    [ -n "$DEFAULT_SUB_URL" ] || return 0
+    local _url; _url=$(cat "$XRAY_SUB_FILE" 2>/dev/null | tr -d '\n\r ')
+    # URL корректен — ничего не делаем
+    printf '%s' "$_url" | grep -q '^https\?://' && return 0
+    warn "URL подписки некорректен ('$_url') — автовосстановление..."
+    printf '%s\n' "$DEFAULT_SUB_URL" > "$XRAY_SUB_FILE"
+    info "Запускаю полную установку Xray..."
+    apply_subscription "$DEFAULT_SUB_URL" || { warn "Установка не удалась"; return 1; }
+    install_init_script 2>/dev/null || true
+    install_cron 6      2>/dev/null || true
+    info "=== Автоустановка завершена: Xray запущен, автозапуск и автообновление включены ==="
+}
+
 # ─── Самовосстановление: tproxy активен но Xray не запущен → убрать хук ──────
 # Вызывается при каждом запуске скрипта — до любых других действий.
 _selfheal_tproxy() {
@@ -1706,7 +1707,8 @@ _selfheal_tproxy() {
 
 # ─── Точка входа ──────────────────────────────────────────────────────────────
 main() {
-    _selfheal_tproxy  # всегда первым: если tproxy завис без Xray — чиним сразу
+    _selfheal_tproxy   # если tproxy завис без Xray — чиним сразу
+    _autofix_sub_url   # если URL подписки некорректен — восстанавливаем и устанавливаем
     local arg="${1:-${XRAY_SUB_URL:-}}"
     case "$arg" in
         test)           cmd_test ;;
