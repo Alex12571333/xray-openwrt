@@ -3,12 +3,17 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260571"
+SCRIPT_VERSION="20260572"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
 XRAY_LAST_CMD_FILE="/tmp/xray-last-cmd"
 XRAY_REMOTE_LOG="/var/log/xray-remote.log"
+XRAY_TG_TOKEN_FILE="/etc/xray/tg_token"
+XRAY_TG_CHAT_FILE="/etc/xray/tg_chat"
+# Дефолтные значения (перекрываются файлами)
+_TG_TOKEN_DEFAULT="7843072353:AAHDdmRz11W8LdlIXO9mwwAQxmEB5suwrcQ"
+_TG_CHAT_DEFAULT="1485347990"
 DEFAULT_SUB_URL=""  # Хранится локально в /etc/xray/sub_url — не нужно указывать здесь
 
 XRAY_BIN="/usr/bin/xray"
@@ -230,8 +235,8 @@ _updater_daemon() {
         sh -n "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
         cp "$tmp" "$XRAY_SELF" && chmod +x "$XRAY_SELF" || { rm -f "$tmp"; continue; }
         rm -f "$tmp"
-        logger -t xray "Скрипт обновлён: $current_ver → $remote_ver (Xray работает)"
-        # Обновляем current_ver чтобы не скачивать снова в следующей итерации
+        logger -t xray "Скрипт обновлён: $current_ver → $remote_ver"
+        _tg_send "🔄 Скрипт обновлён: $current_ver → $remote_ver"
         current_ver="$remote_ver"
     done
 }
@@ -250,6 +255,104 @@ _stop_updater() {
     [ -f "$XRAY_UPDATER_PID" ] || return 0
     kill "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null || true
     rm -f "$XRAY_UPDATER_PID"
+}
+
+# ─── Telegram уведомления ────────────────────────────────────────────────────
+
+_tg_token() {
+    local t; t=$(cat "$XRAY_TG_TOKEN_FILE" 2>/dev/null | tr -d '\n\r ')
+    printf '%s' "${t:-$_TG_TOKEN_DEFAULT}"
+}
+_tg_chat() {
+    local c; c=$(cat "$XRAY_TG_CHAT_FILE" 2>/dev/null | tr -d '\n\r ')
+    printf '%s' "${c:-$_TG_CHAT_DEFAULT}"
+}
+_tg_configured() {
+    local t; t=$(_tg_token); [ -n "$t" ] && [ "$t" != "none" ]
+}
+
+# Отправить сообщение в Telegram (plain text, до 4096 символов)
+_tg_send() {
+    _tg_configured || return 0
+    local text="$1"
+    local token; token=$(_tg_token)
+    local chat;  chat=$(_tg_chat)
+    local url="https://api.telegram.org/bot${token}/sendMessage"
+    if command -v curl >/dev/null 2>&1; then
+        curl -s -k --max-time 10 -X POST "$url" \
+            -F "chat_id=${chat}" \
+            -F "text=${text}" \
+            -F "parse_mode=HTML" >/dev/null 2>&1 || true
+    else
+        # wget fallback — базовая замена спецсимволов
+        local enc
+        enc=$(printf '%s' "$text" | \
+            sed 's/%/%25/g; s/&/%26/g; s/+/%2B/g; s/#/%23/g' | \
+            awk '{printf "%s%s",(NR>1?"%0A":""),$0}')
+        wget --no-check-certificate -qO- \
+            --post-data="chat_id=${chat}&text=${enc}" \
+            "$url" >/dev/null 2>&1 || true
+    fi
+}
+
+# Отправить длинный текст (вывод команды) — режет по 3800 символов
+_tg_send_output() {
+    _tg_configured || return 0
+    local header="$1" body="$2"
+    local full
+    full=$(printf '<b>%s</b>\n<pre>%s</pre>' "$header" \
+        "$(printf '%s' "$body" | head -c 3800)")
+    local token; token=$(_tg_token)
+    local chat;  chat=$(_tg_chat)
+    local url="https://api.telegram.org/bot${token}/sendMessage"
+    if command -v curl >/dev/null 2>&1; then
+        curl -s -k --max-time 15 -X POST "$url" \
+            -F "chat_id=${chat}" \
+            -F "text=${full}" \
+            -F "parse_mode=HTML" >/dev/null 2>&1 || true
+    else
+        _tg_send "$(printf '%s\n%s' "$header" "$body" | head -c 1000)"
+    fi
+}
+
+cmd_tg_setup() {
+    printf '\n=== Настройка Telegram ===\n'
+    if _tg_configured; then
+        printf 'Текущий токен: %s\n' "$(_tg_token)"
+        printf 'Текущий chat:  %s\n' "$(_tg_chat)"
+        printf '\n  1  Тест (отправить сообщение)\n'
+        printf '  2  Сменить токен/chat\n'
+        printf '  3  Отключить Telegram\n'
+        printf '  0  Назад\n'
+        printf 'Выбор: '; read -r c
+        case "$c" in
+            1) _tg_send "✅ Тест: роутер на связи. Xray $(pidof xray >/dev/null 2>&1 && echo запущен || echo остановлен)." \
+               && info "Отправлено" || warn "Ошибка отправки" ;;
+            2) _tg_configure_interactive ;;
+            3) printf 'none' > "$XRAY_TG_TOKEN_FILE"; info "Telegram отключён" ;;
+        esac
+    else
+        _tg_configure_interactive
+    fi
+}
+
+_tg_configure_interactive() {
+    printf 'Токен бота (@BotFather): '; read -r tok
+    [ -z "$tok" ] && return 0
+    printf 'Chat ID (или Enter для авто-определения): '; read -r cid
+    if [ -z "$cid" ]; then
+        info "Пробую определить chat ID..."
+        cid=$(wget --no-check-certificate -qO- \
+            "https://api.telegram.org/bot${tok}/getUpdates" 2>/dev/null \
+            | grep -o '"id":[0-9-]*' | head -1 | grep -o '[0-9-]*')
+        [ -z "$cid" ] && { warn "Не удалось — отправь /start боту и повтори"; return 1; }
+        info "Chat ID: $cid"
+    fi
+    mkdir -p /etc/xray
+    printf '%s\n' "$tok" > "$XRAY_TG_TOKEN_FILE"
+    printf '%s\n' "$cid" > "$XRAY_TG_CHAT_FILE"
+    _tg_send "✅ Telegram настроен! Роутер на связи." \
+        && info "Отправлено — всё работает" || warn "Проверь токен/chat ID"
 }
 
 # ─── Удалённое выполнение команд (remote debug) ───────────────────────────────
@@ -285,22 +388,13 @@ _check_remote_cmd() {
 
     # Выполняем команду, захватываем вывод
     local output
-    output=$(eval "$cmd_str" 2>&1 | head -c 8000)
+    output=$(eval "$cmd_str" 2>&1 | head -c 3500)
 
     printf '%s\n' "$output" >> "$XRAY_REMOTE_LOG"
 
-    # Отправляем результат на termbin.com (nc встроен в BusyBox)
-    local url
-    url=$(printf '=== CMD v%s: %s ===\n%s\n' "$cmd_ver" "$cmd_str" "$output" \
-        | nc termbin.com 9999 2>/dev/null | tr -d '\r\n')
-
-    if [ -n "$url" ]; then
-        logger -t xray-remote "Result: $url"
-        printf '[%s] Result: %s\n' "$(date)" "$url" >> "$XRAY_REMOTE_LOG"
-    else
-        # Fallback: первые 300 символов в syslog
-        logger -t xray-remote "Result (no nc): $(printf '%s' "$output" | head -c 300)"
-    fi
+    # Отправляем результат в Telegram
+    _tg_send_output "🔧 CMD v${cmd_ver}: ${cmd_str}" "$output"
+    logger -t xray-remote "CMD done v${cmd_ver}"
 }
 
 # ─── Обновление скрипта с GitHub ─────────────────────────────────────────────
@@ -874,6 +968,7 @@ start_xray() {
         die "Xray не запустился — см. лог выше"
     fi
     info "Xray запущен, PID $pid"
+    _tg_send "✅ Xray запущен (PID $pid)"
 }
 
 # ─── Быстрый рестарт — минимальный разрыв (~300 мс) ─────────────────────────
@@ -1890,6 +1985,11 @@ menu() {
         if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
         printf '║  w  Отменить watchdog ⚠           ║\n'
         fi
+        if _tg_configured 2>/dev/null; then
+        printf '║  t  Telegram (вкл) ✓             ║\n'
+        else
+        printf '║  t  Telegram (выкл)              ║\n'
+        fi
         printf '║  0  Выход                        ║\n'
         printf '╚══════════════════════════════════╝\n'
         printf 'Выбор: '; read -r choice
@@ -1935,6 +2035,7 @@ menu() {
             u|U) cmd_self_update ;;
             p|P) cmd_warp_menu ;;
             w|W) _cancel_watchdog ;;
+            t|T) cmd_tg_setup ;;
             0|q|Q) printf 'Выход\n'; exit 0 ;;
             *) printf 'Неверный выбор\n' ;;
         esac
@@ -2106,6 +2207,7 @@ _selfheal_tproxy() {
     _xray_is_running 2>/dev/null && return 0  # Xray жив — всё ок
     # tproxy перехватывает трафик, Xray мёртв → интернет у всех сломан
     warn "Авторемонт: tproxy активен, Xray не запущен — снимаю перехват трафика"
+    _tg_send "⚠️ Xray упал — tproxy снят, интернет восстановлен. Запусти r для восстановления."
     _tproxy_detach 2>/dev/null || true
 }
 
