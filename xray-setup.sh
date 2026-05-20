@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260572"
+SCRIPT_VERSION="20260573"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1713,15 +1713,17 @@ apply_subscription() {
         die "Установка отменена: прокси не работает после запуска"
     fi
 
-    # Прозрачный прокси: включаем автоматически или переключаем если уже был включён
-    setup_iptables 2>/dev/null \
-        || warn "iptables недоступен — прозрачный прокси не активен (SOCKS5 :1080 работает)"
-
     local lan_ip; lan_ip=$(ip -4 addr show br-lan 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
-    [ -z "$lan_ip" ] && lan_ip="<IP роутера>"
-    printf '\n  SOCKS5 : %s:1080  (вручную на устройстве)\n' "$lan_ip"
-    printf '  HTTP   : %s:1081  (вручную на устройстве)\n' "$lan_ip"
-    printf '  TProxy : включён — весь LAN автоматически\n\n'
+    [ -z "$lan_ip" ] && lan_ip="192.168.8.1"
+    printf '\n'
+    printf '  ✅ Xray запущен\n'
+    printf '  SOCKS5 : %s:1080\n' "$lan_ip"
+    printf '  HTTP   : %s:1081\n' "$lan_ip"
+    printf '\n'
+    printf '  Прозрачный прокси (tproxy) — ВЫКЛ  → пункт 9 для включения\n'
+    printf '  Автозапуск                 — ВЫКЛ  → пункт 5 для включения\n'
+    printf '  Автообновление             — ВЫКЛ  → пункт 6 для включения\n'
+    printf '\n'
 }
 
 # ─── Статус ───────────────────────────────────────────────────────────────────
@@ -1752,6 +1754,9 @@ cmd_status() {
         || printf '  Автозапуск  : выключен\n'
 
     printf '  Автообновл. : %s\n' "$(cron_interval)"
+    local lan_ip; lan_ip=$(ip -4 addr show br-lan 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+    [ -z "$lan_ip" ] && lan_ip="192.168.8.1"
+    printf '  SOCKS5      : %s:1080  (для RustDesk и др.)\n' "$lan_ip"
     iptables_active \
         && printf '  TProxy      : включён (весь LAN через Xray)\n' \
         || printf '  TProxy      : выключен (только ручной прокси)\n'
@@ -2183,9 +2188,7 @@ cmd_recover() {
     info "URL: $_url"
     printf '%s\n' "$_url" > "$XRAY_SUB_FILE"
     apply_subscription "$_url" || { warn "Установка не удалась"; return 1; }
-    install_init_script 2>/dev/null || true
-    install_cron 6      2>/dev/null || true
-    info "=== Готово: Xray запущен, автозапуск и автообновление включены ==="
+    info "=== Готово: Xray запущен ==="
 }
 
 # ─── Автовосстановление URL подписки при старте ──────────────────────────────
