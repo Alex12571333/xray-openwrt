@@ -3,8 +3,9 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260549"
+SCRIPT_VERSION="20260550"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
+DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
 XRAY_BIN="/usr/bin/xray"
 XRAY_CONFIG="/etc/xray/config.json"
@@ -194,6 +195,22 @@ cmd_self_update() {
             iptables -t mangle -D PREROUTING -i "$_iface" -j XRAY_TP 2>/dev/null || true
             warn "tproxy снят — интернет восстановлен"
         fi
+    fi
+
+    # Проверяем URL подписки — если некорректный (например случайно введено "5"),
+    # восстанавливаем из DEFAULT_SUB_URL и запускаем полную установку
+    local _saved_url
+    _saved_url=$(cat "$XRAY_SUB_FILE" 2>/dev/null | tr -d '\n\r ')
+    if ! printf '%s' "$_saved_url" | grep -q '^https\?://'; then
+        warn "URL подписки некорректен ($_saved_url) — восстанавливаю и устанавливаю..."
+        printf '%s\n' "$DEFAULT_SUB_URL" > "$XRAY_SUB_FILE"
+        # Полная автоустановка: Xray + подписка + автозапуск + автообновление
+        sh "$XRAY_SELF" "$DEFAULT_SUB_URL" && \
+        sh "$XRAY_SELF" autostart-on && \
+        sh "$XRAY_SELF" cron-on && \
+        info "=== Автоустановка завершена ===" || \
+        warn "Автоустановка не завершена — откройте меню и нажмите 1"
+        return 0
     fi
 
     # Перезапускаем с новой версией (только в интерактивном режиме)
