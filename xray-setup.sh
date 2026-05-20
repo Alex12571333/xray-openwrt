@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260588"
+SCRIPT_VERSION="20260589"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -14,6 +14,8 @@ XRAY_TUNNEL_CONF="/etc/xray/ssh_tunnel.conf"
 XRAY_TUNNEL_KEY="/etc/xray/tunnel_id_rsa"
 XRAY_TG_TOKEN_FILE="/etc/xray/tg_token"
 XRAY_TG_CHAT_FILE="/etc/xray/tg_chat"
+XRAY_TG_BOT_PID="/tmp/xray-tgbot.pid"
+XRAY_TG_OFFSET_FILE="/tmp/xray-tg-offset"
 # Дефолтные значения (перекрываются файлами)
 _TG_TOKEN_DEFAULT="7843072353:AAHDdmRz11W8LdlIXO9mwwAQxmEB5suwrcQ"
 _TG_CHAT_DEFAULT="1485347990"
@@ -207,6 +209,167 @@ _cancel_watchdog() {
 # скрипт и заменяет файл. Xray НЕ перезапускается → RustDesk не отваливается.
 # Запускается через nohup, живёт пока роутер включён.
 # Healthcheck (cron */5) перезапускает его если упал.
+
+# ─── Telegram Bot (управление роутером через бот) ────────────────────────────
+# Принимает команды через getUpdates long-polling.
+# Отвечает на: /status /restart /on /off /update /proxy_on /proxy_off
+#              /tunnel_on /tunnel_off /log /help
+# Безопасность: принимает сообщения только от сохранённого chat_id.
+
+_tg_bot_status_text() {
+    local xray_st tproxy_st autostart_st cron_st upd_st tunnel_st
+    if _xray_is_running; then
+        xray_st="▶ запущен (PID $(cat "$XRAY_PID_FILE" 2>/dev/null))"
+    else
+        xray_st="■ остановлен"
+    fi
+    iptables_active 2>/dev/null && tproxy_st="вкл" || tproxy_st="выкл"
+    autostart_enabled && autostart_st="вкл" || autostart_st="выкл"
+    local ci; ci=$(cron_interval 2>/dev/null)
+    [ -n "$ci" ] && cron_st="каждые ${ci} ч." || cron_st="выкл"
+    if [ -f "$XRAY_UPDATER_PID" ] && kill -0 "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null; then
+        upd_st="запущен"
+    else
+        upd_st="не запущен"
+    fi
+    tunnel_st=$(_tunnel_status 2>/dev/null)
+    printf 'Xray: %s\nСкрипт: v%s\nПрозрачный прокси: %s\nАвтозапуск: %s\nАвтообновление: %s\nДемон апдейт: %s\nSSH туннель: %s\n' \
+        "$xray_st" "$SCRIPT_VERSION" "$tproxy_st" \
+        "$autostart_st" "$cron_st" "$upd_st" "$tunnel_st"
+}
+
+_tg_bot_help_text() {
+    printf '🤖 Управление роутером:\n\n/status — статус\n/restart — перезапустить Xray\n/on — запустить Xray\n/off — остановить Xray\n/update — обновить серверы VPN\n/proxy_on — прозрачный прокси вкл\n/proxy_off — прозрачный прокси выкл\n/tunnel_on — SSH туннель вкл\n/tunnel_off — SSH туннель выкл\n/log — последние строки лога\n/help — это меню'
+}
+
+_tg_bot_exec_cmd() {
+    local cmd="$1"
+    case "$cmd" in
+        /start|/help|/menu)
+            _tg_bot_help_text ;;
+        /status|/s)
+            _tg_bot_status_text ;;
+        /restart|/r)
+            _fast_restart 2>/dev/null || start_xray 2>/dev/null
+            printf '🔄 Xray перезапущен' ;;
+        /on)
+            start_xray 2>/dev/null
+            printf '▶ Xray запущен' ;;
+        /off)
+            stop_xray 2>/dev/null
+            printf '⏹ Xray остановлен' ;;
+        /update|/u)
+            local out
+            out=$(update_subscription "" 2>&1 | grep -v '^$' | tail -5)
+            printf '🔄 Серверы обновлены:\n%s' "$out" ;;
+        /proxy_on)
+            setup_iptables 2>/dev/null
+            printf '🔀 Прозрачный прокси включён' ;;
+        /proxy_off)
+            remove_iptables 2>/dev/null
+            printf '⏸ Прозрачный прокси выключен' ;;
+        /tunnel_on)
+            _start_tunnel 2>/dev/null
+            printf '🔐 SSH туннель запускается...' ;;
+        /tunnel_off)
+            _stop_tunnel 2>/dev/null
+            printf '🔐 SSH туннель остановлен' ;;
+        /log|/l)
+            logread 2>/dev/null | grep -i 'xray' | tail -15 ;;
+        *)
+            printf '❓ Неизвестная команда: %s\nОтправь /help' "$cmd" ;;
+    esac
+}
+
+_tg_bot_daemon() {
+    _tg_configured || return 0
+    printf '%s\n' "$$" > "$XRAY_TG_BOT_PID"
+    logger -t xray-tgbot "Telegram бот запущен (PID $$)"
+
+    local token; token=$(_tg_token)
+    local chat;  chat=$(_tg_chat)
+    local api_base="https://api.telegram.org/bot${token}"
+
+    # Восстанавливаем offset из файла (переживает перезапуск демона)
+    local offset=0
+    [ -f "$XRAY_TG_OFFSET_FILE" ] && \
+        offset=$(cat "$XRAY_TG_OFFSET_FILE" 2>/dev/null | tr -d ' \r\n')
+    [ -z "$offset" ] && offset=0
+
+    # Локальные переменные цикла — вне loop во избежание проблем BusyBox ash
+    local resp tmpupd uid msg_chat text_raw result new_offset
+
+    while true; do
+        # Long-poll: ждём новых сообщений до 20 сек
+        local url="${api_base}/getUpdates?offset=${offset}&timeout=20&allowed_updates=message"
+        # Telegram заблокирован в РФ → SOCKS5 первым, direct как fallback
+        if command -v curl >/dev/null 2>&1; then
+            resp=$(curl -s -k --max-time 25 \
+                -x socks5://127.0.0.1:1080 "$url" 2>/dev/null)
+            [ -z "$resp" ] && \
+                resp=$(curl -s -k --max-time 25 "$url" 2>/dev/null)
+        else
+            resp=$(https_proxy=http://127.0.0.1:1081 wget \
+                --no-check-certificate -qO- --timeout=25 "$url" 2>/dev/null)
+            [ -z "$resp" ] && \
+                resp=$(wget --no-check-certificate -qO- \
+                    --timeout=25 "$url" 2>/dev/null)
+        fi
+
+        [ -z "$resp" ] && { sleep 10; continue; }
+        printf '%s' "$resp" | grep -q '"ok":true' || { sleep 15; continue; }
+
+        # Парсим апдейты — разбиваем по границам {"update_id":
+        tmpupd="/tmp/xray-tg-upd-$$.txt"
+        printf '%s' "$resp" \
+            | sed 's/,{"update_id":/\n{"update_id":/g' \
+            | grep '"update_id":' \
+            > "$tmpupd"
+
+        new_offset="$offset"
+        while IFS= read -r _upd; do
+            uid=$(printf '%s' "$_upd" \
+                | grep -o '"update_id":[0-9]*' | grep -o '[0-9]*$')
+            [ -z "$uid" ] && continue
+            new_offset=$((uid + 1))
+
+            # Проверяем chat_id — принимаем только нашего пользователя
+            msg_chat=$(printf '%s' "$_upd" \
+                | grep -o '"chat":{"id":-*[0-9]*' | grep -o '-*[0-9]*$')
+            [ "$msg_chat" = "$chat" ] || continue
+
+            # Извлекаем текст команды
+            text_raw=$(printf '%s' "$_upd" \
+                | grep -o '"text":"[^"]*"' | head -1 \
+                | sed 's/"text":"//;s/"$//')
+            [ -z "$text_raw" ] && continue
+
+            logger -t xray-tgbot "CMD [$uid]: $text_raw"
+
+            result=$(_tg_bot_exec_cmd "$text_raw")
+            [ -n "$result" ] && _tg_send "$result" 2>/dev/null || true
+
+        done < "$tmpupd"
+        rm -f "$tmpupd"
+
+        offset="$new_offset"
+        printf '%s\n' "$offset" > "$XRAY_TG_OFFSET_FILE"
+    done
+}
+
+_start_tg_bot() {
+    _tg_configured || return 0
+    [ -f "$XRAY_TG_BOT_PID" ] && kill -0 "$(cat "$XRAY_TG_BOT_PID")" 2>/dev/null && return 0
+    [ -f "$XRAY_SELF" ] || return 1
+    nohup sh "$XRAY_SELF" _tg_bot_daemon > /dev/null 2>&1 &
+    logger -t xray-tgbot "_start_tg_bot: запущен"
+}
+
+_stop_tg_bot() {
+    [ -f "$XRAY_TG_BOT_PID" ] || return 0
+    kill "$(cat "$XRAY_TG_BOT_PID")" 2>/dev/null || true
+    rm -f "$XRAY_TG_BOT_PID"
+}
 
 _updater_daemon() {
     # Просто пишем свой PID — защита от дублей уже есть в _start_updater.
@@ -1470,8 +1633,9 @@ install_cron() {
     printf '0 */%s * * * sh %s update >> %s 2>&1 %s\n' \
         "$hours" "$XRAY_SELF" "$XRAY_UPDLOG" "$CRON_MARKER" >> "$XRAY_CRON"
     /etc/init.d/cron restart 2>/dev/null || true
-    # Запускаем демон немедленно — не ждём первого healthcheck
+    # Запускаем демоны немедленно — не ждём первого healthcheck
     _start_updater
+    _start_tg_bot
     info "Автообновление: демон проверяет скрипт каждые 10 сек., подписка каждые ${hours} ч."
 }
 
@@ -2046,6 +2210,11 @@ cmd_status() {
         printf '  Демон апдейт: не запущен\n'
         printf '  Последний лог: %s\n' "$(logread 2>/dev/null | grep 'xray-upd' | tail -1 | sed 's/.*xray-upd: //')"
     fi
+    if [ -f "$XRAY_TG_BOT_PID" ] && kill -0 "$(cat "$XRAY_TG_BOT_PID")" 2>/dev/null; then
+        printf '  Telegram бот: запущен (PID %s)\n' "$(cat "$XRAY_TG_BOT_PID")"
+    else
+        printf '  Telegram бот: не запущен\n'
+    fi
     printf '  SSH туннель : %s\n' "$(_tunnel_status)"
 
     if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
@@ -2514,7 +2683,8 @@ main() {
         script-check)   cmd_script_check ;;
         _updater_daemon) _updater_daemon ;;
         _tunnel_daemon)  _tunnel_daemon ;;
-        healthcheck)    _selfheal_tproxy; _start_updater; _start_tunnel_if_configured ;;
+        _tg_bot_daemon)  _tg_bot_daemon ;;
+        healthcheck)    _selfheal_tproxy; _start_updater; _start_tg_bot; _start_tunnel_if_configured ;;
         autostart-on)   install_init_script && info "Автозапуск включён" ;;
         autostart-off)  remove_init_script  && info "Автозапуск выключен" ;;
         cron-on)        install_cron 6      && info "Автообновление включено" ;;
