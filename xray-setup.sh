@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260557"
+SCRIPT_VERSION="20260558"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -541,14 +541,14 @@ gen_config() {
     fi
 
     # Правила маршрутизации в зависимости от наличия geosite:ru-blocked
-    local ru_blocked_rule catchall_tag
+    # catch-all ВСЕГДА direct — иначе при недоступных прокси весь интернет ломается
+    local ru_blocked_rule
     if [ "$_has_ru_blocked" = 1 ]; then
         ru_blocked_rule='      {"type":"field","domain":["geosite:ru-blocked"],"balancerTag":"balancer"},'
-        catchall_tag='"outboundTag":"direct"'
     else
         ru_blocked_rule=""
-        catchall_tag='"balancerTag":"balancer"'
     fi
+    local catchall_tag='"outboundTag":"direct"'
 
     local ob1 ob2 ob3
     ob1=$(gen_outbound "proxy1" "/tmp/xray_sv_1.env")
