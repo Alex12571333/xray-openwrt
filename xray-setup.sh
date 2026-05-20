@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260586"
+SCRIPT_VERSION="20260587"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -208,10 +208,10 @@ _cancel_watchdog() {
 # Healthcheck (cron */5) перезапускает его если упал.
 
 _updater_daemon() {
-    # Убиваем дубль если есть
-    if [ -f "$XRAY_UPDATER_PID" ] && kill -0 "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null; then
-        [ "$(cat "$XRAY_UPDATER_PID")" = "$$" ] || return 0
-    fi
+    # Просто пишем свой PID — защита от дублей уже есть в _start_updater.
+    # Не делаем kill-check здесь: $! от nohup и $$ внутри sh могут различаться
+    # (nohup форкает), из-за чего PID в файле ≠ $$, демон думает "уже запущен"
+    # и выходит, хотя на самом деле должен стартовать.
     printf '%s\n' "$$" > "$XRAY_UPDATER_PID"
     logger -t xray-upd "Демон запущен (PID $$)"
 
@@ -312,16 +312,16 @@ _updater_daemon() {
 }
 
 _start_updater() {
-    # Уже запущен?
+    # Уже запущен? Читаем PID который сам демон записал ($$, не $! от nohup).
     if [ -f "$XRAY_UPDATER_PID" ] && kill -0 "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null; then
         return 0
     fi
     # Файл скрипта должен существовать
     [ -f "$XRAY_SELF" ] || { logger -t xray-upd "XRAY_SELF не найден: $XRAY_SELF"; return 1; }
-    # Запускаем демон в фоне
+    # Запускаем демон в фоне. Демон сам запишет свой $$ в PID-файл.
+    # nohup на BusyBox может форкать → $! ≠ $$ внутри sh, поэтому PID не пишем здесь.
     nohup sh "$XRAY_SELF" _updater_daemon > /dev/null 2>&1 &
-    printf '%s\n' "$!" > "$XRAY_UPDATER_PID"
-    logger -t xray-upd "_start_updater: запущен PID $!"
+    logger -t xray-upd "_start_updater: демон запрошен (nohup PID $!)"
 }
 
 _stop_updater() {
