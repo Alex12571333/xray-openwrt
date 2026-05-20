@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260533"
+SCRIPT_VERSION="20260534"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -15,6 +15,8 @@ XRAY_INIT="/etc/init.d/xray"
 XRAY_CRON="/etc/crontabs/root"
 CRON_MARKER="# xray-autoupdate"
 GITHUB_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+GEODATA_GEOIP="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"
+GEODATA_GEOSITE="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat"
 XRAY_LOG="/var/log/xray.log"
 XRAY_LOG_MAX=262144   # 256 КБ — при превышении оставляем последние 128 КБ
 XRAY_CONFIG_BAK="${XRAY_CONFIG}.bak"
@@ -263,6 +265,36 @@ install_xray() {
     [ -f "${ex}/geoip.dat"   ] && mv "${ex}/geoip.dat"   /etc/xray/geoip.dat
     [ -f "${ex}/geosite.dat" ] && mv "${ex}/geosite.dat" /etc/xray/geosite.dat
     info "Xray установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
+    # Скачиваем актуальные геоданные с русскими блокировками
+    update_geodata || true
+}
+
+# ─── Обновление геоданных (runetfreedom: geosite:ru-blocked) ─────────────────
+update_geodata() {
+    info "Обновляю геоданные (runetfreedom/russia-v2ray-rules-dat)..."
+    mkdir -p /etc/xray
+    local ok=0
+
+    local tmp_ip="${WORK_DIR}/geoip.dat"
+    local tmp_site="${WORK_DIR}/geosite.dat"
+
+    if _dl "$GEODATA_GEOIP" "$tmp_ip" && [ -s "$tmp_ip" ]; then
+        mv "$tmp_ip" /etc/xray/geoip.dat
+        info "geoip.dat обновлён ($(wc -c < /etc/xray/geoip.dat | tr -d ' ') байт)"
+        ok=$((ok + 1))
+    else
+        warn "Не удалось скачать geoip.dat — используется текущий"
+    fi
+
+    if _dl "$GEODATA_GEOSITE" "$tmp_site" && [ -s "$tmp_site" ]; then
+        mv "$tmp_site" /etc/xray/geosite.dat
+        info "geosite.dat обновлён ($(wc -c < /etc/xray/geosite.dat | tr -d ' ') байт)"
+        ok=$((ok + 1))
+    else
+        warn "Не удалось скачать geosite.dat — используется текущий"
+    fi
+
+    [ "$ok" -gt 0 ] && return 0 || return 1
 }
 
 # ─── Подписка ─────────────────────────────────────────────────────────────────
@@ -475,8 +507,8 @@ ${ob3},
     "rules": [
       {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
       {"type":"field","ip":["geoip:ru","109.105.128.0/17"],"outboundTag":"direct"},
-      {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$"],"outboundTag":"direct"},
-      {"type":"field","network":"tcp,udp","balancerTag":"balancer"}
+      {"type":"field","domain":["geosite:ru-blocked"],"balancerTag":"balancer"},
+      {"type":"field","network":"tcp,udp","outboundTag":"direct"}
     ]
   },
   "observatory": {
@@ -1118,6 +1150,7 @@ menu() {
         else
         printf '║  9  Прозрачный прокси (выкл)     ║\n'
         fi
+        printf '║  g  Обновить геоданные           ║\n'
         printf '║  u  Обновить скрипт              ║\n'
         if [ -f "$XRAY_WATCHDOG_PID" ] && kill -0 "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null; then
         printf '║  w  Отменить watchdog ⚠           ║\n'
@@ -1161,6 +1194,7 @@ menu() {
             7) cmd_uninstall ;;
             8) cmd_test ;;
             9) cmd_tproxy_menu ;;
+            g|G) update_geodata && info "Перезапустите Xray (пункт 3) чтобы применить" ;;
             u|U) cmd_self_update ;;
             w|W) _cancel_watchdog ;;
             0|q|Q) printf 'Выход\n'; exit 0 ;;
