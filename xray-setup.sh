@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260553"
+SCRIPT_VERSION="20260554"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -256,6 +256,11 @@ detect_arch() {
 install_xray() {
     if [ -x "$XRAY_BIN" ]; then
         info "Xray уже установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
+        # Проверяем geodata — без них Xray падает сразу при запуске
+        if [ ! -f /etc/xray/geoip.dat ] || [ ! -f /etc/xray/geosite.dat ]; then
+            warn "Geodata отсутствует — скачиваю..."
+            update_geodata || warn "Не удалось скачать geodata — Xray может не запуститься"
+        fi
         return 0
     fi
     info "Xray не найден — устанавливаю из GitHub..."
@@ -645,8 +650,11 @@ start_xray() {
     _start_xray_proc
     [ "$_tp" = 1 ] && _tproxy_attach
     local pid; pid=$(_find_xray_pid)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
-        || die "Xray упал сразу — проверьте лог: $XRAY_LOG"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        warn "=== Xray упал сразу. Последние строки лога ==="
+        tail -20 "$XRAY_LOG" 2>/dev/null || warn "(лог пуст)"
+        die "Xray не запустился — см. лог выше"
+    fi
     info "Xray запущен, PID $pid"
 }
 
