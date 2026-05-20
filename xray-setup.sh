@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260554"
+SCRIPT_VERSION="20260556"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -303,8 +303,8 @@ install_xray() {
     [ -f "${ex}/geoip.dat"   ] && mv "${ex}/geoip.dat"   /etc/xray/geoip.dat
     [ -f "${ex}/geosite.dat" ] && mv "${ex}/geosite.dat" /etc/xray/geosite.dat
     info "Xray установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
-    # Скачиваем актуальные геоданные с русскими блокировками
-    update_geodata || true
+    # Скачиваем актуальные геоданные с русскими блокировками (обязательно)
+    update_geodata || warn "Geodata не скачаны — запустите g из меню после установки"
 }
 
 # ─── Обновление геоданных (runetfreedom: geosite:ru-blocked) ─────────────────
@@ -507,12 +507,48 @@ gen_outbound() {
 OUTJSON
 }
 
+# ─── Проверка: есть ли geosite:ru-blocked в текущем geosite.dat ──────────────
+_has_geosite_ru_blocked() {
+    [ -x "$XRAY_BIN" ] || return 1
+    [ -f /etc/xray/geosite.dat ] || return 1
+    local _tc="/tmp/xray_test_geo_$$.json"
+    printf '%s\n' '{"log":{"loglevel":"none"},"inbounds":[{"port":19998,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","network":"tcp"}}],"outbounds":[{"protocol":"freedom"}],"routing":{"rules":[{"type":"field","domain":["geosite:ru-blocked"],"outboundTag":"direct"}]}}' > "$_tc"
+    XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -test -c "$_tc" >/dev/null 2>&1
+    local rc=$?
+    rm -f "$_tc"
+    return $rc
+}
+
 # ─── Генерация config.json ────────────────────────────────────────────────────
 gen_config() {
     # $1 — путь назначения (по умолчанию $XRAY_CONFIG)
     local dest="${1:-$XRAY_CONFIG}"
     info "Генерирую конфиг: $dest"
     mkdir -p /etc/xray
+
+    # Проверяем geosite:ru-blocked; если недоступен — пробуем скачать geodata
+    local _has_ru_blocked=0
+    if _has_geosite_ru_blocked; then
+        _has_ru_blocked=1
+    else
+        warn "geosite:ru-blocked не найден — обновляю geodata (runetfreedom)..."
+        if update_geodata 2>/dev/null && _has_geosite_ru_blocked; then
+            _has_ru_blocked=1
+            info "Geodata обновлена, geosite:ru-blocked доступен"
+        else
+            warn "geosite:ru-blocked по-прежнему недоступен — весь нероссийский трафик пойдёт через прокси (catch-all → balancer)"
+        fi
+    fi
+
+    # Правила маршрутизации в зависимости от наличия geosite:ru-blocked
+    local ru_blocked_rule catchall_tag
+    if [ "$_has_ru_blocked" = 1 ]; then
+        ru_blocked_rule='      {"type":"field","domain":["geosite:ru-blocked"],"balancerTag":"balancer"},'
+        catchall_tag='"outboundTag":"direct"'
+    else
+        ru_blocked_rule=""
+        catchall_tag='"balancerTag":"balancer"'
+    fi
 
     local ob1 ob2 ob3
     ob1=$(gen_outbound "proxy1" "/tmp/xray_sv_1.env")
@@ -576,9 +612,9 @@ ${warp_ob_line}
       {"type":"field","ip":["geoip:ru","109.105.128.0/17"],"outboundTag":"direct"},
       {"type":"field","domain":["domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
 ${warp_rule_line}
-      {"type":"field","domain":["geosite:ru-blocked"],"balancerTag":"balancer"},
+${ru_blocked_rule}
       {"type":"field","port":"2106,7777,9014,2009","balancerTag":"balancer"},
-      {"type":"field","network":"tcp,udp","outboundTag":"direct"}
+      {"type":"field","network":"tcp,udp",${catchall_tag}}
     ]
   },
   "observatory": {
