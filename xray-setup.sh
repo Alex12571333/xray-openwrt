@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260532"
+SCRIPT_VERSION="20260533"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 
 XRAY_BIN="/usr/bin/xray"
@@ -1100,8 +1100,17 @@ menu() {
         printf '║  2  Статус                       ║\n'
         printf '║  3  Перезапустить                ║\n'
         printf '║  4  Остановить                   ║\n'
-        printf '║  5  Автозапуск при загрузке      ║\n'
-        printf '║  6  Автообновление подписки      ║\n'
+        if autostart_enabled; then
+        printf '║  5  Автозапуск (вкл) ✓           ║\n'
+        else
+        printf '║  5  Автозапуск (выкл)            ║\n'
+        fi
+        local cron_st; cron_st=$(cron_interval)
+        if [ "$cron_st" = "выключено" ]; then
+        printf '║  6  Автообновление (выкл)        ║\n'
+        else
+        printf '║  6  Автообновление (%s)   ║\n' "$cron_st"
+        fi
         printf '║  7  Удалить всё                  ║\n'
         printf '║  8  Тесты                        ║\n'
         if iptables_active 2>/dev/null; then
