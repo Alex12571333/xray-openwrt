@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260559"
+SCRIPT_VERSION="20260560"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 DEFAULT_SUB_URL="https://2cb3d08d.withblancvpn.online/s/f0d463f6f99d4812af793d5bd729c99a"
 
@@ -34,6 +34,27 @@ XRAY_SERVERS_FILE="/etc/xray/servers.txt"
 # Домены, которые всегда идут через WARP (детектируют VPN)
 # AI-сервисы, дизайн, заметки — datacenter IP блокируют
 WARP_DEFAULT_DOMAINS="domain:openai.com,domain:chatgpt.com,domain:oaistatic.com,domain:oaiusercontent.com,domain:sora.com,domain:claude.ai,domain:anthropic.com,domain:midjourney.com,domain:perplexity.ai,domain:copilot.microsoft.com,domain:bing.com,domain:canva.com,domain:notion.so,domain:figma.com"
+
+# Встроенный список заблокированных доменов — работает БЕЗ скачивания geodata.
+# geosite:ru-blocked (если скачан) используется дополнительно к этому списку.
+PROXY_DOMAINS_BUILTIN="\
+domain:youtube.com,domain:youtu.be,domain:googlevideo.com,domain:yt3.ggpht.com,domain:ytimg.com,\
+domain:instagram.com,domain:cdninstagram.com,domain:fbcdn.net,\
+domain:facebook.com,domain:fb.com,domain:fbsbx.com,domain:fbcdn.com,\
+domain:twitter.com,domain:x.com,domain:twimg.com,domain:t.co,\
+domain:tiktok.com,domain:tiktokcdn.com,domain:tiktokv.com,\
+domain:threads.net,\
+domain:linkedin.com,domain:licdn.com,\
+domain:pinterest.com,domain:pinimg.com,\
+domain:discord.com,domain:discordapp.com,domain:discordapp.net,\
+domain:spotify.com,domain:scdn.co,\
+domain:twitch.tv,domain:twitchsvc.net,\
+domain:reddit.com,domain:redd.it,domain:redditmedia.com,domain:reddituploads.com,\
+domain:medium.com,\
+domain:patreon.com,\
+domain:soundcloud.com,\
+domain:behance.net,\
+domain:quora.com"
 
 WORK_DIR=$(mktemp -d /tmp/xray-XXXXXX)
 trap 'rm -rf "$WORK_DIR" /tmp/xray_sv_*.env /tmp/xray_ping*.txt 2>/dev/null' EXIT INT TERM
@@ -526,33 +547,31 @@ gen_config() {
     info "Генерирую конфиг: $dest"
     mkdir -p /etc/xray
 
-    # Проверяем geosite:ru-blocked; если недоступен — пробуем скачать geodata (3 попытки)
+    # Встроенный список → JSON-массив ["domain:youtube.com","domain:instagram.com",...]
+    local builtin_json
+    builtin_json=$(printf '%s' "$PROXY_DOMAINS_BUILTIN" | tr -d ' \\' | awk -F',' '{
+        printf "["; for(i=1;i<=NF;i++){if(i>1)printf ","; printf "\"%s\"",$i}; printf "]"
+    }')
+
+    # Пробуем получить geosite:ru-blocked (одна попытка скачать если нет)
     local _has_ru_blocked=0
     if _has_geosite_ru_blocked; then
         _has_ru_blocked=1
     else
-        local _try=1
-        while [ "$_try" -le 3 ]; do
-            warn "geosite:ru-blocked не найден — попытка $_try/3, скачиваю geodata (runetfreedom)..."
-            if update_geodata 2>/dev/null && _has_geosite_ru_blocked; then
-                _has_ru_blocked=1
-                info "Geodata обновлена, geosite:ru-blocked доступен"
-                break
-            fi
-            [ "$_try" -lt 3 ] && { warn "Не удалось, жду 15 сек и повторяю..."; sleep 15; }
-            _try=$((_try + 1))
-        done
-        [ "$_has_ru_blocked" = 0 ] && warn "Geodata недоступна после 3 попыток — продолжаю без geosite:ru-blocked (только прямые маршруты)"
+        warn "geosite:ru-blocked не найден — пробую скачать geodata (runetfreedom)..."
+        if update_geodata 2>/dev/null && _has_geosite_ru_blocked; then
+            _has_ru_blocked=1
+            info "Geodata обновлена, geosite:ru-blocked доступен"
+        else
+            warn "Geodata недоступна — используется встроенный список доменов (YouTube, Instagram и др.)"
+        fi
     fi
 
-    # Правила маршрутизации в зависимости от наличия geosite:ru-blocked
-    # catch-all ВСЕГДА direct — иначе при недоступных прокси весь интернет ломается
-    local ru_blocked_rule
-    if [ "$_has_ru_blocked" = 1 ]; then
+    # Встроенный список ВСЕГДА в конфиге; geosite:ru-blocked — дополнительно если скачан
+    local ru_blocked_rule=""
+    [ "$_has_ru_blocked" = 1 ] && \
         ru_blocked_rule='      {"type":"field","domain":["geosite:ru-blocked"],"balancerTag":"balancer"},'
-    else
-        ru_blocked_rule=""
-    fi
+    # catch-all ВСЕГДА direct — иначе при недоступных прокси весь интернет ломается
     local catchall_tag='"outboundTag":"direct"'
 
     local ob1 ob2 ob3
@@ -617,6 +636,7 @@ ${warp_ob_line}
       {"type":"field","ip":["geoip:ru","109.105.128.0/17"],"outboundTag":"direct"},
       {"type":"field","domain":["domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
 ${warp_rule_line}
+      {"type":"field","domain":${builtin_json},"balancerTag":"balancer"},
 ${ru_blocked_rule}
       {"type":"field","port":"2106,7777,9014,2009","balancerTag":"balancer"},
       {"type":"field","network":"tcp,udp",${catchall_tag}}
