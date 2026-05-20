@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260568"
+SCRIPT_VERSION="20260569"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 DEFAULT_SUB_URL=""  # Хранится локально в /etc/xray/sub_url — не нужно указывать здесь
@@ -25,6 +25,7 @@ XRAY_CONFIG_BAK="${XRAY_CONFIG}.bak"
 XRAY_WATCHDOG_SCRIPT="/tmp/xray-watchdog.sh"
 XRAY_WATCHDOG_OK="/tmp/xray-watchdog-ok"
 XRAY_WATCHDOG_PID="/tmp/xray-watchdog.pid"
+XRAY_UPDATER_PID="/tmp/xray-updater.pid"
 IPTABLES_CHAIN="XRAY_TP"
 FIREWALL_MARK="# xray-tproxy"
 FIREWALL_USER="/etc/firewall.user"
@@ -186,6 +187,61 @@ _cancel_watchdog() {
     kill "$(cat "$XRAY_WATCHDOG_PID")" 2>/dev/null || true
     rm -f "$XRAY_WATCHDOG_SCRIPT" "$XRAY_WATCHDOG_OK" "$XRAY_WATCHDOG_PID"
     info "Watchdog отменён"
+}
+
+# ─── Фоновый демон автообновления скрипта ────────────────────────────────────
+# Каждые 10 сек качает version (10 байт). Если версия новее — качает полный
+# скрипт и заменяет файл. Xray НЕ перезапускается → RustDesk не отваливается.
+# Запускается через nohup, живёт пока роутер включён.
+# Healthcheck (cron */5) перезапускает его если упал.
+
+_updater_daemon() {
+    # Убиваем дубль если есть
+    if [ -f "$XRAY_UPDATER_PID" ] && kill -0 "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null; then
+        [ "$(cat "$XRAY_UPDATER_PID")" = "$$" ] || return 0
+    fi
+    printf '%s\n' "$$" > "$XRAY_UPDATER_PID"
+    while true; do
+        sleep 10
+        # Шаг 1: качаем version (10 байт) — почти нет трафика
+        local remote_ver
+        remote_ver=$(wget --no-check-certificate -qO- "$SCRIPT_VERSION_URL" 2>/dev/null \
+            | tr -d ' \r\n')
+        [ -z "$remote_ver" ] && continue
+        # Читаем текущую версию из файла (не из переменной — файл мог обновиться)
+        local current_ver
+        current_ver=$(grep '^SCRIPT_VERSION=' "$XRAY_SELF" 2>/dev/null \
+            | head -1 | sed 's/SCRIPT_VERSION="\(.*\)"/\1/')
+        [ -z "$current_ver" ] && current_ver="$SCRIPT_VERSION"
+        # Версия та же — ничего не делаем (типичный случай, 99.9% итераций)
+        [ "$remote_ver" -le "$current_ver" ] 2>/dev/null && continue
+        # Шаг 2: новая версия — качаем полный скрипт (~60KB, редко)
+        local tmp; tmp=$(mktemp /tmp/xray-upd-XXXXXX.sh 2>/dev/null) || tmp="/tmp/xray-upd-$$.sh"
+        wget --no-check-certificate -qO "$tmp" "$SCRIPT_URL" 2>/dev/null || { rm -f "$tmp"; continue; }
+        [ -s "$tmp" ] || { rm -f "$tmp"; continue; }
+        sh -n "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+        cp "$tmp" "$XRAY_SELF" && chmod +x "$XRAY_SELF" || { rm -f "$tmp"; continue; }
+        rm -f "$tmp"
+        logger -t xray "Скрипт обновлён: $current_ver → $remote_ver (Xray работает)"
+        # Обновляем current_ver чтобы не скачивать снова в следующей итерации
+        current_ver="$remote_ver"
+    done
+}
+
+_start_updater() {
+    # Уже запущен?
+    if [ -f "$XRAY_UPDATER_PID" ] && kill -0 "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null; then
+        return 0
+    fi
+    # Запускаем демон в фоне
+    nohup sh "$XRAY_SELF" _updater_daemon > /dev/null 2>&1 &
+    printf '%s\n' "$!" > "$XRAY_UPDATER_PID"
+}
+
+_stop_updater() {
+    [ -f "$XRAY_UPDATER_PID" ] || return 0
+    kill "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null || true
+    rm -f "$XRAY_UPDATER_PID"
 }
 
 # ─── Обновление скрипта с GitHub ─────────────────────────────────────────────
@@ -940,7 +996,9 @@ install_cron() {
     printf '0 */%s * * * sh %s update >> /var/log/xray-update.log 2>&1 %s\n' \
         "$hours" "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
     /etc/init.d/cron restart 2>/dev/null || true
-    info "Автообновление: скрипт каждые 15 мин., подписка каждые ${hours} ч., healthcheck каждые 5 мин."
+    # Запускаем демон немедленно — не ждём первого healthcheck
+    _start_updater
+    info "Автообновление: демон проверяет скрипт каждые 10 сек., подписка каждые ${hours} ч."
 }
 
 remove_cron() {
@@ -2000,7 +2058,8 @@ main() {
         warp)           cmd_warp_menu ;;
         self-update)    cmd_self_update ;;
         script-check)   cmd_script_check ;;
-        healthcheck)    _selfheal_tproxy ;;
+        _updater_daemon) _updater_daemon ;;
+        healthcheck)    _selfheal_tproxy; _start_updater ;;
         autostart-on)   install_init_script && info "Автозапуск включён" ;;
         autostart-off)  remove_init_script  && info "Автозапуск выключен" ;;
         cron-on)        install_cron 6      && info "Автообновление включено" ;;
