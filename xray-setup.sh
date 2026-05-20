@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260582"
+SCRIPT_VERSION="20260583"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1162,7 +1162,7 @@ gen_config() {
      "settings":{"auth":"noauth","udp":true}},
     {"tag":"http","listen":"0.0.0.0","port":1081,"protocol":"http","settings":{}},
     {"tag":"tproxy","listen":"0.0.0.0","port":12345,"protocol":"dokodemo-door",
-     "settings":{"network":"tcp","followRedirect":true},
+     "settings":{"network":"tcp,udp","followRedirect":true},
      "streamSettings":{"sockopt":{"tproxy":"redirect"}},
      "sniffing":{"enabled":true,"destOverride":["http","tls"],"routeOnly":true}}
   ],
@@ -1181,7 +1181,8 @@ ${warp_ob_line}
     "rules": [
       {"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4"],"outboundTag":"direct"},
       {"type":"field","ip":["109.105.128.0/17"],"outboundTag":"direct"},
-      {"type":"field","domain":["regexp:\\.ru$","regexp:\\.su$","regexp:\\.xn--p1ai$","domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com","domain:telegram.org","domain:t.me","domain:telegram.me","domain:telegra.ph"],"outboundTag":"direct"},
+      {"type":"field","domain":["regexp:\\.ru$","regexp:\\.su$","regexp:\\.xn--p1ai$","domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
+      {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"balancerTag":"balancer"},
 ${warp_rule_line}
       {"type":"field","network":"tcp,udp","balancerTag":"balancer"}
     ]
@@ -1499,14 +1500,15 @@ _apply_excluded_ips() {
     done < "$XRAY_EXCLUDED_IPS_FILE"
 }
 
-# ─── Прозрачный прокси: NAT REDIRECT (TCP) ───────────────────────────────────
-# Используем iptables -t nat REDIRECT → намного проще и надёжнее чем TPROXY.
+# ─── Прозрачный прокси: NAT REDIRECT (TCP + UDP Telegram) ───────────────────
+# TCP: весь трафик → REDIRECT :12345 (кроме приватных/игровых/SSH).
+# UDP: только Telegram IP-диапазоны → REDIRECT :12345 (звонки/видео через прокси).
 # Не требует kmod-ipt-tproxy, ip rule, ip route.
-# UDP идёт напрямую (игры, DNS, Telegram-звонки — работают без прокси).
-# Xray снифает SNI/Host чтобы роутить .ru по домену, а не по IP.
+# Xray снифает SNI/Host чтобы роутить .ru по домену.
+_TG_IPS="91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.56.0/22 149.154.160.0/20 149.154.164.0/22"
 setup_iptables() {
     local iface; iface=$(_lan_iface)
-    info "Настраиваю прозрачный прокси (NAT REDIRECT, TCP, $iface → :12345)..."
+    info "Настраиваю прозрачный прокси (NAT REDIRECT, TCP+UDP Telegram, $iface → :12345)..."
 
     remove_iptables 2>/dev/null || true
 
@@ -1530,14 +1532,19 @@ setup_iptables() {
     # SSH — не трогаем управляющий трафик
     iptables -t nat -A "$IPTABLES_CHAIN" -p tcp --dport 22 -j RETURN
 
-    # Весь TCP → Xray :12345 (он уже знает куда отправить по домену/IP)
+    # UDP Telegram (звонки/видео) → Xray :12345
+    for _tgip in $_TG_IPS; do
+        iptables -t nat -A "$IPTABLES_CHAIN" -p udp -d "$_tgip" -j REDIRECT --to-ports 12345
+    done
+
+    # Весь TCP → Xray :12345
     iptables -t nat -A "$IPTABLES_CHAIN" -p tcp -j REDIRECT --to-ports 12345
 
     # Применяем к LAN-трафику
     iptables -t nat -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN"
 
     conntrack -F 2>/dev/null || true
-    info "Прозрачный прокси включён (TCP, интерфейс $iface)"
+    info "Прозрачный прокси включён (TCP + UDP Telegram, интерфейс $iface)"
     _persist_iptables "$iface"
 }
 
@@ -1583,6 +1590,9 @@ _persist_iptables() {
         printf 'iptables -t nat -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
         printf 'iptables -t nat -A XRAY_TP -d 109.105.128.0/17 -j RETURN\n'
         printf 'iptables -t nat -A XRAY_TP -p tcp --dport 22 -j RETURN\n'
+        for _tgip in $_TG_IPS; do
+            printf 'iptables -t nat -A XRAY_TP -p udp -d %s -j REDIRECT --to-ports 12345\n' "$_tgip"
+        done
         printf 'iptables -t nat -A XRAY_TP -p tcp -j REDIRECT --to-ports 12345\n'
         printf 'iptables -t nat -A PREROUTING -i %s -j XRAY_TP\n' "$iface"
         printf '%s-end\n' "$FIREWALL_MARK"
