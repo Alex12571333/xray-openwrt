@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260577"
+SCRIPT_VERSION="20260578"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -273,18 +273,10 @@ _tg_configured() {
     local t; t=$(_tg_token); [ -n "$t" ] && [ "$t" != "none" ]
 }
 
-# Вспомогательная функция — строим аргументы прокси для curl/wget.
-# Роутер сам НЕ ходит через tproxy (tproxy только для br-lan).
-# Если Xray запущен — направляем свои запросы через его SOCKS5.
-_tg_proxy_args_curl() {
-    nc -z 127.0.0.1 1080 2>/dev/null && printf '%s' "-x socks5://127.0.0.1:1080" || printf ''
-}
-_tg_proxy_env_wget() {
-    nc -z 127.0.0.1 1080 2>/dev/null && printf '%s' "https_proxy=socks5://127.0.0.1:1080 http_proxy=socks5://127.0.0.1:1080" || printf ''
-}
-
 # Отправить сообщение в Telegram (plain text, до 4096 символов)
-# Возвращает 0 если Telegram ответил "ok":true, иначе 1.
+# Стратегия: сначала через Xray SOCKS5 (нужен если ISP блокирует Telegram),
+# при неудаче — прямое соединение. Не зависит от nc -z (BusyBox-совместимо).
+# Возвращает 0 только если Telegram ответил "ok":true.
 _tg_send() {
     _tg_configured || return 0
     local text="$1"
@@ -293,26 +285,33 @@ _tg_send() {
     local url="https://api.telegram.org/bot${token}/sendMessage"
     local resp
     if command -v curl >/dev/null 2>&1; then
-        # --data-urlencode: правильное кодирование любых символов (emoji, кириллица)
-        # -x socks5://...: через Xray если запущен (иначе ISP может блокировать)
-        local proxy_arg; proxy_arg=$(_tg_proxy_args_curl)
-        resp=$(curl -s -k --max-time 10 $proxy_arg \
+        # Попытка 1: через Xray SOCKS5 (короткий timeout — если Xray не запущен, быстро падает)
+        resp=$(curl -s -k --max-time 8 -x socks5://127.0.0.1:1080 \
+            --data-urlencode "chat_id=${chat}" \
+            --data-urlencode "text=${text}" \
+            --data-urlencode "parse_mode=HTML" \
+            "$url" 2>/dev/null)
+        printf '%s' "$resp" | grep -q '"ok":true' && return 0
+        # Попытка 2: прямое соединение (если Xray не запущен или SOCKS5 не нужен)
+        resp=$(curl -s -k --max-time 10 \
             --data-urlencode "chat_id=${chat}" \
             --data-urlencode "text=${text}" \
             --data-urlencode "parse_mode=HTML" \
             "$url" 2>/dev/null)
     else
-        # wget fallback: базовое URL-кодирование + прокси если нужен
+        # wget fallback: через HTTP-прокси Xray если доступен, иначе напрямую
         local enc
         enc=$(printf '%s' "$text" | \
             sed 's/%/%25/g; s/&/%26/g; s/+/%2B/g; s/#/%23/g; s/ /+/g' | \
             awk '{printf "%s%s",(NR>1?"%0A":""),$0}')
-        local proxy_env; proxy_env=$(_tg_proxy_env_wget)
-        resp=$(env $proxy_env wget --no-check-certificate -qO- \
+        resp=$(https_proxy=http://127.0.0.1:1081 wget --no-check-certificate -qO- \
+            --post-data="chat_id=${chat}&text=${enc}&parse_mode=HTML" \
+            "$url" 2>/dev/null)
+        printf '%s' "$resp" | grep -q '"ok":true' && return 0
+        resp=$(wget --no-check-certificate -qO- \
             --post-data="chat_id=${chat}&text=${enc}&parse_mode=HTML" \
             "$url" 2>/dev/null)
     fi
-    # Успех только если Telegram вернул "ok":true
     printf '%s' "$resp" | grep -q '"ok":true' && return 0
     return 1
 }
@@ -329,8 +328,15 @@ _tg_send_output() {
     local url="https://api.telegram.org/bot${token}/sendMessage"
     local resp
     if command -v curl >/dev/null 2>&1; then
-        local proxy_arg; proxy_arg=$(_tg_proxy_args_curl)
-        resp=$(curl -s -k --max-time 15 $proxy_arg \
+        # Попытка 1: через SOCKS5
+        resp=$(curl -s -k --max-time 10 -x socks5://127.0.0.1:1080 \
+            --data-urlencode "chat_id=${chat}" \
+            --data-urlencode "text=${full}" \
+            --data-urlencode "parse_mode=HTML" \
+            "$url" 2>/dev/null)
+        printf '%s' "$resp" | grep -q '"ok":true' && return 0
+        # Попытка 2: напрямую
+        resp=$(curl -s -k --max-time 15 \
             --data-urlencode "chat_id=${chat}" \
             --data-urlencode "text=${full}" \
             --data-urlencode "parse_mode=HTML" \
@@ -364,12 +370,16 @@ cmd_tg_setup() {
                     local _chat; _chat=$(_tg_chat)
                     local _resp
                     if command -v curl >/dev/null 2>&1; then
-                        local _parg; _parg=$(_tg_proxy_args_curl)
-                        _resp=$(curl -s -k --max-time 10 $_parg \
+                        # Проверяем токен через SOCKS5 (на случай блокировки)
+                        _resp=$(curl -s -k --max-time 8 -x socks5://127.0.0.1:1080 \
+                            "https://api.telegram.org/bot${_tkn}/getMe" 2>/dev/null)
+                        [ -z "$_resp" ] && _resp=$(curl -s -k --max-time 10 \
                             "https://api.telegram.org/bot${_tkn}/getMe" 2>/dev/null)
                     else
-                        local _penv; _penv=$(_tg_proxy_env_wget)
-                        _resp=$(env $_penv wget --no-check-certificate -qO- \
+                        _resp=$(https_proxy=http://127.0.0.1:1081 \
+                            wget --no-check-certificate -qO- \
+                            "https://api.telegram.org/bot${_tkn}/getMe" 2>/dev/null)
+                        [ -z "$_resp" ] && _resp=$(wget --no-check-certificate -qO- \
                             "https://api.telegram.org/bot${_tkn}/getMe" 2>/dev/null)
                     fi
                     if printf '%s' "$_resp" | grep -q '"ok":true'; then
@@ -1389,11 +1399,12 @@ remove_cron() {
 
 cron_interval() {
     [ -f "$XRAY_CRON" ] || { printf 'выключено'; return; }
+    # Ищем строку с "update" — она содержит */N в поле часов (не healthcheck с */5 в минутах)
     local entry
-    entry=$(grep "$CRON_MARKER" "$XRAY_CRON" 2>/dev/null | head -1)
+    entry=$(grep "$CRON_MARKER" "$XRAY_CRON" 2>/dev/null | grep ' update' | head -1)
     [ -z "$entry" ] && { printf 'выключено'; return; }
-    # Extract interval from "0 */N * * *"
-    printf '%s' "$entry" | awk '{printf "каждые %s ч.", substr($2,3)}'
+    # Формат: "0 */N * * * ..." → извлекаем N из второго поля
+    printf '%s' "$entry" | awk '{n=substr($2,3); if(n~/^[0-9]+$/) printf "каждые %s ч.", n; else printf "вкл"}'
 }
 
 # ─── iptables прозрачный прокси (TCP REDIRECT) ───────────────────────────────
