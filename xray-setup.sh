@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260601"
+SCRIPT_VERSION="20260602"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1877,6 +1877,10 @@ warp_register() {
 
     [ -n "$cf_pubkey" ]    || die "Не удалось извлечь CF pubkey из ответа WARP API"
     [ -n "$endpoint" ]     || { warn "endpoint не найден — использую 162.159.192.1:2408"; endpoint="162.159.192.1:2408"; }
+    # Cloudflare API иногда возвращает порт 0 — заменяем на 2408
+    case "$endpoint" in
+        *:0) endpoint="${endpoint%:0}:2408"; warn "endpoint порт 0 → принудительно 2408" ;;
+    esac
     [ -n "$addr4" ]        || { warn "адрес не найден — использую 172.16.0.2"; addr4="172.16.0.2"; }
     [ -n "$reserved_raw" ] || { warn "reserved не найден — использую 0,0,0"; reserved_raw="0,0,0"; }
 
