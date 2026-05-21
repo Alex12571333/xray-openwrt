@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260600"
+SCRIPT_VERSION="20260601"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1895,8 +1895,9 @@ WARPEOF
 }
 
 # Возвращает JSON-объект outbound (без ведущей запятой).
-# WireGuard-трафик идёт внутри VLESS-туннеля (proxy1) →
-# DPI видит только VLESS, блокировка WireGuard в России не мешает.
+# WireGuard-трафик идёт напрямую с роутера на Cloudflare (UDP :2408).
+# Цель — ChatGPT видит Cloudflare IP, а не VPS datacenter IP.
+# VLESS для этого не нужен — Cloudflare UDP не блокируется в России.
 gen_warp_outbound() {
     [ -f "$WARP_CONF" ] || return 1
     . "$WARP_CONF" 2>/dev/null
@@ -1913,8 +1914,7 @@ gen_warp_outbound() {
         "peers": [{"publicKey": "${WARP_CF_PUBKEY}", "endpoint": "${WARP_ENDPOINT}"}],
         "reserved": ${reserved_json},
         "mtu": 1280
-      },
-      "proxySettings": {"tag": "proxy1", "transportLayer": true}
+      }
     }
 WARPJSON
 }
