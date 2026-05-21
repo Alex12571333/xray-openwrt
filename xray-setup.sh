@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260599"
+SCRIPT_VERSION="20260600"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1834,20 +1834,30 @@ warp_register() {
         "$pub" "$tos")
 
     local resp
+    local _warp_url='https://api.cloudflareclient.com/v0a2158/reg'
+    # Пробуем через SOCKS5 (Xray), потом напрямую — API может быть заблокирован в РФ
     if command -v curl >/dev/null 2>&1; then
+        resp=$(curl -s -k --max-time 30 -x socks5://127.0.0.1:1080 -X POST \
+            -H 'CF-Client-Version: a-6.11-2158' -H 'Content-Type: application/json' \
+            -d "$body" "$_warp_url" 2>/dev/null)
+        [ -z "$resp" ] && \
         resp=$(curl -s -k --max-time 30 -X POST \
-            -H 'CF-Client-Version: a-6.11-2158' \
-            -H 'Content-Type: application/json' \
-            -d "$body" \
-            'https://api.cloudflareclient.com/v0a2158/reg' 2>/dev/null)
+            -H 'CF-Client-Version: a-6.11-2158' -H 'Content-Type: application/json' \
+            -d "$body" "$_warp_url" 2>/dev/null)
     else
+        resp=$(https_proxy=http://127.0.0.1:1081 wget --no-check-certificate -qO- \
+            --post-data="$body" \
+            --header='CF-Client-Version: a-6.11-2158' \
+            --header='Content-Type: application/json' \
+            "$_warp_url" 2>/dev/null)
+        [ -z "$resp" ] && \
         resp=$(wget --no-check-certificate -qO- \
             --post-data="$body" \
             --header='CF-Client-Version: a-6.11-2158' \
             --header='Content-Type: application/json' \
-            'https://api.cloudflareclient.com/v0a2158/reg' 2>/dev/null)
+            "$_warp_url" 2>/dev/null)
     fi
-    [ -n "$resp" ] || die "Нет ответа от WARP API — проверьте интернет-соединение"
+    [ -n "$resp" ] || die "Нет ответа от WARP API — убедитесь что Xray запущен и прокси работает"
 
     # Парсим JSON без jq (убираем переносы строк для надёжного grep)
     local resp1
