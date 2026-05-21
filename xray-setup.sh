@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260603"
+SCRIPT_VERSION="20260604"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -284,6 +284,9 @@ _tg_bot_exec_cmd() {
 
 _tg_bot_daemon() {
     _tg_configured || return 0
+    # Переустанавливаем trap: мы долгоживущий демон
+    trap 'logger -t xray-tgbot "Бот завершён (PID $$)"; rm -f "$XRAY_TG_BOT_PID"' EXIT
+    trap - INT TERM
     printf '%s\n' "$$" > "$XRAY_TG_BOT_PID"
     logger -t xray-tgbot "Telegram бот запущен (PID $$)"
 
@@ -363,7 +366,7 @@ _start_tg_bot() {
     _tg_configured || return 0
     [ -f "$XRAY_TG_BOT_PID" ] && kill -0 "$(cat "$XRAY_TG_BOT_PID")" 2>/dev/null && return 0
     [ -f "$XRAY_SELF" ] || return 1
-    nohup sh "$XRAY_SELF" _tg_bot_daemon > /dev/null 2>&1 &
+    ( nohup sh "$XRAY_SELF" _tg_bot_daemon > /dev/null 2>&1 & )
     logger -t xray-tgbot "_start_tg_bot: запущен"
 }
 
@@ -374,10 +377,9 @@ _stop_tg_bot() {
 }
 
 _updater_daemon() {
-    # Просто пишем свой PID — защита от дублей уже есть в _start_updater.
-    # Не делаем kill-check здесь: $! от nohup и $$ внутри sh могут различаться
-    # (nohup форкает), из-за чего PID в файле ≠ $$, демон думает "уже запущен"
-    # и выходит, хотя на самом деле должен стартовать.
+    # Переустанавливаем trap: мы долгоживущий демон, не разовый скрипт
+    trap 'logger -t xray-upd "Демон завершён (PID $$)"; rm -f "$XRAY_UPDATER_PID"' EXIT
+    trap - INT TERM  # дефолтная обработка сигналов — EXIT trap всё равно сработает
     printf '%s\n' "$$" > "$XRAY_UPDATER_PID"
     logger -t xray-upd "Демон запущен (PID $$)"
 
@@ -486,8 +488,10 @@ _start_updater() {
     [ -f "$XRAY_SELF" ] || { logger -t xray-upd "XRAY_SELF не найден: $XRAY_SELF"; return 1; }
     # Запускаем демон в фоне. Демон сам запишет свой $$ в PID-файл.
     # nohup на BusyBox может форкать → $! ≠ $$ внутри sh, поэтому PID не пишем здесь.
-    nohup sh "$XRAY_SELF" _updater_daemon > /dev/null 2>&1 &
-    logger -t xray-upd "_start_updater: демон запрошен (nohup PID $!)"
+    # Двойной форк: демон отвязан от родительской группы процессов,
+    # не получит SIGHUP/SIGTERM когда cron-задача завершится
+    ( nohup sh "$XRAY_SELF" _updater_daemon > /dev/null 2>&1 & )
+    logger -t xray-upd "_start_updater: демон запрошен"
 }
 
 _stop_updater() {
