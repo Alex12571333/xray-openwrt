@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260598"
+SCRIPT_VERSION="20260599"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -24,6 +24,7 @@ DEFAULT_SUB_URL=""  # Хранится локально в /etc/xray/sub_url —
 XRAY_BIN="/usr/bin/xray"
 XRAY_CONFIG="/etc/xray/config.json"
 XRAY_PID="/var/run/xray.pid"
+XRAY_INTENT="/var/run/xray-running"  # Флаг: пользователь хочет чтобы Xray работал
 XRAY_SUB_FILE="/etc/xray/sub_url"
 XRAY_SELF="/etc/xray/setup.sh"
 XRAY_INIT="/etc/init.d/xray"
@@ -1411,7 +1412,7 @@ _stop_xray() {
     local pid; pid=$(_find_xray_pid)
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     killall xray 2>/dev/null || true
-    rm -f "$XRAY_PID"
+    rm -f "$XRAY_PID" "$XRAY_INTENT"
 }
 
 # ─── Запустить Xray с учётом procd ───────────────────────────────────────────
@@ -1447,6 +1448,7 @@ start_xray() {
         tail -20 "$XRAY_LOG" 2>/dev/null || warn "(лог пуст)"
         die "Xray не запустился — см. лог выше"
     fi
+    touch "$XRAY_INTENT"   # Пользователь явно запустил — помним это до перезагрузки
     info "Xray запущен, PID $pid"
     _tg_send "✅ Xray запущен (PID $pid)"
 }
@@ -1483,9 +1485,8 @@ _fast_restart() {
 _reload_xray() {
     local pid; pid=$(_find_xray_pid)
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-        warn "Xray не запущен — запускаю..."
-        start_xray
-        return
+        info "Xray не запущен — конфиг сохранён, применится при следующем запуске"
+        return 0
     fi
     kill -HUP "$pid" 2>/dev/null || {
         warn "SIGHUP не удался — делаю быстрый рестарт"
@@ -2660,18 +2661,22 @@ _autofix_sub_url() {
 # Вызывается при каждом запуске скрипта — до любых других действий.
 _selfheal_tproxy() {
     _xray_is_running 2>/dev/null && return 0  # Xray жив — всё ок
-    # Xray не запущен — пробуем перезапустить
-    if [ -f "$XRAY_CONFIG" ]; then
-        warn "Авторемонт: Xray не запущен — перезапускаю..."
-        _fast_restart 2>/dev/null && {
-            logger -t xray-heal "Xray перезапущен автоматически"
-            return 0
-        }
+    # Перезапускаем только если: autostart включён ИЛИ пользователь явно запускал в этой сессии
+    # XRAY_INTENT (/var/run/xray-running) — tmpfs, очищается при перезагрузке.
+    # Это предотвращает автостарт Xray при перезагрузке когда autostart выключен.
+    if autostart_enabled 2>/dev/null || [ -f "$XRAY_INTENT" ]; then
+        if [ -f "$XRAY_CONFIG" ]; then
+            warn "Авторемонт: Xray не запущен — перезапускаю..."
+            _fast_restart 2>/dev/null && {
+                logger -t xray-heal "Xray перезапущен автоматически"
+                return 0
+            }
+        fi
     fi
-    # Xray не удалось запустить — если tproxy активен, снимаем чтобы не блокировать интернет
+    # Не должен быть запущен или не удалось — если tproxy активен, снимаем
     iptables_active 2>/dev/null || return 0
-    warn "Авторемонт: Xray упал и не восстановился — снимаю перехват трафика"
-    _tg_send "⚠️ Xray упал и не восстановился — tproxy снят, интернет работает напрямую. Запусти /restart"
+    warn "Авторемонт: tproxy активен, Xray не запущен — снимаю перехват трафика"
+    _tg_send "⚠️ Xray не запущен — tproxy снят, интернет работает напрямую. Запусти /restart"
     _tproxy_detach 2>/dev/null || true
 }
 
