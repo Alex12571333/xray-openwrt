@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260593"
+SCRIPT_VERSION="20260594"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1441,6 +1441,8 @@ start_xray() {
     _stop_xray
     _start_xray_proc
     [ "$_tp" = 1 ] && _tproxy_attach
+    # Сбрасываем conntrack — иначе игры (L2 и др.) зависают на повторном входе
+    conntrack -F 2>/dev/null || true
     local pid; pid=$(_find_xray_pid)
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
         warn "=== Xray упал сразу. Последние строки лога ==="
@@ -1469,6 +1471,8 @@ _fast_restart() {
     done
     # Возвращаем TPROXY-хук (Xray готов принимать трафик)
     [ "$_tp" = 1 ] && _tproxy_attach
+    # Сбрасываем conntrack — иначе игры (L2 и др.) зависают на повторном входе
+    conntrack -F 2>/dev/null || true
     local pid; pid=$(_find_xray_pid)
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
         || die "Xray не запустился — проверьте лог: $XRAY_LOG"
