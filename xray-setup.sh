@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260602"
+SCRIPT_VERSION="20260603"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1314,7 +1314,7 @@ gen_config() {
     ob3=$(gen_outbound "proxy3" "$([ -f /tmp/xray_sv_3.env ] && echo /tmp/xray_sv_3.env || echo /tmp/xray_sv_1.env)")
 
     # WARP: опциональный outbound и правило маршрутизации
-    local warp_ob_line="" warp_rule_line=""
+    local warp_ob_line="" warp_rule_line="" warp_cf_ip_rule=""
     if warp_configured 2>/dev/null; then
         local _wo
         _wo=$(gen_warp_outbound) && {
@@ -1337,6 +1337,8 @@ gen_config() {
                 printf "["; for(i=1;i<=NF;i++){if(i>1)printf ","; printf "\"%s\"",$i}; printf "]"
             }')
             warp_rule_line="      {\"type\":\"field\",\"domain\":${_wjson},\"outboundTag\":\"warp\"},"
+            # IP-диапазоны Cloudflare CDN — для ECH (зашифрованный SNI) когда домен не виден
+            warp_cf_ip_rule='      {"type":"field","ip":["104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"],"outboundTag":"warp"},'
             info "WARP включён: $(printf '%s' "$_wdomains" | tr ',' '\n' | wc -l | tr -d ' ') доменов → Cloudflare"
         } || warn "WARP настроен, но gen_warp_outbound вернул ошибку — WARP пропущен"
     fi
@@ -1371,6 +1373,7 @@ ${warp_ob_line}
       {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$","regexp:[.]xn--p1ai$","domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
       {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"balancerTag":"balancer"},
 ${warp_rule_line}
+${warp_cf_ip_rule}
       {"type":"field","network":"tcp,udp","balancerTag":"balancer"}
     ]
   },
