@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260597"
+SCRIPT_VERSION="20260598"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1441,8 +1441,6 @@ start_xray() {
     _stop_xray
     _start_xray_proc
     [ "$_tp" = 1 ] && _tproxy_attach
-    # Сбрасываем conntrack — иначе игры (L2 и др.) зависают на повторном входе
-    conntrack -F 2>/dev/null || true
     local pid; pid=$(_find_xray_pid)
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
         warn "=== Xray упал сразу. Последние строки лога ==="
@@ -1471,8 +1469,6 @@ _fast_restart() {
     done
     # Возвращаем TPROXY-хук (Xray готов принимать трафик)
     [ "$_tp" = 1 ] && _tproxy_attach
-    # Сбрасываем conntrack — иначе игры (L2 и др.) зависают на повторном входе
-    conntrack -F 2>/dev/null || true
     local pid; pid=$(_find_xray_pid)
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
         || die "Xray не запустился — проверьте лог: $XRAY_LOG"
@@ -2663,11 +2659,19 @@ _autofix_sub_url() {
 # ─── Самовосстановление: tproxy активен но Xray не запущен → убрать хук ──────
 # Вызывается при каждом запуске скрипта — до любых других действий.
 _selfheal_tproxy() {
-    iptables_active 2>/dev/null || return 0   # tproxy не активен — всё ок
     _xray_is_running 2>/dev/null && return 0  # Xray жив — всё ок
-    # tproxy перехватывает трафик, Xray мёртв → интернет у всех сломан
-    warn "Авторемонт: tproxy активен, Xray не запущен — снимаю перехват трафика"
-    _tg_send "⚠️ Xray упал — tproxy снят, интернет восстановлен. Запусти r для восстановления."
+    # Xray не запущен — пробуем перезапустить
+    if [ -f "$XRAY_CONFIG" ]; then
+        warn "Авторемонт: Xray не запущен — перезапускаю..."
+        _fast_restart 2>/dev/null && {
+            logger -t xray-heal "Xray перезапущен автоматически"
+            return 0
+        }
+    fi
+    # Xray не удалось запустить — если tproxy активен, снимаем чтобы не блокировать интернет
+    iptables_active 2>/dev/null || return 0
+    warn "Авторемонт: Xray упал и не восстановился — снимаю перехват трафика"
+    _tg_send "⚠️ Xray упал и не восстановился — tproxy снят, интернет работает напрямую. Запусти /restart"
     _tproxy_detach 2>/dev/null || true
 }
 
