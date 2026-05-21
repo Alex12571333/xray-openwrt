@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260596"
+SCRIPT_VERSION="20260597"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1718,8 +1718,6 @@ setup_iptables() {
     iptables -t nat -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
     iptables -t nat -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
     iptables -t nat -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
-    # Lineage2/4game/Innova — все серверы в 109.105.128.0/17, GameGuard обходит Xray
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 109.105.128.0/17 -j RETURN
     # SSH — не трогаем управляющий трафик
     iptables -t nat -A "$IPTABLES_CHAIN" -p tcp --dport 22 -j RETURN
 
@@ -1779,7 +1777,6 @@ _persist_iptables() {
         printf 'iptables -t nat -A XRAY_TP -d 192.168.0.0/16 -j RETURN\n'
         printf 'iptables -t nat -A XRAY_TP -d 224.0.0.0/4 -j RETURN\n'
         printf 'iptables -t nat -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 109.105.128.0/17 -j RETURN\n'
         printf 'iptables -t nat -A XRAY_TP -p tcp --dport 22 -j RETURN\n'
         for _tgip in $_TG_IPS; do
             printf 'iptables -t nat -A XRAY_TP -p udp -d %s -j REDIRECT --to-ports 12345\n' "$_tgip"
