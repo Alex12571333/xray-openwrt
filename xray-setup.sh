@@ -881,9 +881,10 @@ cmd_self_update() {
     info "Текущая версия: $SCRIPT_VERSION"
     info "Проверяю обновления..."
 
-    # Шаг 1: лёгкая проверка version-файла (10 байт, без CDN-кэша полного скрипта)
-    local remote_ver
-    remote_ver=$(_dl "$SCRIPT_VERSION_URL" - 2>/dev/null | tr -d ' \r\n')
+    # Шаг 1: лёгкая проверка version-файла (cache-bust чтобы CDN не отдал старое)
+    local remote_ver _nocache
+    _nocache=$(date +%s 2>/dev/null || echo "$$")
+    remote_ver=$(_dl "${SCRIPT_VERSION_URL}?nc=${_nocache}" - 2>/dev/null | tr -d ' \r\n')
     if [ -n "$remote_ver" ]; then
         info "Доступная версия: $remote_ver"
         if [ "$remote_ver" -le "$SCRIPT_VERSION" ] 2>/dev/null; then
