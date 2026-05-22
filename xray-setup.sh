@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260609"
+SCRIPT_VERSION="20260610"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -331,12 +331,8 @@ _start_tg_bot() {
     _tg_configured || return 0
     [ -f "$XRAY_TG_BOT_PID" ] && kill -0 "$(cat "$XRAY_TG_BOT_PID")" 2>/dev/null && return 0
     [ -f "$XRAY_SELF" ] || return 1
-    if command -v setsid >/dev/null 2>&1; then
-        ( setsid sh "$XRAY_SELF" _tg_bot_daemon > /dev/null 2>&1 & )
-    else
-        ( nohup sh "$XRAY_SELF" _tg_bot_daemon > /dev/null 2>&1 & )
-    fi
-    logger -t xray-tgbot "_start_tg_bot: запущен"
+    sh "$XRAY_SELF" _tg_bot_daemon </dev/null >/dev/null 2>&1 &
+    logger -t xray-tgbot "_start_tg_bot: запущен (PID $!)"
 }
 
 _stop_tg_bot() {
@@ -455,15 +451,9 @@ _start_updater() {
     fi
     # Файл скрипта должен существовать
     [ -f "$XRAY_SELF" ] || { logger -t xray-upd "XRAY_SELF не найден: $XRAY_SELF"; return 1; }
-    # setsid: создаёт новую сессию → демон не в process group cron-задачи
-    # BusyBox crond убивает весь process group при завершении задачи — setsid спасает от этого
-    # Fallback на двойной-nohup если setsid недоступен
-    if command -v setsid >/dev/null 2>&1; then
-        ( setsid sh "$XRAY_SELF" _updater_daemon > /dev/null 2>&1 & )
-    else
-        ( nohup sh "$XRAY_SELF" _updater_daemon > /dev/null 2>&1 & )
-    fi
-    logger -t xray-upd "_start_updater: демон запрошен (setsid=$(command -v setsid >/dev/null 2>&1 && echo ok || echo no))"
+    # Демон игнорирует HUP и TERM (trap '' HUP TERM внутри) — nohup/setsid не нужны
+    sh "$XRAY_SELF" _updater_daemon </dev/null >/dev/null 2>&1 &
+    logger -t xray-upd "_start_updater: демон запрошен (PID $!)"
 }
 
 _stop_updater() {
