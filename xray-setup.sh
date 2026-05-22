@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260610"
+SCRIPT_VERSION="20260611"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -185,7 +185,7 @@ _cancel_watchdog() {
 _tg_bot_status_text() {
     local xray_st tproxy_st autostart_st cron_st upd_st tunnel_st
     if _xray_is_running; then
-        xray_st="▶ запущен (PID $(cat "$XRAY_PID_FILE" 2>/dev/null))"
+        xray_st="▶ запущен (PID $(cat "$XRAY_PID" 2>/dev/null))"
     else
         xray_st="■ остановлен"
     fi
