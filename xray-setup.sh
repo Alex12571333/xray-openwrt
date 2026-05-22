@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260608"
+SCRIPT_VERSION="20260609"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -251,8 +251,7 @@ _tg_bot_daemon() {
     _tg_configured || return 0
     # Переустанавливаем trap: мы долгоживущий демон
     trap 'logger -t xray-tgbot "Бот завершён (PID $$)"; rm -f "$XRAY_TG_BOT_PID"' EXIT
-    trap '' HUP
-    trap - INT TERM
+    trap '' HUP TERM   # игнорируем HUP и TERM — убить только через kill -9
     printf '%s\n' "$$" > "$XRAY_TG_BOT_PID"
     logger -t xray-tgbot "Telegram бот запущен (PID $$)"
 
@@ -342,15 +341,14 @@ _start_tg_bot() {
 
 _stop_tg_bot() {
     [ -f "$XRAY_TG_BOT_PID" ] || return 0
-    kill "$(cat "$XRAY_TG_BOT_PID")" 2>/dev/null || true
+    kill -9 "$(cat "$XRAY_TG_BOT_PID")" 2>/dev/null || true
     rm -f "$XRAY_TG_BOT_PID"
 }
 
 _updater_daemon() {
     # Переустанавливаем trap: мы долгоживущий демон, не разовый скрипт
     trap 'logger -t xray-upd "Демон завершён (PID $$)"; rm -f "$XRAY_UPDATER_PID"' EXIT
-    trap '' HUP        # игнорируем SIGHUP (защита если setsid недоступен)
-    trap - INT TERM    # дефолтная обработка — EXIT trap отработает при kill
+    trap '' HUP TERM   # игнорируем HUP и TERM — убить только через kill -9
     printf '%s\n' "$$" > "$XRAY_UPDATER_PID"
     logger -t xray-upd "Демон запущен (PID $$)"
 
@@ -470,7 +468,7 @@ _start_updater() {
 
 _stop_updater() {
     [ -f "$XRAY_UPDATER_PID" ] || return 0
-    kill "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null || true
+    kill -9 "$(cat "$XRAY_UPDATER_PID")" 2>/dev/null || true
     rm -f "$XRAY_UPDATER_PID"
 }
 
@@ -1872,7 +1870,8 @@ cmd_status() {
         printf '  Демон апдейт: запущен (PID %s)\n' "$(cat "$XRAY_UPDATER_PID")"
     else
         printf '  Демон апдейт: не запущен\n'
-        printf '  Последний лог: %s\n' "$(logread 2>/dev/null | grep 'xray-upd' | tail -1 | sed 's/.*xray-upd: //')"
+        printf '  Лог демона:\n'
+        logread 2>/dev/null | grep -E 'xray-upd|xray-tgbot' | tail -6 | sed 's/.*daemon\./  > /'
     fi
     if [ -f "$XRAY_TG_BOT_PID" ] && kill -0 "$(cat "$XRAY_TG_BOT_PID")" 2>/dev/null; then
         printf '  Telegram бот: запущен (PID %s)\n' "$(cat "$XRAY_TG_BOT_PID")"
