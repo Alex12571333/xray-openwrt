@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260616"
+SCRIPT_VERSION="20260617"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1216,6 +1216,12 @@ gen_outbound() {
         user_json="{\"id\":\"${SV_UUID}\",\"encryption\":\"none\"}"
     fi
 
+    # mux+xudp: туннелируем UDP (Telegram звонки) через TCP VLESS.
+    # Нельзя использовать с flow (Reality + xtls-rprx-vision).
+    local mux_json=""
+    [ -z "$SV_FLOW" ] && mux_json=',
+      "mux": {"enabled": true, "concurrency": -1, "xudpConcurrency": 16, "xudpProxyUDP443": "reject"}'
+
     local effective_sni="${SV_SNI:-${SV_HOST}}"
     local security_json
     case "$SV_SEC" in
@@ -1253,7 +1259,7 @@ gen_outbound() {
       "settings": {
         "vnext": [{"address":"${SV_HOST}","port":${SV_PORT},"users":[${user_json}]}]
       },
-      "streamSettings": { ${network_json}, ${security_json} }
+      "streamSettings": { ${network_json}, ${security_json} }${mux_json}
     }
 OUTJSON
 }
@@ -1309,7 +1315,7 @@ ${ob3},
       {"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4"],"outboundTag":"direct"},
       {"type":"field","ip":["109.105.128.0/17"],"outboundTag":"direct"},
       {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$","regexp:[.]xn--p1ai$","domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
-      {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"outboundTag":"direct"},
+      {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"balancerTag":"balancer"},
       {"type":"field","network":"tcp,udp","balancerTag":"balancer"}
     ]
   },
