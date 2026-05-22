@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260617"
+SCRIPT_VERSION="20260618"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1297,7 +1297,7 @@ gen_config() {
     {"tag":"http","listen":"0.0.0.0","port":1081,"protocol":"http","settings":{}},
     {"tag":"tproxy","listen":"0.0.0.0","port":12345,"protocol":"dokodemo-door",
      "settings":{"network":"tcp,udp","followRedirect":true},
-     "streamSettings":{"sockopt":{"tproxy":"redirect"}},
+     "streamSettings":{"sockopt":{"tproxy":"tproxy"}},
      "sniffing":{"enabled":true,"destOverride":["http","tls"],"routeOnly":true}}
   ],
   "outbounds": [
@@ -1604,24 +1604,26 @@ cron_interval() {
     printf '%s' "$entry" | awk '{n=substr($2,3); if(n~/^[0-9]+$/) printf "каждые %s ч.", n; else printf "вкл"}'
 }
 
-# ─── iptables прозрачный прокси (TCP REDIRECT) ───────────────────────────────
+# ─── iptables прозрачный прокси (TPROXY TCP+UDP) ────────────────────────────
 _lan_iface() {
     ip link show br-lan >/dev/null 2>&1 && printf 'br-lan' || printf 'eth0'
 }
 
 iptables_active() {
-    iptables -t nat -L "$IPTABLES_CHAIN" >/dev/null 2>&1
+    iptables -t mangle -L "$IPTABLES_CHAIN" >/dev/null 2>&1
 }
 
-# Быстро отцепить / прицепить цепочку от PREROUTING (NAT REDIRECT)
+# Быстро отцепить / прицепить цепочку от PREROUTING (TPROXY)
 _tproxy_detach() {
     local iface; iface=$(_lan_iface)
-    iptables -t nat -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
 }
 _tproxy_attach() {
     local iface; iface=$(_lan_iface)
-    iptables -t nat -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -t nat -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    ip rule add fwmark 0x1 table 100 2>/dev/null || true
+    ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -t mangle -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
 }
 
 _apply_excluded_ips() {
@@ -1629,53 +1631,54 @@ _apply_excluded_ips() {
     while IFS= read -r _ip; do
         [ -z "$_ip" ] && continue
         case "$_ip" in '#'*) continue ;; esac
-        iptables -t nat -A "$IPTABLES_CHAIN" -s "$_ip" -j RETURN 2>/dev/null || true
+        iptables -t mangle -A "$IPTABLES_CHAIN" -s "$_ip" -j RETURN 2>/dev/null || true
     done < "$XRAY_EXCLUDED_IPS_FILE"
 }
 
-# ─── Прозрачный прокси: NAT REDIRECT (TCP + UDP Telegram) ───────────────────
-# TCP: весь трафик → REDIRECT :12345 (кроме приватных/игровых/SSH).
-# UDP: только Telegram IP-диапазоны → REDIRECT :12345 (звонки/видео через прокси).
-# Не требует kmod-ipt-tproxy, ip rule, ip route.
+# ─── Прозрачный прокси: TPROXY (TCP + UDP) ──────────────────────────────────
+# TCP + весь UDP → TPROXY :12345 (включая Telegram звонки/видео).
+# Требует xt_TPROXY (встроен в OpenWrt 21+) + ip rule/route для policy routing.
 # Xray снифает SNI/Host чтобы роутить .ru по домену.
-_TG_IPS="91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.56.0/22 149.154.160.0/20 149.154.164.0/22"
 setup_iptables() {
     local iface; iface=$(_lan_iface)
-    info "Настраиваю прозрачный прокси (NAT REDIRECT, TCP+UDP Telegram, $iface → :12345)..."
+    info "Настраиваю прозрачный прокси (TPROXY, TCP+UDP, $iface → :12345)..."
 
     remove_iptables 2>/dev/null || true
 
-    # Цепочка в таблице nat
-    iptables -t nat -N "$IPTABLES_CHAIN" 2>/dev/null || true
+    # Загружаем модуль TPROXY (если не встроен)
+    modprobe xt_TPROXY 2>/dev/null || true
 
-    # Исключённые устройства
+    # Policy routing: помеченные пакеты (fwmark 1) → loopback → Xray
+    ip rule add fwmark 0x1 table 100 2>/dev/null || true
+    ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+
+    # Цепочка в таблице mangle
+    iptables -t mangle -N "$IPTABLES_CHAIN" 2>/dev/null || true
+
+    # Исключённые устройства (по IP источника)
     _apply_excluded_ips
 
     # Приватные/зарезервированные адреса — напрямую
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 0.0.0.0/8      -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 10.0.0.0/8     -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 127.0.0.0/8    -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 169.254.0.0/16 -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 172.16.0.0/12  -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
-    iptables -t nat -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 0.0.0.0/8      -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 10.0.0.0/8     -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 127.0.0.0/8    -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 169.254.0.0/16 -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 172.16.0.0/12  -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
     # SSH — не трогаем управляющий трафик
-    iptables -t nat -A "$IPTABLES_CHAIN" -p tcp --dport 22 -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 22 -j RETURN
 
-    # UDP Telegram (звонки/видео) → Xray :12345
-    for _tgip in $_TG_IPS; do
-        iptables -t nat -A "$IPTABLES_CHAIN" -p udp -d "$_tgip" -j REDIRECT --to-ports 12345
-    done
-
-    # Весь TCP → Xray :12345
-    iptables -t nat -A "$IPTABLES_CHAIN" -p tcp -j REDIRECT --to-ports 12345
+    # Весь TCP + UDP → TPROXY :12345 с меткой 1
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp -j TPROXY --on-port 12345 --tproxy-mark 1
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -j TPROXY --on-port 12345 --tproxy-mark 1
 
     # Применяем к LAN-трафику
-    iptables -t nat -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN"
+    iptables -t mangle -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN"
 
     conntrack -F 2>/dev/null || true
-    info "Прозрачный прокси включён (TCP + UDP Telegram, интерфейс $iface)"
+    info "Прозрачный прокси включён (TPROXY TCP+UDP, интерфейс $iface)"
     _persist_iptables "$iface"
 }
 
@@ -1703,31 +1706,32 @@ _persist_iptables() {
     _unpersist_iptables
     {
         printf '%s\n' "$FIREWALL_MARK"
-        printf 'iptables -t nat -N XRAY_TP 2>/dev/null || true\n'
+        printf 'modprobe xt_TPROXY 2>/dev/null || true\n'
+        printf 'ip rule add fwmark 0x1 table 100 2>/dev/null || true\n'
+        printf 'ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true\n'
+        printf 'iptables -t mangle -N XRAY_TP 2>/dev/null || true\n'
         if [ -f "$XRAY_EXCLUDED_IPS_FILE" ]; then
             while IFS= read -r _eip; do
                 [ -z "$_eip" ] && continue
                 case "$_eip" in '#'*) continue ;; esac
-                printf 'iptables -t nat -A XRAY_TP -s %s -j RETURN\n' "$_eip"
+                printf 'iptables -t mangle -A XRAY_TP -s %s -j RETURN\n' "$_eip"
             done < "$XRAY_EXCLUDED_IPS_FILE"
         fi
-        printf 'iptables -t nat -A XRAY_TP -d 0.0.0.0/8 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 10.0.0.0/8 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 127.0.0.0/8 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 169.254.0.0/16 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 172.16.0.0/12 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 192.168.0.0/16 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 224.0.0.0/4 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
-        printf 'iptables -t nat -A XRAY_TP -p tcp --dport 22 -j RETURN\n'
-        for _tgip in $_TG_IPS; do
-            printf 'iptables -t nat -A XRAY_TP -p udp -d %s -j REDIRECT --to-ports 12345\n' "$_tgip"
-        done
-        printf 'iptables -t nat -A XRAY_TP -p tcp -j REDIRECT --to-ports 12345\n'
-        printf 'iptables -t nat -A PREROUTING -i %s -j XRAY_TP\n' "$iface"
+        printf 'iptables -t mangle -A XRAY_TP -d 0.0.0.0/8 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 10.0.0.0/8 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 127.0.0.0/8 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 169.254.0.0/16 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 172.16.0.0/12 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 192.168.0.0/16 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 224.0.0.0/4 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -d 240.0.0.0/4 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -p tcp --dport 22 -j RETURN\n'
+        printf 'iptables -t mangle -A XRAY_TP -p tcp -j TPROXY --on-port 12345 --tproxy-mark 1\n'
+        printf 'iptables -t mangle -A XRAY_TP -p udp -j TPROXY --on-port 12345 --tproxy-mark 1\n'
+        printf 'iptables -t mangle -A PREROUTING -i %s -j XRAY_TP\n' "$iface"
         printf '%s-end\n' "$FIREWALL_MARK"
     } >> "$FIREWALL_USER"
-    info "Правила NAT REDIRECT сохранены → $FIREWALL_USER"
+    info "Правила TPROXY сохранены → $FIREWALL_USER"
 }
 
 _unpersist_iptables() {
