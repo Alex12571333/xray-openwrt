@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260619"
+SCRIPT_VERSION="20260620"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1460,6 +1460,19 @@ _servers_changed() {
     [ "$old_hosts" = "$new_hosts" ] && return 1 || return 0
 }
 
+# ─── Проверка доступности текущего proxy1 ────────────────────────────────────
+# Возвращает 0 если сервер принимает TCP-соединения (порт открыт).
+_proxy1_reachable() {
+    [ -f "$XRAY_CONFIG" ] || return 1
+    local host port
+    host=$(grep '"address"' "$XRAY_CONFIG" | head -1 \
+        | sed 's/.*"address": *"\([^"]*\)".*/\1/')
+    port=$(grep '"port"' "$XRAY_CONFIG" | head -1 \
+        | sed 's/[^0-9]//g')
+    [ -z "$host" ] || [ -z "$port" ] && return 1
+    nc -z -w 5 "$host" "$port" 2>/dev/null
+}
+
 # ─── Обновление подписки без разрыва соединений ───────────────────────────────
 update_subscription() {
     local sub_url="$1"
@@ -1503,18 +1516,29 @@ update_subscription() {
         return 1
     fi
 
-    # Проверяем изменение серверов ДО перезаписи конфига
-    if _servers_changed "$new_cfg" 2>/dev/null; then
-        info "Серверы обновились — горячая перезагрузка конфига"
-    else
-        info "Серверы не изменились — горячая перезагрузка конфига"
+    _save_backup
+
+    if ! _servers_changed "$new_cfg" 2>/dev/null; then
+        # Серверы те же — перезапуск не нужен вообще
+        info "Серверы не изменились — Xray продолжает работу без перезапуска"
+        cp "$new_cfg" "$XRAY_CONFIG"
+        info "Обновление подписки завершено (без перезапуска)"
+        return 0
     fi
 
-    _save_backup
-    cp "$new_cfg" "$XRAY_CONFIG"
+    # Серверы изменились в подписке — проверяем текущий сервер
+    if _proxy1_reachable 2>/dev/null; then
+        # Текущий сервер работает — сохраняем новый конфиг но не переключаемся
+        info "Серверы обновились в подписке, но текущий proxy1 работает — не переключаем"
+        cp "$new_cfg" "$XRAY_CONFIG"
+        info "Новый конфиг сохранён. Xray продолжает работу на текущем сервере."
+        info "Новые серверы применятся при следующем перезапуске Xray."
+        return 0
+    fi
 
-    # SIGHUP: Xray перечитывает config.json без разрыва соединений.
-    # Если новый конфиг невалиден — Xray сам остаётся на старом (встроенная защита).
+    # Текущий сервер недоступен — применяем новые серверы
+    info "Текущий сервер недоступен — переключаемся на новые серверы"
+    cp "$new_cfg" "$XRAY_CONFIG"
     _reload_xray
     info "Обновление подписки завершено"
 }
