@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260620"
+SCRIPT_VERSION="20260621"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -229,11 +229,13 @@ _tg_bot_exec_cmd() {
             out=$(update_subscription "" 2>&1 | grep -v '^$' | tail -5)
             printf '🔄 Серверы обновлены:\n%s' "$out" ;;
         /proxy_on)
+            _xray_is_running || start_xray 2>/dev/null
             setup_iptables 2>/dev/null
-            printf '🔀 Прозрачный прокси включён' ;;
+            printf '🔀 Прозрачный прокси включён, Xray запущен' ;;
         /proxy_off)
             remove_iptables 2>/dev/null
-            printf '⏸ Прозрачный прокси выключен' ;;
+            _stop_xray 2>/dev/null
+            printf '⏸ Прозрачный прокси выключен, Xray остановлен' ;;
         /tunnel_on)
             _start_tunnel 2>/dev/null
             printf '🔐 SSH туннель запускается...' ;;
@@ -1774,10 +1776,15 @@ cmd_tproxy_menu() {
             if [ ! -f "$XRAY_CONFIG" ]; then
                 printf 'Сначала настройте подписку (пункт 1)\n'
             else
+                _xray_is_running || start_xray
                 setup_iptables || warn "Ошибка настройки iptables"
             fi
             ;;
-        2) remove_iptables ;;
+        2)
+            remove_iptables
+            _stop_xray
+            info "Xray остановлен"
+            ;;
     esac
 }
 
