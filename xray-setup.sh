@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260618"
+SCRIPT_VERSION="20260619"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1310,7 +1310,7 @@ ${ob3},
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "balancers": [{"tag":"balancer","selector":["proxy1","proxy2","proxy3"],
-                   "strategy":{"type":"leastPing"}}],
+                   "strategy":{"type":"random"}}],
     "rules": [
       {"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4"],"outboundTag":"direct"},
       {"type":"field","ip":["109.105.128.0/17"],"outboundTag":"direct"},
@@ -1400,12 +1400,10 @@ start_xray() {
 
 # ─── Быстрый рестарт — минимальный разрыв (~300 мс) ─────────────────────────
 # Используется при обновлении подписки когда серверы изменились.
-# При включённом автозапуске использует init-скрипт — исключает race с procd.
+# TPROXY НЕ отцепляем: пока Xray не поднялся (< 500мс), браузер получает
+# ECONNREFUSED и сам делает retry — для пользователя это незаметно.
+# Отцепление TPROXY хуже: ISP-блокировки сразу закрывают трафик на 2-5с.
 _fast_restart() {
-    # Временно снимаем TPROXY-хук чтобы LAN-трафик не прерывался пока Xray не запущен
-    local _tp=0
-    iptables_active 2>/dev/null && _tp=1
-    [ "$_tp" = 1 ] && _tproxy_detach
     _stop_xray
     _start_xray_proc
     # Ждём готовности порта (до 5 с)
@@ -1414,8 +1412,6 @@ _fast_restart() {
         nc -z 127.0.0.1 1080 2>/dev/null && break
         sleep 1; i=$((i + 1))
     done
-    # Возвращаем TPROXY-хук (Xray готов принимать трафик)
-    [ "$_tp" = 1 ] && _tproxy_attach
     local pid; pid=$(_find_xray_pid)
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
         || die "Xray не запустился — проверьте лог: $XRAY_LOG"
