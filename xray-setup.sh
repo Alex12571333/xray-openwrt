@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260625"
+SCRIPT_VERSION="20260626"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1101,17 +1101,70 @@ fetch_subscription() {
     printf '%s\n' "$decoded" | grep '^vless://' || true
 }
 
-# ─── Выбор серверов из подписки ──────────────────────────────────────────────
-# TCP-тест не работает для VLESS/TLS серверов: они требуют TLS ClientHello,
-# голый TCP даёт RST → ложные срабатывания "недоступен".
-# Xray сам тестирует серверы через observatory + leastPing по реальному протоколу.
-# Берём первые $want серверов из подписки — Xray выберет лучший сам.
+# ─── TCP-латентность через /proc/uptime ──────────────────────────────────────
+_uptime_cs() {
+    awk '{printf "%d", $1*100}' /proc/uptime 2>/dev/null || printf '0'
+}
+
+# ─── Выбор лучших серверов по HTTPS-латентности ───────────────────────────────
+# Используем HTTPS (TLS handshake) — работает для Reality и TLS серверов.
+# Голый TCP (nc -z) не работает: серверы требуют TLS ClientHello.
+# timeout + wget: 3 сек макс на сервер, exit 124 = таймаут = недоступен.
 select_best_servers() {
-    local input="$1" want="${2:-3}"
-    local total
+    local input="$1" want="${2:-3}" test_max="${3:-20}"
+    local scored="${WORK_DIR}/scored.txt"
+    > "$scored"
+
+    # Если timeout недоступен — просто берём первые N
+    if ! command -v timeout >/dev/null 2>&1; then
+        local total; total=$(wc -l < "$input" | tr -d ' ')
+        printf '>>> timeout недоступен — беру первые %s из %s\n' "$want" "$total" >&2
+        head -"$want" "$input"
+        return
+    fi
+
+    local total tested=0
     total=$(wc -l < "$input" | tr -d ' ')
-    printf '>>> Серверов в подписке: %s — беру первые %s\n' "$total" "$want" >&2
-    head -"$want" "$input"
+    printf '>>> Тестирую серверы HTTPS (первые %s из %s)...\n' "$test_max" "$total" >&2
+
+    while IFS= read -r line && [ "$tested" -lt "$test_max" ]; do
+        [ -z "$line" ] && continue
+        tested=$((tested + 1))
+
+        local rest after hp host port
+        rest="${line#vless://}"
+        after="${rest#*@}"
+        case "$after" in *\?*) hp="${after%%\?*}";; *) hp="${after%%#*}";; esac
+        host="${hp%:*}"
+        port="${hp##*:}"
+
+        local t1 t2 ms ex
+        t1=$(_uptime_cs)
+        timeout 3 wget --no-check-certificate --spider -q \
+            "https://${host}:${port}/" >/dev/null 2>&1
+        ex=$?
+        t2=$(_uptime_cs)
+        ms=$(( (t2 - t1) * 10 ))
+
+        # exit 124 = timeout команды = сервер недоступен
+        # остальные коды (0=OK, 8=HTTP error от сервера) = сервер ответил
+        if [ "$ex" -ne 124 ] && [ "$ms" -lt 2900 ]; then
+            [ "$ms" -le 0 ] && ms=1
+            printf '%04d\t%s\n' "$ms" "$line" >> "$scored"
+            printf '  [%2d/%d] %-38s %3dms ✓\n' "$tested" "$test_max" "${host}:${port}" "$ms" >&2
+        else
+            printf '  [%2d/%d] %-38s недоступен\n' "$tested" "$test_max" "${host}:${port}" >&2
+        fi
+    done < "$input"
+
+    local found; found=$(wc -l < "$scored" | tr -d ' ')
+    if [ "$found" -gt 0 ]; then
+        printf '>>> Доступно: %s — беру топ-%s по латентности\n' "$found" "$want" >&2
+        sort -n "$scored" | head -"$want" | cut -f2-
+    else
+        warn "нет доступных серверов в первых $test_max — берём первые $want без проверки"
+        head -"$want" "$input"
+    fi
 }
 
 # ─── ALPN → JSON-массив ───────────────────────────────────────────────────────
