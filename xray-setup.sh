@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260626"
+SCRIPT_VERSION="20260627"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1715,8 +1715,12 @@ setup_iptables() {
     # Применяем к LAN-трафику
     iptables -t mangle -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN"
 
+    # Блокируем IPv6 форвардинг с LAN: IPv6 обходит TPROXY (только IPv4).
+    # Браузер получает отказ по IPv6 и переключается на IPv4 → попадает в TPROXY.
+    ip6tables -I FORWARD -i "$iface" -j DROP 2>/dev/null || true
+
     conntrack -F 2>/dev/null || true
-    info "Прозрачный прокси включён (TPROXY TCP+UDP, интерфейс $iface)"
+    info "Прозрачный прокси включён (TPROXY TCP+UDP, IPv6 LAN заблокирован, $iface)"
     _persist_iptables "$iface"
 }
 
@@ -1734,6 +1738,10 @@ remove_iptables() {
     while ip rule del fwmark 0x1 lookup 100    2>/dev/null; do :; done
     while ip rule del fwmark 0x1/0x1 lookup 100 2>/dev/null; do :; done
     ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+    # Убираем IPv6 блокировку
+    for _if in br-lan eth0 eth1; do
+        ip6tables -D FORWARD -i "$_if" -j DROP 2>/dev/null || true
+    done
     conntrack -F 2>/dev/null || true
     _unpersist_iptables
     info "Прозрачный прокси отключён"
@@ -1767,6 +1775,7 @@ _persist_iptables() {
         printf 'iptables -t mangle -A XRAY_TP -p tcp -j TPROXY --on-port 12345 --tproxy-mark 1\n'
         printf 'iptables -t mangle -A XRAY_TP -p udp -j TPROXY --on-port 12345 --tproxy-mark 1\n'
         printf 'iptables -t mangle -A PREROUTING -i %s -j XRAY_TP\n' "$iface"
+        printf 'ip6tables -I FORWARD -i %s -j DROP 2>/dev/null || true\n' "$iface"
         printf '%s-end\n' "$FIREWALL_MARK"
     } >> "$FIREWALL_USER"
     info "Правила TPROXY сохранены → $FIREWALL_USER"
