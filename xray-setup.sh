@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260624"
+SCRIPT_VERSION="20260625"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1101,55 +1101,17 @@ fetch_subscription() {
     printf '%s\n' "$decoded" | grep '^vless://' || true
 }
 
-# ─── TCP-латентность через /proc/uptime (10ms точность, Linux) ────────────────
-_uptime_cs() {
-    awk '{printf "%d", $1*100}' /proc/uptime 2>/dev/null || printf '0'
-}
-
-# ─── Выбор лучших серверов по TCP-пингу ──────────────────────────────────────
-# $1 — файл с vless:// строками, $2 — сколько нужно (3), $3 — сколько тестить (20)
+# ─── Выбор серверов из подписки ──────────────────────────────────────────────
+# TCP-тест не работает для VLESS/TLS серверов: они требуют TLS ClientHello,
+# голый TCP даёт RST → ложные срабатывания "недоступен".
+# Xray сам тестирует серверы через observatory + leastPing по реальному протоколу.
+# Берём первые $want серверов из подписки — Xray выберет лучший сам.
 select_best_servers() {
-    local input="$1" want="${2:-3}" test_max="${3:-20}"
-    local scored="${WORK_DIR}/scored.txt"
-    > "$scored"
-
-    local total tested=0
+    local input="$1" want="${2:-3}"
+    local total
     total=$(wc -l < "$input" | tr -d ' ')
-    printf '>>> Тестирую серверы (первые %s из %s)...\n' "$test_max" "$total" >&2
-
-    while IFS= read -r line && [ "$tested" -lt "$test_max" ]; do
-        [ -z "$line" ] && continue
-        tested=$((tested + 1))
-
-        local rest; rest="${line#vless://}"
-        local after; after="${rest#*@}"
-        local hp
-        case "$after" in *\?*) hp="${after%%\?*}";; *) hp="${after%%#*}";; esac
-        local host; host="${hp%:*}"
-        local port; port="${hp##*:}"
-
-        local t1; t1=$(_uptime_cs)
-        local t2; local ms
-        if echo "" | nc -w 2 "$host" "$port" >/dev/null 2>&1; then
-            t2=$(_uptime_cs)
-            ms=$(( (t2 - t1) * 10 ))
-            # ms=0 если uptime-таймер не успел тикнуть — ставим 1 чтобы сервер не отсеялся
-            [ "$ms" -le 0 ] && ms=1
-            printf '%04d\t%s\n' "$ms" "$line" >> "$scored"
-            printf '  [%2d/%d] %-38s %3dms ✓\n' "$tested" "$test_max" "${host}:${port}" "$ms" >&2
-        else
-            printf '  [%2d/%d] %-38s недоступен\n' "$tested" "$test_max" "${host}:${port}" >&2
-        fi
-    done < "$input"
-
-    local found; found=$(wc -l < "$scored" | tr -d ' ')
-    if [ "$found" -gt 0 ]; then
-        printf '>>> Доступно: %s — беру топ-%s по латентности\n' "$found" "$want" >&2
-        sort -n "$scored" | head -"$want" | cut -f2-
-    else
-        warn "нет доступных серверов в первых $test_max — берём первые $want без проверки"
-        head -"$want" "$input"
-    fi
+    printf '>>> Серверов в подписке: %s — беру первые %s\n' "$total" "$want" >&2
+    head -"$want" "$input"
 }
 
 # ─── ALPN → JSON-массив ───────────────────────────────────────────────────────
