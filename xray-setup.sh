@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260631"
+SCRIPT_VERSION="20260632"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -31,7 +31,8 @@ XRAY_INIT="/etc/init.d/xray"
 XRAY_CRON="/etc/crontabs/root"
 CRON_MARKER="# xray-autoupdate"
 GITHUB_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-GEODATA_GEOIP="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"
+GEODATA_GEOIP="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/geoip.dat"
+GEODATA_GEOIP_UPSTREAM="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"
 GEODATA_GEOSITE="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat"
 XRAY_LOG="/var/log/xray.log"
 XRAY_LOG_MAX=262144    # 256 КБ — при превышении оставляем последние 128 КБ
@@ -1042,47 +1043,41 @@ install_xray() {
     info "Xray установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
 }
 
-# ─── Скачать файл с попыткой нескольких зеркал ───────────────────────────────
-_dl_mirrors() {
-    # $1 = имя файла (geoip.dat / geosite.dat), $2 = путь назначения
-    local name="$1" dest="$2"
-    local base="runetfreedom/russia-v2ray-rules-dat/releases/latest/download/${name}"
-    local mirrors="\
-https://github.com/${base}
-https://mirror.ghproxy.com/https://github.com/${base}
-https://ghfast.top/https://github.com/${base}
-https://gh.llkk.cc/https://github.com/${base}"
-    printf '%s\n' "$mirrors" | while IFS= read -r url; do
-        [ -z "$url" ] && continue
-        info "  Пробую: $url"
-        _dl "$url" "$dest" && [ -s "$dest" ] && return 0
-    done
-    return 1
-}
-
-# ─── Обновление геоданных (runetfreedom: geosite:ru-blocked) ─────────────────
+# ─── Обновление геоданных ─────────────────────────────────────────────────────
+# geoip.dat: сначала из нашего репо (работает если роутер достаёт GitHub raw),
+# fallback — upstream runetfreedom + зеркала.
+# geosite.dat: только upstream (в конфиге не используется — для ручного обновления).
 update_geodata() {
-    info "Обновляю геоданные (runetfreedom/russia-v2ray-rules-dat)..."
+    info "Обновляю геоданные..."
     mkdir -p /etc/xray
     local ok=0
 
     local tmp_ip="${WORK_DIR}/geoip.dat"
-    local tmp_site="${WORK_DIR}/geosite.dat"
 
-    if _dl_mirrors "geoip.dat" "$tmp_ip" && [ -s "$tmp_ip" ]; then
+    # Пробуем наш репо первым (raw.githubusercontent.com — доступен с роутера)
+    info "geoip.dat: качаю из репо..."
+    if _dl "$GEODATA_GEOIP" "$tmp_ip" && [ -s "$tmp_ip" ]; then
         mv "$tmp_ip" /etc/xray/geoip.dat
         info "geoip.dat обновлён ($(wc -c < /etc/xray/geoip.dat | tr -d ' ') байт)"
         ok=$((ok + 1))
     else
-        warn "Не удалось скачать geoip.dat (все зеркала недоступны)"
-    fi
-
-    if _dl_mirrors "geosite.dat" "$tmp_site" && [ -s "$tmp_site" ]; then
-        mv "$tmp_site" /etc/xray/geosite.dat
-        info "geosite.dat обновлён ($(wc -c < /etc/xray/geosite.dat | tr -d ' ') байт)"
-        ok=$((ok + 1))
-    else
-        warn "Не удалось скачать geosite.dat (все зеркала недоступны)"
+        # Fallback: upstream + зеркала
+        info "geoip.dat: репо недоступен, пробую upstream..."
+        local base="runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"
+        local ok2=0
+        for url in "$GEODATA_GEOIP_UPSTREAM" \
+                   "https://mirror.ghproxy.com/https://github.com/${base}" \
+                   "https://ghfast.top/https://github.com/${base}"; do
+            info "  Пробую: $url"
+            _dl "$url" "$tmp_ip" && [ -s "$tmp_ip" ] && ok2=1 && break
+        done
+        if [ "$ok2" = 1 ]; then
+            mv "$tmp_ip" /etc/xray/geoip.dat
+            info "geoip.dat обновлён через upstream ($(wc -c < /etc/xray/geoip.dat | tr -d ' ') байт)"
+            ok=$((ok + 1))
+        else
+            warn "Не удалось скачать geoip.dat"
+        fi
     fi
 
     [ "$ok" -gt 0 ] && return 0 || return 1
@@ -1869,10 +1864,10 @@ apply_subscription() {
     info "=== Установка Xray ==="
     install_xray
 
-    # Геоданные нужны для geoip:ru (маршрутизация игр/сервисов напрямую)
-    if [ ! -f /etc/xray/geoip.dat ] || [ ! -f /etc/xray/geosite.dat ]; then
-        info "=== Скачиваю геоданные (geoip.dat / geosite.dat) ==="
-        update_geodata || warn "Не удалось скачать геоданные — используются встроенные IP-диапазоны"
+    # geoip.dat нужен для geoip:ru (российские IP → напрямую, без VPN)
+    if [ ! -f /etc/xray/geoip.dat ]; then
+        info "=== Скачиваю geoip.dat ==="
+        update_geodata || warn "Не удалось скачать geoip.dat — используются встроенные IP-диапазоны"
     fi
 
     info "=== Загрузка подписки ==="
