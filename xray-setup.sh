@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260623"
+SCRIPT_VERSION="20260624"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1218,6 +1218,13 @@ gen_outbound() {
         user_json="{\"id\":\"${SV_UUID}\",\"encryption\":\"none\"}"
     fi
 
+    # mux+xudp: туннелируем UDP (Telegram звонки) через TCP VLESS.
+    # concurrency:-1 = TCP mux выключен, только XUDP для UDP.
+    # Нельзя с flow (Reality xtls-rprx-vision).
+    local mux_json=""
+    [ -z "$SV_FLOW" ] && mux_json=',
+      "mux": {"enabled": true, "concurrency": -1, "xudpConcurrency": 16, "xudpProxyUDP443": "reject"}'
+
     local effective_sni="${SV_SNI:-${SV_HOST}}"
     local security_json
     case "$SV_SEC" in
@@ -1255,7 +1262,7 @@ gen_outbound() {
       "settings": {
         "vnext": [{"address":"${SV_HOST}","port":${SV_PORT},"users":[${user_json}]}]
       },
-      "streamSettings": { ${network_json}, ${security_json} }
+      "streamSettings": { ${network_json}, ${security_json} }${mux_json}
     }
 OUTJSON
 }
