@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260630"
+SCRIPT_VERSION="20260631"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1306,6 +1306,16 @@ gen_config() {
     ob2=$(gen_outbound "proxy2" "$([ -f /tmp/xray_sv_2.env ] && echo /tmp/xray_sv_2.env || echo /tmp/xray_sv_1.env)")
     ob3=$(gen_outbound "proxy3" "$([ -f /tmp/xray_sv_3.env ] && echo /tmp/xray_sv_3.env || echo /tmp/xray_sv_1.env)")
 
+    # geoip:ru требует /etc/xray/geoip.dat — используем только если файл есть
+    local ru_ip_rule
+    if [ -f /etc/xray/geoip.dat ]; then
+        ru_ip_rule='"geoip:ru","109.105.128.0/17"'
+    else
+        # Fallback: основные российские диапазоны + Innova/4Game без geoip.dat
+        ru_ip_rule='"109.105.128.0/17","5.8.0.0/13","5.16.0.0/14","5.45.192.0/18","5.61.0.0/16","5.100.0.0/14","37.9.0.0/16","37.140.0.0/16","45.84.0.0/22","46.0.0.0/8","77.72.128.0/17","77.88.0.0/18","78.24.0.0/13","79.98.0.0/15","80.64.0.0/13","81.18.0.0/16","81.176.0.0/12","81.200.0.0/13","84.20.0.0/14","85.112.0.0/13","87.224.0.0/12","88.83.0.0/16","89.108.0.0/13","90.150.0.0/15","91.108.0.0/16","91.190.0.0/16","91.219.0.0/16","92.112.0.0/13","93.92.0.0/14","93.158.128.0/17","94.19.0.0/16","94.25.0.0/16","94.100.0.0/14","95.24.0.0/13","95.108.0.0/14","176.208.0.0/13","178.64.0.0/13","185.2.0.0/16","188.128.0.0/13","193.0.0.0/8","194.0.0.0/8","195.0.0.0/8","212.188.0.0/14","213.148.0.0/14","217.0.0.0/8"'
+        warn "geoip.dat не найден — используются встроенные RU-диапазоны. Для полного покрытия запустите: g → Обновить геоданные"
+    fi
+
     cat > "$dest" << CFGEOF
 {
   "log": {"loglevel":"warning"},
@@ -1329,7 +1339,7 @@ ${ob3},
     "domainStrategy": "IPIfNonMatch",
     "rules": [
       {"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4"],"outboundTag":"direct"},
-      {"type":"field","ip":["geoip:ru","109.105.128.0/17"],"outboundTag":"direct"},
+      {"type":"field","ip":[${ru_ip_rule}],"outboundTag":"direct"},
       {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$","regexp:[.]xn--p1ai$","domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
       {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"outboundTag":"proxy1"},
       {"type":"field","network":"tcp,udp","outboundTag":"proxy1"}
@@ -1858,6 +1868,12 @@ apply_subscription() {
 
     info "=== Установка Xray ==="
     install_xray
+
+    # Геоданные нужны для geoip:ru (маршрутизация игр/сервисов напрямую)
+    if [ ! -f /etc/xray/geoip.dat ] || [ ! -f /etc/xray/geosite.dat ]; then
+        info "=== Скачиваю геоданные (geoip.dat / geosite.dat) ==="
+        update_geodata || warn "Не удалось скачать геоданные — используются встроенные IP-диапазоны"
+    fi
 
     info "=== Загрузка подписки ==="
     local vless_lines
