@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260621"
+SCRIPT_VERSION="20260622"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1130,7 +1130,7 @@ select_best_servers() {
 
         local t1; t1=$(_uptime_cs)
         local t2; local ms
-        if nc -z -w 2 "$host" "$port" 2>/dev/null; then
+        if echo "" | nc -w 2 "$host" "$port" >/dev/null 2>&1; then
             t2=$(_uptime_cs)
             ms=$(( (t2 - t1) * 10 ))
             # ms=0 если uptime-таймер не успел тикнуть — ставим 1 чтобы сервер не отсеялся
@@ -1312,7 +1312,7 @@ ${ob3},
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "balancers": [{"tag":"balancer","selector":["proxy1","proxy2","proxy3"],
-                   "strategy":{"type":"random"}}],
+                   "strategy":{"type":"leastPing"}}],
     "rules": [
       {"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4"],"outboundTag":"direct"},
       {"type":"field","ip":["109.105.128.0/17"],"outboundTag":"direct"},
@@ -1324,7 +1324,7 @@ ${ob3},
   "observatory": {
     "subjectSelector":["proxy1","proxy2","proxy3"],
     "probeURL":"https://www.gstatic.com/generate_204",
-    "probeInterval":"1m"
+    "probeInterval":"3m"
   }
 }
 CFGEOF
@@ -1411,7 +1411,7 @@ _fast_restart() {
     # Ждём готовности порта (до 5 с)
     local i=0
     while [ $i -lt 5 ]; do
-        nc -z 127.0.0.1 1080 2>/dev/null && break
+        echo "" | nc -w 1 127.0.0.1 1080 >/dev/null 2>&1 && break
         sleep 1; i=$((i + 1))
     done
     local pid; pid=$(_find_xray_pid)
@@ -1441,10 +1441,10 @@ _reload_xray() {
     # Проверяем что порт отвечает
     local i=0
     while [ $i -lt 5 ]; do
-        nc -z 127.0.0.1 1080 2>/dev/null && break
+        echo "" | nc -w 1 127.0.0.1 1080 >/dev/null 2>&1 && break
         sleep 1; i=$((i + 1))
     done
-    if ! nc -z 127.0.0.1 1080 2>/dev/null; then
+    if ! echo "" | nc -w 1 127.0.0.1 1080 >/dev/null 2>&1; then
         warn "Xray не отвечает после SIGHUP — делаю быстрый рестарт"
         _fast_restart
         return
@@ -1472,7 +1472,7 @@ _proxy1_reachable() {
     port=$(grep '"port"' "$XRAY_CONFIG" | head -1 \
         | sed 's/[^0-9]//g')
     [ -z "$host" ] || [ -z "$port" ] && return 1
-    nc -z -w 5 "$host" "$port" 2>/dev/null
+    echo "" | nc -w 5 "$host" "$port" >/dev/null 2>&1
 }
 
 # ─── Обновление подписки без разрыва соединений ───────────────────────────────
