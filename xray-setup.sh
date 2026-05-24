@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260627"
+SCRIPT_VERSION="20260628"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1313,7 +1313,7 @@ gen_config() {
     {"tag":"socks","listen":"0.0.0.0","port":1080,"protocol":"socks",
      "settings":{"auth":"noauth","udp":true}},
     {"tag":"http","listen":"0.0.0.0","port":1081,"protocol":"http","settings":{}},
-    {"tag":"tproxy","listen":"0.0.0.0","port":12345,"protocol":"dokodemo-door",
+    {"tag":"tproxy","listen":"::","port":12345,"protocol":"dokodemo-door",
      "settings":{"network":"tcp,udp","followRedirect":true},
      "streamSettings":{"sockopt":{"tproxy":"tproxy"}},
      "sniffing":{"enabled":true,"destOverride":["http","tls"],"routeOnly":true}}
@@ -1715,30 +1715,58 @@ setup_iptables() {
     # Применяем к LAN-трафику
     iptables -t mangle -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN"
 
-    # Блокируем IPv6 форвардинг с LAN: IPv6 обходит TPROXY (только IPv4).
-    # Браузер получает отказ по IPv6 и переключается на IPv4 → попадает в TPROXY.
-    ip6tables -I FORWARD -i "$iface" -j DROP 2>/dev/null || true
+    # IPv6 TPROXY — перехватываем IPv6 трафик с LAN
+    # Если ip6t_TPROXY недоступен — fallback на DROP (браузер переключится на IPv4)
+    ip -6 rule add fwmark 0x1 table 100 2>/dev/null || true
+    ip -6 route add local ::/0 dev lo table 100 2>/dev/null || true
+    ip6tables -t mangle -N "$IPTABLES_CHAIN" 2>/dev/null || true
+    # Исключаем link-local, loopback, ULA, multicast
+    ip6tables -t mangle -A "$IPTABLES_CHAIN" -d ::1/128        -j RETURN 2>/dev/null || true
+    ip6tables -t mangle -A "$IPTABLES_CHAIN" -d fe80::/10      -j RETURN 2>/dev/null || true
+    ip6tables -t mangle -A "$IPTABLES_CHAIN" -d fc00::/7       -j RETURN 2>/dev/null || true
+    ip6tables -t mangle -A "$IPTABLES_CHAIN" -d ff00::/8       -j RETURN 2>/dev/null || true
+    ip6tables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 22 -j RETURN 2>/dev/null || true
+    if ip6tables -t mangle -A "$IPTABLES_CHAIN" -p tcp -j TPROXY --on-port 12345 --tproxy-mark 1 2>/dev/null \
+    && ip6tables -t mangle -A "$IPTABLES_CHAIN" -p udp -j TPROXY --on-port 12345 --tproxy-mark 1 2>/dev/null; then
+        ip6tables -t mangle -A PREROUTING -i "$iface" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+        info "IPv6 TPROXY включён"
+    else
+        # TPROXY не поддерживается — блокируем IPv6 форвардинг с LAN
+        ip6tables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
+        ip6tables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
+        ip6tables -I FORWARD -i "$iface" -j DROP 2>/dev/null || true
+        warn "ip6t_TPROXY недоступен — IPv6 с LAN заблокирован (fallback)"
+    fi
 
     conntrack -F 2>/dev/null || true
-    info "Прозрачный прокси включён (TPROXY TCP+UDP, IPv6 LAN заблокирован, $iface)"
+    info "Прозрачный прокси включён (TPROXY TCP+UDP IPv4+IPv6, $iface)"
     _persist_iptables "$iface"
 }
 
 remove_iptables() {
     # Убираем оба варианта: nat (новый) и mangle (старый TPROXY — для чистоты)
     for _if in br-lan eth0 eth1; do
-        iptables -t nat   -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+        iptables -t nat    -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
         iptables -t mangle -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
     done
     iptables -t nat    -F "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t nat    -X "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
-    # Удаляем ip rule/route от старого TPROXY (если остались)
-    while ip rule del fwmark 0x1 lookup 100    2>/dev/null; do :; done
+    # Удаляем IPv4 policy routing
+    while ip rule del fwmark 0x1 lookup 100     2>/dev/null; do :; done
     while ip rule del fwmark 0x1/0x1 lookup 100 2>/dev/null; do :; done
     ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
-    # Убираем IPv6 блокировку
+    # Убираем IPv6 TPROXY цепочку
+    for _if in br-lan eth0 eth1; do
+        ip6tables -t mangle -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    done
+    ip6tables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    # Убираем IPv6 policy routing
+    while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
+    ip -6 route del local ::/0 dev lo table 100 2>/dev/null || true
+    # Убираем fallback IPv6 блокировку (если была)
     for _if in br-lan eth0 eth1; do
         ip6tables -D FORWARD -i "$_if" -j DROP 2>/dev/null || true
     done
@@ -1775,7 +1803,23 @@ _persist_iptables() {
         printf 'iptables -t mangle -A XRAY_TP -p tcp -j TPROXY --on-port 12345 --tproxy-mark 1\n'
         printf 'iptables -t mangle -A XRAY_TP -p udp -j TPROXY --on-port 12345 --tproxy-mark 1\n'
         printf 'iptables -t mangle -A PREROUTING -i %s -j XRAY_TP\n' "$iface"
-        printf 'ip6tables -I FORWARD -i %s -j DROP 2>/dev/null || true\n' "$iface"
+        # IPv6 TPROXY (с fallback на DROP если модуль недоступен)
+        printf 'ip -6 rule add fwmark 0x1 table 100 2>/dev/null || true\n'
+        printf 'ip -6 route add local ::/0 dev lo table 100 2>/dev/null || true\n'
+        printf 'ip6tables -t mangle -N XRAY_TP 2>/dev/null || true\n'
+        printf 'ip6tables -t mangle -A XRAY_TP -d ::1/128   -j RETURN 2>/dev/null || true\n'
+        printf 'ip6tables -t mangle -A XRAY_TP -d fe80::/10 -j RETURN 2>/dev/null || true\n'
+        printf 'ip6tables -t mangle -A XRAY_TP -d fc00::/7  -j RETURN 2>/dev/null || true\n'
+        printf 'ip6tables -t mangle -A XRAY_TP -d ff00::/8  -j RETURN 2>/dev/null || true\n'
+        printf 'ip6tables -t mangle -A XRAY_TP -p tcp --dport 22 -j RETURN 2>/dev/null || true\n'
+        printf 'if ip6tables -t mangle -A XRAY_TP -p tcp -j TPROXY --on-port 12345 --tproxy-mark 1 2>/dev/null \\\n'
+        printf '&& ip6tables -t mangle -A XRAY_TP -p udp -j TPROXY --on-port 12345 --tproxy-mark 1 2>/dev/null; then\n'
+        printf '    ip6tables -t mangle -A PREROUTING -i %s -j XRAY_TP 2>/dev/null || true\n' "$iface"
+        printf 'else\n'
+        printf '    ip6tables -t mangle -F XRAY_TP 2>/dev/null || true\n'
+        printf '    ip6tables -t mangle -X XRAY_TP 2>/dev/null || true\n'
+        printf '    ip6tables -I FORWARD -i %s -j DROP 2>/dev/null || true\n' "$iface"
+        printf 'fi\n'
         printf '%s-end\n' "$FIREWALL_MARK"
     } >> "$FIREWALL_USER"
     info "Правила TPROXY сохранены → $FIREWALL_USER"
@@ -2218,18 +2262,24 @@ cmd_netreset() {
 
     info "Очищаю iptables (все интерфейсы, все дубли)..."
     for _if in br-lan eth0 eth1 eth0.2 br0; do
-        iptables -t mangle -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
-        iptables -t nat   -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+        iptables  -t mangle -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+        iptables  -t nat    -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+        ip6tables -t mangle -D PREROUTING -i "$_if" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+        ip6tables -D FORWARD -i "$_if" -j DROP 2>/dev/null || true
     done
-    iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -t nat    -F "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -t nat    -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables  -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables  -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables  -t nat    -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables  -t nat    -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
 
     info "Удаляю все ip rule (все дубли)..."
-    while ip rule del fwmark 0x1 lookup 100    2>/dev/null; do :; done
+    while ip rule del fwmark 0x1 lookup 100     2>/dev/null; do :; done
     while ip rule del fwmark 0x1/0x1 lookup 100 2>/dev/null; do :; done
     ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+    while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
+    ip -6 route del local ::/0 dev lo table 100 2>/dev/null || true
 
     info "Сбрасываю conntrack (зависшие соединения)..."
     conntrack -F 2>/dev/null || true
