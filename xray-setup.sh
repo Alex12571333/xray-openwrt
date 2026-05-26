@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260639"
+SCRIPT_VERSION="20260640"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1469,15 +1469,23 @@ _servers_changed() {
 }
 
 # ─── Проверка доступности текущего proxy1 ────────────────────────────────────
-# Возвращает 0 если сервер принимает TCP-соединения (порт открыт).
+# Возвращает 0 если сервер отвечает на HTTPS (работает для TLS/Reality).
 _proxy1_reachable() {
     [ -f "$XRAY_CONFIG" ] || return 1
-    local host port
-    host=$(grep '"address"' "$XRAY_CONFIG" | head -1 \
-        | sed 's/.*"address": *"\([^"]*\)".*/\1/')
-    port=$(grep '"port"' "$XRAY_CONFIG" | head -1 \
-        | sed 's/[^0-9]//g')
+    local sv_line host port ex
+    sv_line=$(grep '"address"' "$XRAY_CONFIG" | head -1)
+    host=$(printf '%s' "$sv_line" | sed 's/.*"address": *"\([^"]*\)".*/\1/')
+    port=$(printf '%s' "$sv_line" | grep -o '"port": *[0-9]*' | grep -o '[0-9]*$')
     [ -z "$host" ] || [ -z "$port" ] && return 1
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 10 wget --no-check-certificate --spider -q \
+            "https://${host}:${port}/" >/dev/null 2>&1
+        ex=$?
+        # 124=timeout, 4=connection refused → недоступен
+        [ "$ex" -eq 124 ] || [ "$ex" -eq 4 ] && return 1
+        return 0
+    fi
+    # fallback если timeout недоступен
     echo "" | nc -w 5 "$host" "$port" >/dev/null 2>&1
 }
 
@@ -2463,23 +2471,27 @@ _healthcheck_proxy() {
     [ -f "$XRAY_PROXY_CHECK_LOCK" ] && return 0
     touch "$XRAY_PROXY_CHECK_LOCK"
 
-    local host port ex
-    host=$(grep '"address"' "$XRAY_CONFIG" | head -1 | sed 's/.*"address": *"\([^"]*\)".*/\1/')
-    port=$(grep '"port"' "$XRAY_CONFIG" | head -1 | sed 's/[^0-9]//g')
+    # Берём host и port с ОДНОЙ строки (строка vnext в outbound)
+    # grep '"port"' | head -1 неверно — взял бы порт socks inbound (1080)
+    local sv_line host port ex
+    sv_line=$(grep '"address"' "$XRAY_CONFIG" | head -1)
+    host=$(printf '%s' "$sv_line" | sed 's/.*"address": *"\([^"]*\)".*/\1/')
+    port=$(printf '%s' "$sv_line" | grep -o '"port": *[0-9]*' | grep -o '[0-9]*$')
 
     if [ -n "$host" ] && [ -n "$port" ]; then
         timeout 20 wget --no-check-certificate --spider -q \
             "https://${host}:${port}/" >/dev/null 2>&1
         ex=$?
-        if [ "$ex" -eq 124 ]; then
-            # Таймаут — считаем неудачу
+        # Недоступен: 124=timeout, 4=connection refused/network error
+        # Живой: 0=OK, 8=HTTP error (сервер ответил), всё остальное
+        if [ "$ex" -eq 124 ] || [ "$ex" -eq 4 ]; then
             local fails=0
             [ -f "$XRAY_PROXY_FAIL_FILE" ] && \
                 fails=$(cat "$XRAY_PROXY_FAIL_FILE" 2>/dev/null | tr -d ' \n')
             [ -z "$fails" ] && fails=0
             fails=$((fails + 1))
             printf '%s\n' "$fails" > "$XRAY_PROXY_FAIL_FILE"
-            logger -t xray-heal "proxy1 ${host}:${port} не отвечает (${fails}/3)"
+            logger -t xray-heal "proxy1 ${host}:${port} не отвечает (${fails}/3, exit=${ex})"
             # Переключаем только после 3 неудач подряд (~3 минуты)
             if [ "$fails" -ge 3 ]; then
                 rm -f "$XRAY_PROXY_FAIL_FILE"
@@ -2487,7 +2499,7 @@ _healthcheck_proxy() {
                 _switch_to_next_server
             fi
         else
-            # Успех — сбрасываем счётчик неудач
+            # Успех (0=OK, 8=HTTP error от живого сервера) — сбрасываем счётчик
             rm -f "$XRAY_PROXY_FAIL_FILE"
         fi
     fi
