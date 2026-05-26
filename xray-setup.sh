@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260636"
+SCRIPT_VERSION="20260637"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1323,20 +1323,13 @@ ${ob3},
   ],
   "routing": {
     "domainStrategy": "IPIfNonMatch",
-    "balancers": [{"tag":"balancer","selector":["proxy1","proxy2","proxy3"],
-                   "strategy":{"type":"leastPing"}}],
     "rules": [
       {"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4"],"outboundTag":"direct"},
       {"type":"field","ip":["109.105.128.0/17"],"outboundTag":"direct"},
       {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$","regexp:[.]xn--p1ai$","domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
-      {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"balancerTag":"balancer"},
-      {"type":"field","network":"tcp,udp","balancerTag":"balancer"}
+      {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"outboundTag":"proxy1"},
+      {"type":"field","network":"tcp,udp","outboundTag":"proxy1"}
     ]
-  },
-  "observatory": {
-    "subjectSelector":["proxy1","proxy2","proxy3"],
-    "probeURL":"https://www.gstatic.com/generate_204",
-    "probeInterval":"1m"
   }
 }
 CFGEOF
@@ -1607,8 +1600,8 @@ install_cron() {
     local hours="${1:-6}"
     mkdir -p /etc/crontabs
     remove_cron
-    # Самовосстановление tproxy — каждые 5 минут (без сети, мгновенно)
-    printf '*/5 * * * * sh %s healthcheck %s\n' \
+    # Healthcheck каждую минуту: проверяет proxy1, перезапускает Xray если упал
+    printf '* * * * * sh %s healthcheck %s\n' \
         "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
     # Обновление серверов подписки — каждые N часов через SIGHUP (без обрыва соединений)
     printf '0 */%s * * * sh %s update >> %s 2>&1 %s\n' \
@@ -1617,7 +1610,7 @@ install_cron() {
     # Запускаем демоны немедленно — не ждём первого healthcheck
     _start_updater
     _start_tg_bot
-    info "Автообновление: демон проверяет скрипт каждые 10 сек., подписка каждые ${hours} ч."
+    info "Автообновление: healthcheck каждую минуту, подписка каждые ${hours} ч."
 }
 
 remove_cron() {
@@ -2524,7 +2517,16 @@ main() {
         _updater_daemon) _updater_daemon ;;
         _tunnel_daemon)  _tunnel_daemon ;;
         _tg_bot_daemon)  _tg_bot_daemon ;;
-        healthcheck)    _selfheal_tproxy; _healthcheck_proxy; _start_updater; _start_tg_bot; _start_tunnel_if_configured ;;
+        healthcheck)
+            # Автомиграция: обновляем */5 → * * * * * если ещё старый формат
+            if grep -q '\*/5.*healthcheck' "$XRAY_CRON" 2>/dev/null; then
+                local _h; _h=$(grep "$CRON_MARKER" "$XRAY_CRON" 2>/dev/null \
+                    | grep ' update' | head -1 \
+                    | awk '{n=substr($2,3); if(n~/^[0-9]+$/) print n}')
+                install_cron "${_h:-6}" 2>/dev/null || true
+            fi
+            _selfheal_tproxy; _healthcheck_proxy; _start_updater; _start_tg_bot; _start_tunnel_if_configured
+            ;;
         autostart-on)   install_init_script && info "Автозапуск включён" ;;
         autostart-off)  remove_init_script  && info "Автозапуск выключен" ;;
         cron-on)        install_cron 6      && info "Автообновление включено" ;;
