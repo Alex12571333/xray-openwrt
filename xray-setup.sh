@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260635"
+SCRIPT_VERSION="20260636"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1336,7 +1336,7 @@ ${ob3},
   "observatory": {
     "subjectSelector":["proxy1","proxy2","proxy3"],
     "probeURL":"https://www.gstatic.com/generate_204",
-    "probeInterval":"30m"
+    "probeInterval":"1m"
   }
 }
 CFGEOF
