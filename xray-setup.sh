@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260637"
+SCRIPT_VERSION="20260638"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -49,6 +49,7 @@ FIREWALL_USER="/etc/firewall.user"
 XRAY_SERVERS_FILE="/etc/xray/servers.txt"
 XRAY_EXCLUDED_IPS_FILE="/etc/xray/excluded_ips"
 XRAY_PROXY_CHECK_LOCK="/tmp/xray-proxy-check.lock"
+XRAY_PROXY_FAIL_FILE="/tmp/xray-proxy-fails"
 
 WORK_DIR=$(mktemp -d /tmp/xray-XXXXXX)
 trap 'rm -rf "$WORK_DIR" /tmp/xray_sv_*.env /tmp/xray_ping*.txt 2>/dev/null' EXIT INT TERM
@@ -2467,13 +2468,27 @@ _healthcheck_proxy() {
     port=$(grep '"port"' "$XRAY_CONFIG" | head -1 | sed 's/[^0-9]//g')
 
     if [ -n "$host" ] && [ -n "$port" ]; then
-        timeout 6 wget --no-check-certificate --spider -q \
+        timeout 8 wget --no-check-certificate --spider -q \
             "https://${host}:${port}/" >/dev/null 2>&1
         ex=$?
-        # exit 124 = timeout команды = сервер не ответил = недоступен
         if [ "$ex" -eq 124 ]; then
-            logger -t xray-heal "proxy1 ${host}:${port} не отвечает — переключаю сервер"
-            _switch_to_next_server
+            # Таймаут — считаем неудачу
+            local fails=0
+            [ -f "$XRAY_PROXY_FAIL_FILE" ] && \
+                fails=$(cat "$XRAY_PROXY_FAIL_FILE" 2>/dev/null | tr -d ' \n')
+            [ -z "$fails" ] && fails=0
+            fails=$((fails + 1))
+            printf '%s\n' "$fails" > "$XRAY_PROXY_FAIL_FILE"
+            logger -t xray-heal "proxy1 ${host}:${port} не отвечает (${fails}/3)"
+            # Переключаем только после 3 неудач подряд (~3 минуты)
+            if [ "$fails" -ge 3 ]; then
+                rm -f "$XRAY_PROXY_FAIL_FILE"
+                logger -t xray-heal "proxy1 недоступен 3 раза подряд — переключаю"
+                _switch_to_next_server
+            fi
+        else
+            # Успех — сбрасываем счётчик неудач
+            rm -f "$XRAY_PROXY_FAIL_FILE"
         fi
     fi
 
