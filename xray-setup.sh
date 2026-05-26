@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260641"
+SCRIPT_VERSION="20260642"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -2558,7 +2558,7 @@ main() {
                     | awk '{n=substr($2,3); if(n~/^[0-9]+$/) print n}')
                 install_cron "${_h:-6}" 2>/dev/null || true
             fi
-            _selfheal_tproxy; _healthcheck_proxy; _start_updater; _start_tg_bot; _start_tunnel_if_configured
+            _selfheal_tproxy; _start_updater; _start_tg_bot; _start_tunnel_if_configured
             ;;
         autostart-on)   install_init_script && info "Автозапуск включён" ;;
         autostart-off)  remove_init_script  && info "Автозапуск выключен" ;;
