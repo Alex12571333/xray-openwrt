@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260633"
+SCRIPT_VERSION="20260634"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -48,6 +48,7 @@ FIREWALL_MARK="# xray-tproxy"
 FIREWALL_USER="/etc/firewall.user"
 XRAY_SERVERS_FILE="/etc/xray/servers.txt"
 XRAY_EXCLUDED_IPS_FILE="/etc/xray/excluded_ips"
+XRAY_PROXY_CHECK_LOCK="/tmp/xray-proxy-check.lock"
 
 WORK_DIR=$(mktemp -d /tmp/xray-XXXXXX)
 trap 'rm -rf "$WORK_DIR" /tmp/xray_sv_*.env /tmp/xray_ping*.txt 2>/dev/null' EXIT INT TERM
@@ -2401,6 +2402,83 @@ _autofix_sub_url() {
     cmd_recover
 }
 
+# ─── Переключение на следующий сохранённый сервер ─────────────────────────────
+# Вызывается когда proxy1 недоступен. Ротирует серверы из XRAY_SERVERS_FILE:
+# proxy2 становится новым proxy1, старый proxy1 уходит в конец.
+_switch_to_next_server() {
+    [ -f "$XRAY_SERVERS_FILE" ] || return 1
+    local total; total=$(wc -l < "$XRAY_SERVERS_FILE" | tr -d ' ')
+    [ "$total" -lt 2 ] && {
+        logger -t xray-heal "нет резервного сервера в $XRAY_SERVERS_FILE"
+        return 1
+    }
+
+    local line1 line2 line3
+    line1=$(sed -n '1p' "$XRAY_SERVERS_FILE")
+    line2=$(sed -n '2p' "$XRAY_SERVERS_FILE")
+    line3=$(sed -n '3p' "$XRAY_SERVERS_FILE")
+    [ -z "$line3" ] && line3="$line1"
+
+    # Ротация: 2→1, 3→2, 1→3
+    printf '%s\n%s\n%s\n' "$line2" "$line3" "$line1" > "$XRAY_SERVERS_FILE"
+
+    # Парсим новый порядок
+    local i=0
+    while IFS= read -r line && [ "$i" -lt 3 ]; do
+        [ -z "$line" ] && continue
+        i=$((i+1))
+        parse_vless "$line" "$i" 2>/dev/null || i=$((i-1))
+    done < "$XRAY_SERVERS_FILE"
+    [ "$i" -gt 0 ] || { logger -t xray-heal "parse_vless не удался"; return 1; }
+
+    local new_cfg="${WORK_DIR}/config_failover.json"
+    gen_config "$new_cfg" 2>/dev/null
+    XRAY_LOCATION_ASSET=/etc/xray "$XRAY_BIN" run -test -c "$new_cfg" >/dev/null 2>&1 || {
+        logger -t xray-heal "новый конфиг невалиден — откат"
+        return 1
+    }
+
+    _save_backup
+    cp "$new_cfg" "$XRAY_CONFIG"
+    _fast_restart 2>/dev/null || true
+
+    local new_host
+    new_host=$(grep '"address"' "$XRAY_CONFIG" | head -1 | sed 's/.*"address": *"\([^"]*\)".*/\1/')
+    logger -t xray-heal "переключились на резервный сервер: $new_host"
+    _tg_send "⚠️ proxy1 упал — переключился на резервный: $new_host" 2>/dev/null || true
+}
+
+# ─── Проверка доступности proxy1 (каждые 5 мин через healthcheck) ─────────────
+# Если proxy1 недоступен (timeout) — ротируем на следующий сервер.
+# Использует HTTPS-тест (как select_best_servers) — работает для TLS/Reality.
+_healthcheck_proxy() {
+    _xray_is_running 2>/dev/null || return 0   # Xray не запущен — selfheal разберётся
+    [ -f "$XRAY_CONFIG" ] || return 0
+    [ -f "$XRAY_SERVERS_FILE" ] || return 0    # нет сохранённых серверов — нечего переключать
+    command -v timeout >/dev/null 2>&1 || return 0  # нет timeout — пропускаем
+
+    # Не запускаем параллельно
+    [ -f "$XRAY_PROXY_CHECK_LOCK" ] && return 0
+    touch "$XRAY_PROXY_CHECK_LOCK"
+
+    local host port ex
+    host=$(grep '"address"' "$XRAY_CONFIG" | head -1 | sed 's/.*"address": *"\([^"]*\)".*/\1/')
+    port=$(grep '"port"' "$XRAY_CONFIG" | head -1 | sed 's/[^0-9]//g')
+
+    if [ -n "$host" ] && [ -n "$port" ]; then
+        timeout 6 wget --no-check-certificate --spider -q \
+            "https://${host}:${port}/" >/dev/null 2>&1
+        ex=$?
+        # exit 124 = timeout команды = сервер не ответил = недоступен
+        if [ "$ex" -eq 124 ]; then
+            logger -t xray-heal "proxy1 ${host}:${port} не отвечает — переключаю сервер"
+            _switch_to_next_server
+        fi
+    fi
+
+    rm -f "$XRAY_PROXY_CHECK_LOCK"
+}
+
 # ─── Самовосстановление: tproxy активен но Xray не запущен → убрать хук ──────
 # Вызывается при каждом запуске скрипта — до любых других действий.
 _selfheal_tproxy() {
@@ -2438,7 +2516,7 @@ main() {
         _updater_daemon) _updater_daemon ;;
         _tunnel_daemon)  _tunnel_daemon ;;
         _tg_bot_daemon)  _tg_bot_daemon ;;
-        healthcheck)    _selfheal_tproxy; _start_updater; _start_tg_bot; _start_tunnel_if_configured ;;
+        healthcheck)    _selfheal_tproxy; _healthcheck_proxy; _start_updater; _start_tg_bot; _start_tunnel_if_configured ;;
         autostart-on)   install_init_script && info "Автозапуск включён" ;;
         autostart-off)  remove_init_script  && info "Автозапуск выключен" ;;
         cron-on)        install_cron 6      && info "Автообновление включено" ;;
