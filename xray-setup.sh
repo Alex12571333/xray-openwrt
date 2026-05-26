@@ -3,7 +3,7 @@
 # Зависимости: wget/uclient-fetch, openssl/base64, unzip, grep, sed, awk, nc (BusyBox)
 # Использование: sh xray-setup.sh [sub_url|test|update|self-update]  или без аргументов — меню
 
-SCRIPT_VERSION="20260640"
+SCRIPT_VERSION="20260641"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 SCRIPT_REMOTE_CMD_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/remote_cmd"
@@ -1324,13 +1324,20 @@ ${ob3},
   ],
   "routing": {
     "domainStrategy": "IPIfNonMatch",
+    "balancers": [{"tag":"balancer","selector":["proxy1","proxy2","proxy3"],
+                   "strategy":{"type":"leastPing"}}],
     "rules": [
       {"type":"field","ip":["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4"],"outboundTag":"direct"},
       {"type":"field","ip":["109.105.128.0/17"],"outboundTag":"direct"},
       {"type":"field","domain":["regexp:[.]ru$","regexp:[.]su$","regexp:[.]xn--p1ai$","domain:rustdesk.com","domain:4game.com","domain:4game.ru","domain:innova.ru","domain:ncsoft.com","domain:lineage2.com"],"outboundTag":"direct"},
-      {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"outboundTag":"proxy1"},
-      {"type":"field","network":"tcp,udp","outboundTag":"proxy1"}
+      {"type":"field","ip":["91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.56.0/22","149.154.160.0/20","149.154.164.0/22"],"balancerTag":"balancer"},
+      {"type":"field","network":"tcp,udp","balancerTag":"balancer"}
     ]
+  },
+  "observatory": {
+    "subjectSelector":["proxy1","proxy2","proxy3"],
+    "probeURL":"https://www.gstatic.com/generate_204",
+    "probeInterval":"5m"
   }
 }
 CFGEOF
@@ -2458,21 +2465,20 @@ _switch_to_next_server() {
     _tg_send "⚠️ proxy1 упал — переключился на резервный: $new_host" 2>/dev/null || true
 }
 
-# ─── Проверка доступности proxy1 (каждые 5 мин через healthcheck) ─────────────
-# Если proxy1 недоступен (timeout) — ротируем на следующий сервер.
-# Использует HTTPS-тест (как select_best_servers) — работает для TLS/Reality.
+# ─── Проверка доступности серверов (резервный контур, раз в минуту) ───────────
+# Основной фейловер — observatory+balancer внутри Xray (бесшовный, без перезапуска).
+# Этот healthcheck — резерв на случай если все 3 сервера из текущего конфига
+# недоступны: скачивает новую подписку и обновляет список серверов.
 _healthcheck_proxy() {
-    _xray_is_running 2>/dev/null || return 0   # Xray не запущен — selfheal разберётся
+    _xray_is_running 2>/dev/null || return 0
     [ -f "$XRAY_CONFIG" ] || return 0
-    [ -f "$XRAY_SERVERS_FILE" ] || return 0    # нет сохранённых серверов — нечего переключать
-    command -v timeout >/dev/null 2>&1 || return 0  # нет timeout — пропускаем
+    [ -f "$XRAY_SERVERS_FILE" ] || return 0
+    command -v timeout >/dev/null 2>&1 || return 0
 
-    # Не запускаем параллельно
     [ -f "$XRAY_PROXY_CHECK_LOCK" ] && return 0
     touch "$XRAY_PROXY_CHECK_LOCK"
 
-    # Берём host и port с ОДНОЙ строки (строка vnext в outbound)
-    # grep '"port"' | head -1 неверно — взял бы порт socks inbound (1080)
+    # Берём host и port с ОДНОЙ строки vnext (не socks inbound!)
     local sv_line host port ex
     sv_line=$(grep '"address"' "$XRAY_CONFIG" | head -1)
     host=$(printf '%s' "$sv_line" | sed 's/.*"address": *"\([^"]*\)".*/\1/')
@@ -2482,8 +2488,7 @@ _healthcheck_proxy() {
         timeout 20 wget --no-check-certificate --spider -q \
             "https://${host}:${port}/" >/dev/null 2>&1
         ex=$?
-        # Недоступен: 124=timeout, 4=connection refused/network error
-        # Живой: 0=OK, 8=HTTP error (сервер ответил), всё остальное
+        # 124=timeout, 4=connection refused → недоступен
         if [ "$ex" -eq 124 ] || [ "$ex" -eq 4 ]; then
             local fails=0
             [ -f "$XRAY_PROXY_FAIL_FILE" ] && \
@@ -2492,14 +2497,15 @@ _healthcheck_proxy() {
             fails=$((fails + 1))
             printf '%s\n' "$fails" > "$XRAY_PROXY_FAIL_FILE"
             logger -t xray-heal "proxy1 ${host}:${port} не отвечает (${fails}/3, exit=${ex})"
-            # Переключаем только после 3 неудач подряд (~3 минуты)
+            # После 3 неудач — обновляем подписку (получаем новые серверы)
+            # Balancer уже должен был переключиться на proxy2/proxy3 сам.
+            # Это страховка если все 3 сервера из текущего списка упали.
             if [ "$fails" -ge 3 ]; then
                 rm -f "$XRAY_PROXY_FAIL_FILE"
-                logger -t xray-heal "proxy1 недоступен 3 раза подряд — переключаю"
-                _switch_to_next_server
+                logger -t xray-heal "proxy1 недоступен 3 раза — обновляю подписку"
+                update_subscription "" >> "$XRAY_UPDLOG" 2>&1 || true
             fi
         else
-            # Успех (0=OK, 8=HTTP error от живого сервера) — сбрасываем счётчик
             rm -f "$XRAY_PROXY_FAIL_FILE"
         fi
     fi
