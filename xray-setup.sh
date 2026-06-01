@@ -3,7 +3,7 @@
 # Использование: sh xray-setup.sh <vless://...>
 # Весь трафик идёт на VPS, VPS решает маршрутизацию
 
-SCRIPT_VERSION="20260643"
+SCRIPT_VERSION="20260644"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -365,6 +365,97 @@ self_update() {
     info "Скрипт обновлён до $remote_ver"
 }
 
+# ─── Меню ────────────────────────────────────────────────────────────────────
+
+show_menu() {
+    local vps_info status_str
+    if [ -f "$XRAY_VLESS_FILE" ]; then
+        local _url; _url=$(cat "$XRAY_VLESS_FILE")
+        local _host; _host=$(printf '%s' "${_url#vless://}" | sed 's/.*@//' | cut -d'?' -f1)
+        vps_info="$_host"
+    else
+        vps_info="не настроен"
+    fi
+
+    if _xray_is_running; then
+        status_str="[работает, PID $(cat "$XRAY_PID")]"
+    else
+        status_str="[не запущен]"
+    fi
+
+    echo ""
+    echo "=============================="
+    echo "  Xray VPS туннель v${SCRIPT_VERSION}"
+    echo "=============================="
+    echo "  VPS    : $vps_info"
+    echo "  Статус : $status_str"
+    echo "------------------------------"
+    echo "  1) Запустить / перезапустить"
+    echo "  2) Остановить"
+    echo "  3) Сменить VPS (новый VLESS)"
+    echo "  4) Показать логи"
+    echo "  5) Обновить скрипт"
+    echo "  6) Выход"
+    echo "=============================="
+    printf "Выбор: "
+    read -r choice
+    echo ""
+    case "$choice" in
+        1)
+            if [ -f "$XRAY_VLESS_FILE" ]; then
+                VLESS_URL=$(cat "$XRAY_VLESS_FILE")
+                parse_vless "$VLESS_URL"
+                install_xray
+                gen_config
+                start_xray
+                setup_iptables
+                install_cron
+            else
+                echo "Сначала укажи VLESS URL (пункт 3)"
+            fi
+            ;;
+        2)
+            kill "$(cat "$XRAY_PID" 2>/dev/null)" 2>/dev/null || killall xray 2>/dev/null || true
+            cleanup_iptables
+            info "Xray остановлен"
+            ;;
+        3)
+            printf "Вставь VLESS URL: "
+            read -r new_url
+            case "$new_url" in
+                vless://*)
+                    mkdir -p /etc/xray
+                    printf '%s\n' "$new_url" > "$XRAY_VLESS_FILE"
+                    parse_vless "$new_url"
+                    install_xray
+                    gen_config
+                    cp "$XRAY_SELF" "$XRAY_SELF.bak" 2>/dev/null || true
+                    start_xray
+                    setup_iptables
+                    install_cron
+                    info "Готово! VPS: ${SV_HOST}:${SV_PORT}"
+                    ;;
+                *)
+                    echo "Ошибка: URL должен начинаться с vless://"
+                    ;;
+            esac
+            ;;
+        4)
+            echo "--- Последние 30 строк лога ---"
+            tail -30 "$XRAY_LOG" 2>/dev/null || echo "Лог пустой"
+            ;;
+        5)
+            self_update
+            ;;
+        6)
+            exit 0
+            ;;
+        *)
+            echo "Неверный выбор"
+            ;;
+    esac
+}
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -377,6 +468,11 @@ case "${1:-}" in
         info "Xray остановлен"
         ;;
     restart)
+        if [ -f "$XRAY_VLESS_FILE" ]; then
+            VLESS_URL=$(cat "$XRAY_VLESS_FILE")
+            parse_vless "$VLESS_URL"
+            gen_config
+        fi
         kill "$(cat "$XRAY_PID" 2>/dev/null)" 2>/dev/null || killall xray 2>/dev/null || true
         sleep 1
         start_xray
@@ -388,12 +484,13 @@ case "${1:-}" in
     status)
         if _xray_is_running; then
             info "Xray работает (PID $(cat "$XRAY_PID"))"
+            [ -f "$XRAY_VLESS_FILE" ] && info "VPS: $(cat "$XRAY_VLESS_FILE" | sed 's/vless:\/\///' | sed 's/.*@//' | cut -d'?' -f1)"
         else
             info "Xray не запущен"
         fi
         ;;
     vless://*)
-        # Новый VLESS URL — сохранить и перенастроить
+        # Прямая передача VLESS URL без меню
         VLESS_URL="$1"
         mkdir -p /etc/xray
         printf '%s\n' "$VLESS_URL" > "$XRAY_VLESS_FILE"
@@ -407,24 +504,7 @@ case "${1:-}" in
         info "Готово! VPS: ${SV_HOST}:${SV_PORT}"
         ;;
     *)
-        # Без аргументов — использовать сохранённый URL
-        if [ -f "$XRAY_VLESS_FILE" ]; then
-            VLESS_URL=$(cat "$XRAY_VLESS_FILE")
-            parse_vless "$VLESS_URL"
-            install_xray
-            gen_config
-            start_xray
-            setup_iptables
-            install_cron
-            info "Готово! VPS: ${SV_HOST}:${SV_PORT}"
-        else
-            echo "Использование:"
-            echo "  sh $0 vless://UUID@host:port?...   — первоначальная настройка"
-            echo "  sh $0 restart                       — перезапуск"
-            echo "  sh $0 stop                          — остановить"
-            echo "  sh $0 status                        — статус"
-            echo "  sh $0 self-update                   — обновить скрипт"
-            exit 1
-        fi
+        # Без аргументов — показать меню
+        show_menu
         ;;
 esac
