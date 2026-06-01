@@ -1,32 +1,32 @@
 #!/bin/sh
-# xray-setup.sh — минимальный Xray TPROXY туннель для OpenWrt
-# Использование: sh xray-setup.sh <vless://...>
-# Весь трафик идёт на VPS, VPS решает маршрутизацию
+# setup.sh — sing-box TPROXY туннель для OpenWrt
+# Весь трафик → VPS, VPS решает маршрутизацию
+# Использование: sh setup.sh <vless://...>
 
-SCRIPT_VERSION="20260644"
+SCRIPT_VERSION="20260645"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
-XRAY_BIN="/usr/bin/xray"
-XRAY_CONFIG="/etc/xray/config.json"
-XRAY_PID="/var/run/xray.pid"
-XRAY_VLESS_FILE="/etc/xray/vless_url"
-XRAY_LOG="/var/log/xray.log"
-XRAY_SELF="/etc/xray/setup.sh"
-XRAY_CRON="/etc/crontabs/root"
-CRON_MARKER="# xray-tunnel"
-IPTABLES_CHAIN="XRAY_TP"
-GITHUB_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+SINGBOX_BIN="/usr/bin/sing-box"
+SINGBOX_CONFIG="/etc/sing-box/config.json"
+SINGBOX_PID="/var/run/sing-box.pid"
+SINGBOX_VLESS_FILE="/etc/sing-box/vless_url"
+SINGBOX_LOG="/var/log/sing-box.log"
+SINGBOX_SELF="/etc/sing-box/setup.sh"
+SINGBOX_CRON="/etc/crontabs/root"
+CRON_MARKER="# sing-box-tunnel"
+IPTABLES_CHAIN="SBOX_TP"
+GITHUB_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 
 # ─── Утилиты ────────────────────────────────────────────────────────────────
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
-info() { echo "[xray] $*"; }
-warn() { echo "[xray] WARN: $*" >&2; }
+info() { echo "[sing-box] $*"; }
+warn() { echo "[sing-box] WARN: $*" >&2; }
 
-_xray_is_running() {
-    [ -f "$XRAY_PID" ] || return 1
-    local pid; pid=$(cat "$XRAY_PID" 2>/dev/null)
+_is_running() {
+    [ -f "$SINGBOX_PID" ] || return 1
+    local pid; pid=$(cat "$SINGBOX_PID" 2>/dev/null)
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
@@ -34,34 +34,43 @@ _xray_is_running() {
 
 detect_arch() {
     case $(uname -m) in
-        aarch64)        echo "arm64-v8a" ;;
-        armv7l)         echo "arm32-v7a" ;;
-        armv6l)         echo "arm32-v6" ;;
-        x86_64)         echo "64" ;;
-        i686|i386)      echo "32" ;;
-        mips)           echo "mips32" ;;
-        mipsel|mipsle)  echo "mips32le" ;;
+        aarch64)        echo "linux-arm64" ;;
+        armv7l)         echo "linux-armv7" ;;
+        armv6l)         echo "linux-armv6" ;;
+        x86_64)         echo "linux-amd64" ;;
+        i686|i386)      echo "linux-386" ;;
+        mipsel|mipsle)  echo "linux-mipsle-softfloat" ;;
+        mips)           echo "linux-mips-softfloat" ;;
         *) die "Unsupported arch: $(uname -m)" ;;
     esac
 }
 
-# ─── Установка Xray ─────────────────────────────────────────────────────────
+# ─── Установка sing-box ──────────────────────────────────────────────────────
 
-install_xray() {
-    if [ -x "$XRAY_BIN" ]; then
-        info "Xray уже установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
+install_singbox() {
+    if [ -x "$SINGBOX_BIN" ]; then
+        info "sing-box уже установлен: $("$SINGBOX_BIN" version 2>/dev/null | head -1)"
         return 0
     fi
-    info "Устанавливаю Xray..."
+    info "Устанавливаю sing-box..."
     local arch; arch=$(detect_arch)
-    local archive="Xray-linux-${arch}.zip"
-    local json url tmpdir
-    tmpdir=$(mktemp -d /tmp/xray-XXXXXX)
+    local json url ver archive tmpdir
+    tmpdir=$(mktemp -d /tmp/singbox-XXXXXX)
     trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
     info "Получаю последний релиз с GitHub..."
     json=$(wget --no-check-certificate -qO- "$GITHUB_API") \
         || die "Не удалось получить информацию о релизе"
+
+    ver=$(printf '%s' "$json" \
+        | grep '"tag_name"' \
+        | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' \
+        | head -1)
+    [ -n "$ver" ] || die "Не удалось определить версию"
+
+    # Убираем 'v' из версии для имени файла
+    local ver_num="${ver#v}"
+    archive="sing-box-${ver_num}-${arch}.tar.gz"
 
     url=$(printf '%s' "$json" \
         | grep '"browser_download_url"' \
@@ -71,17 +80,19 @@ install_xray() {
     [ -n "$url" ] || die "Не найден URL для $archive"
 
     info "Скачиваю $archive..."
-    wget --no-check-certificate -qO "$tmpdir/xray.zip" "$url" \
+    wget --no-check-certificate -qO "$tmpdir/singbox.tar.gz" "$url" \
         || die "Ошибка скачивания"
-    [ -s "$tmpdir/xray.zip" ] || die "Архив пустой"
+    [ -s "$tmpdir/singbox.tar.gz" ] || die "Архив пустой"
 
-    unzip -o "$tmpdir/xray.zip" xray -d "$tmpdir/" \
+    tar -xzf "$tmpdir/singbox.tar.gz" -C "$tmpdir/" \
         || die "Ошибка распаковки"
-    [ -f "$tmpdir/xray" ] || die "Бинарник xray не найден в архиве"
 
-    mv "$tmpdir/xray" "$XRAY_BIN"
-    chmod +x "$XRAY_BIN"
-    info "Xray установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
+    local bin; bin=$(find "$tmpdir" -name "sing-box" -type f | head -1)
+    [ -n "$bin" ] || die "Бинарник sing-box не найден в архиве"
+
+    mv "$bin" "$SINGBOX_BIN"
+    chmod +x "$SINGBOX_BIN"
+    info "sing-box установлен: $("$SINGBOX_BIN" version 2>/dev/null | head -1)"
 }
 
 # ─── Парсинг VLESS URL ───────────────────────────────────────────────────────
@@ -123,136 +134,139 @@ parse_vless() {
     SV_FP="${SV_FP:-chrome}"
 }
 
-alpn_to_json() {
-    printf '%s' "$1" | awk -F',' 'BEGIN{printf "["}{for(i=1;i<=NF;i++){if(i>1)printf ","; printf "\"%s\"",$i}}END{printf "]"}'
-}
-
 # ─── Генерация конфига ───────────────────────────────────────────────────────
 
 gen_config() {
     info "Генерирую конфиг..."
-    mkdir -p /etc/xray
+    mkdir -p /etc/sing-box
 
-    # Stream settings
-    local stream_settings
+    # TLS блок
+    local tls_block=""
     case "$SV_SEC" in
         reality)
-            stream_settings=$(cat <<EOF
-        "streamSettings": {
-          "network": "${SV_TYPE}",
-          "security": "reality",
-          "realitySettings": {
-            "serverName": "${SV_SNI}",
-            "fingerprint": "${SV_FP}",
-            "publicKey": "${SV_PBK}",
-            "shortId": "${SV_SID}"
-          }$([ -n "$SV_PATH" ] && printf ',\n          "wsSettings": {"path": "%s"}' "$SV_PATH")
+            tls_block=$(cat <<EOF
+      "tls": {
+        "enabled": true,
+        "server_name": "${SV_SNI}",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "${SV_FP}"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "${SV_PBK}",
+          "short_id": "${SV_SID}"
         }
+      },
 EOF
 )
             ;;
         tls)
-            local alpn_json; alpn_json=$(alpn_to_json "$SV_ALPN")
-            stream_settings=$(cat <<EOF
-        "streamSettings": {
-          "network": "${SV_TYPE}",
-          "security": "tls",
-          "tlsSettings": {
-            "serverName": "${SV_SNI}",
-            "alpn": ${alpn_json}
-          }$([ -n "$SV_PATH" ] && printf ',\n          "wsSettings": {"path": "%s", "headers": {"Host": "%s"}}' "$SV_PATH" "${SV_HOST_HDR:-$SV_SNI}")
+            tls_block=$(cat <<EOF
+      "tls": {
+        "enabled": true,
+        "server_name": "${SV_SNI}",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "${SV_FP}"
         }
-EOF
-)
-            ;;
-        *)
-            stream_settings=$(cat <<EOF
-        "streamSettings": {
-          "network": "${SV_TYPE}"$([ -n "$SV_PATH" ] && printf ',\n          "wsSettings": {"path": "%s"}' "$SV_PATH")
-        }
+      },
 EOF
 )
             ;;
     esac
 
+    # Transport блок (ws/grpc)
+    local transport_block=""
+    case "$SV_TYPE" in
+        ws)
+            transport_block=$(cat <<EOF
+      "transport": {
+        "type": "ws",
+        "path": "${SV_PATH}",
+        "headers": { "Host": "${SV_HOST_HDR:-$SV_SNI}" }
+      },
+EOF
+)
+            ;;
+        grpc)
+            transport_block=$(cat <<EOF
+      "transport": {
+        "type": "grpc",
+        "service_name": "${SV_PATH}"
+      },
+EOF
+)
+            ;;
+    esac
+
+    # Flow
     local flow_line=""
     [ -n "$SV_FLOW" ] && flow_line="\"flow\": \"${SV_FLOW}\","
 
-    cat > "$XRAY_CONFIG" <<EOF
+    cat > "$SINGBOX_CONFIG" <<EOF
 {
   "log": {
-    "loglevel": "warning",
-    "access": "${XRAY_LOG}",
-    "error": "${XRAY_LOG}"
+    "level": "warn",
+    "output": "${SINGBOX_LOG}"
   },
   "inbounds": [
     {
-      "tag": "socks",
-      "port": 1080,
-      "protocol": "socks",
-      "settings": { "auth": "noauth", "udp": true }
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "0.0.0.0",
+      "listen_port": 1080
     },
     {
-      "tag": "http",
-      "port": 1081,
-      "protocol": "http"
+      "type": "http",
+      "tag": "http-in",
+      "listen": "0.0.0.0",
+      "listen_port": 1081
     },
     {
-      "tag": "tproxy",
-      "port": 12345,
-      "protocol": "dokodemo-door",
-      "settings": { "network": "tcp,udp", "followRedirect": true },
-      "streamSettings": { "sockopt": { "tproxy": "tproxy" } }
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "0.0.0.0",
+      "listen_port": 12345
     }
   ],
   "outbounds": [
     {
+      "type": "vless",
       "tag": "proxy",
-      "protocol": "vless",
-      "settings": {
-        "vnext": [{
-          "address": "${SV_HOST}",
-          "port": ${SV_PORT},
-          "users": [{
-            "id": "${SV_UUID}",
-            ${flow_line}
-            "encryption": "none"
-          }]
-        }]
-      },
-${stream_settings}
+      "server": "${SV_HOST}",
+      "server_port": ${SV_PORT},
+      "uuid": "${SV_UUID}",
+      ${flow_line}
+${tls_block}
+${transport_block}
+      "packet_encoding": "xudp"
     },
     {
-      "tag": "direct",
-      "protocol": "freedom"
+      "type": "direct",
+      "tag": "direct"
     },
     {
-      "tag": "block",
-      "protocol": "blackhole"
+      "type": "block",
+      "tag": "block"
     }
   ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
+  "route": {
     "rules": [
       {
-        "type": "field",
-        "ip": [
+        "ip_cidr": [
           "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8",
           "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
           "224.0.0.0/4", "240.0.0.0/4"
         ],
-        "outboundTag": "direct"
-      },
-      {
-        "type": "field",
-        "network": "tcp,udp",
-        "outboundTag": "proxy"
+        "outbound": "direct"
       }
-    ]
+    ],
+    "final": "proxy"
   }
 }
 EOF
-    info "Конфиг записан: $XRAY_CONFIG"
+    info "Конфиг записан: $SINGBOX_CONFIG"
 }
 
 # ─── TPROXY iptables ─────────────────────────────────────────────────────────
@@ -260,37 +274,27 @@ EOF
 setup_iptables() {
     info "Настраиваю iptables TPROXY..."
 
-    # Политика роутинга
     ip rule add fwmark 0x1 table 100 2>/dev/null || true
     ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
 
-    # Сбросить старые правила
     iptables -t mangle -D PREROUTING -j "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
-
     iptables -t mangle -N "$IPTABLES_CHAIN"
 
-    # Пропускаем локальные/приватные адреса напрямую
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 0.0.0.0/8        -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 10.0.0.0/8       -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 127.0.0.0/8      -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 169.254.0.0/16   -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 172.16.0.0/12    -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 192.168.0.0/16   -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 224.0.0.0/4      -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 240.0.0.0/4      -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 0.0.0.0/8      -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 10.0.0.0/8     -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 127.0.0.0/8    -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 169.254.0.0/16 -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 172.16.0.0/12  -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 22 -j RETURN
 
-    # Пропускаем SSH к роутеру
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 22   -j RETURN
-
-    # Весь остальной трафик → TPROXY
     iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp -j TPROXY --on-port 12345 --tproxy-mark 1
     iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -j TPROXY --on-port 12345 --tproxy-mark 1
 
-    # Применяем к входящему трафику с LAN
-    local iface; iface=$(ip route | awk '/^default/{print $5; exit}')
-    # Применяем ко всем интерфейсам кроме loopback и WAN
     for br in br-lan br0 eth1; do
         iptables -t mangle -A PREROUTING -i "$br" -j "$IPTABLES_CHAIN" 2>/dev/null || true
     done
@@ -307,42 +311,42 @@ cleanup_iptables() {
     info "TPROXY правила удалены"
 }
 
-# ─── Запуск Xray ────────────────────────────────────────────────────────────
+# ─── Запуск sing-box ─────────────────────────────────────────────────────────
 
-start_xray() {
-    info "Запускаю Xray..."
+start_singbox() {
+    info "Запускаю sing-box..."
     mkdir -p /var/run /var/log
 
-    if [ -f "$XRAY_PID" ]; then
-        kill "$(cat "$XRAY_PID")" 2>/dev/null || true
-        rm -f "$XRAY_PID"
+    if [ -f "$SINGBOX_PID" ]; then
+        kill "$(cat "$SINGBOX_PID")" 2>/dev/null || true
+        rm -f "$SINGBOX_PID"
     fi
-    killall xray 2>/dev/null || true
+    killall sing-box 2>/dev/null || true
     sleep 1
 
-    "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_LOG" 2>&1 &
-    echo $! > "$XRAY_PID"
+    "$SINGBOX_BIN" run -c "$SINGBOX_CONFIG" >> "$SINGBOX_LOG" 2>&1 &
+    echo $! > "$SINGBOX_PID"
     sleep 2
-    if _xray_is_running; then
-        info "Xray запущен (PID $(cat "$XRAY_PID"))"
+    if _is_running; then
+        info "sing-box запущен (PID $(cat "$SINGBOX_PID"))"
     else
-        die "Xray не запустился — проверь лог: $XRAY_LOG"
+        die "sing-box не запустился — проверь лог: $SINGBOX_LOG"
     fi
 }
 
-# ─── Watchdog (cron) ────────────────────────────────────────────────────────
+# ─── Watchdog ────────────────────────────────────────────────────────────────
 
 install_cron() {
-    grep -q "$CRON_MARKER" "$XRAY_CRON" 2>/dev/null && return 0
-    printf '* * * * * sh %s watchdog %s\n' "$XRAY_SELF" "$CRON_MARKER" >> "$XRAY_CRON"
+    grep -q "$CRON_MARKER" "$SINGBOX_CRON" 2>/dev/null && return 0
+    printf '* * * * * sh %s watchdog %s\n' "$SINGBOX_SELF" "$CRON_MARKER" >> "$SINGBOX_CRON"
     /etc/init.d/cron restart 2>/dev/null || true
     info "Watchdog cron установлен"
 }
 
 _watchdog() {
-    _xray_is_running && return 0
-    logger -t xray-watchdog "Xray не запущен — перезапускаю"
-    start_xray
+    _is_running && return 0
+    logger -t singbox-watchdog "sing-box не запущен — перезапускаю"
+    start_singbox
     setup_iptables
 }
 
@@ -352,16 +356,14 @@ self_update() {
     local remote_ver
     remote_ver=$(wget --no-check-certificate -qO- "$SCRIPT_VERSION_URL" 2>/dev/null | tr -d ' \n')
     if [ -z "$remote_ver" ]; then
-        warn "Не удалось проверить версию"
-        return 1
+        warn "Не удалось проверить версию"; return 1
     fi
     if [ "$remote_ver" = "$SCRIPT_VERSION" ]; then
-        info "Версия актуальна: $SCRIPT_VERSION"
-        return 0
+        info "Версия актуальна: $SCRIPT_VERSION"; return 0
     fi
     info "Обновляю скрипт: $SCRIPT_VERSION → $remote_ver"
-    wget --no-check-certificate -qO "$XRAY_SELF" "$SCRIPT_URL" || die "Ошибка скачивания"
-    chmod +x "$XRAY_SELF"
+    wget --no-check-certificate -qO "$SINGBOX_SELF" "$SCRIPT_URL" || die "Ошибка скачивания"
+    chmod +x "$SINGBOX_SELF"
     info "Скрипт обновлён до $remote_ver"
 }
 
@@ -369,26 +371,25 @@ self_update() {
 
 show_menu() {
     local vps_info status_str
-    if [ -f "$XRAY_VLESS_FILE" ]; then
-        local _url; _url=$(cat "$XRAY_VLESS_FILE")
-        local _host; _host=$(printf '%s' "${_url#vless://}" | sed 's/.*@//' | cut -d'?' -f1)
-        vps_info="$_host"
+    if [ -f "$SINGBOX_VLESS_FILE" ]; then
+        local _url; _url=$(cat "$SINGBOX_VLESS_FILE")
+        vps_info=$(printf '%s' "${_url#vless://}" | sed 's/.*@//' | cut -d'?' -f1)
     else
         vps_info="не настроен"
     fi
 
-    if _xray_is_running; then
-        status_str="[работает, PID $(cat "$XRAY_PID")]"
+    if _is_running; then
+        status_str="работает, PID $(cat "$SINGBOX_PID")"
     else
-        status_str="[не запущен]"
+        status_str="не запущен"
     fi
 
     echo ""
     echo "=============================="
-    echo "  Xray VPS туннель v${SCRIPT_VERSION}"
+    echo "  sing-box туннель v${SCRIPT_VERSION}"
     echo "=============================="
-    echo "  VPS    : $vps_info"
-    echo "  Статус : $status_str"
+    printf "  VPS    : %s\n" "$vps_info"
+    printf "  Статус : %s\n" "$status_str"
     echo "------------------------------"
     echo "  1) Запустить / перезапустить"
     echo "  2) Остановить"
@@ -402,12 +403,12 @@ show_menu() {
     echo ""
     case "$choice" in
         1)
-            if [ -f "$XRAY_VLESS_FILE" ]; then
-                VLESS_URL=$(cat "$XRAY_VLESS_FILE")
+            if [ -f "$SINGBOX_VLESS_FILE" ]; then
+                VLESS_URL=$(cat "$SINGBOX_VLESS_FILE")
                 parse_vless "$VLESS_URL"
-                install_xray
+                install_singbox
                 gen_config
-                start_xray
+                start_singbox
                 setup_iptables
                 install_cron
             else
@@ -415,22 +416,21 @@ show_menu() {
             fi
             ;;
         2)
-            kill "$(cat "$XRAY_PID" 2>/dev/null)" 2>/dev/null || killall xray 2>/dev/null || true
+            kill "$(cat "$SINGBOX_PID" 2>/dev/null)" 2>/dev/null || killall sing-box 2>/dev/null || true
             cleanup_iptables
-            info "Xray остановлен"
+            info "sing-box остановлен"
             ;;
         3)
             printf "Вставь VLESS URL: "
             read -r new_url
             case "$new_url" in
                 vless://*)
-                    mkdir -p /etc/xray
-                    printf '%s\n' "$new_url" > "$XRAY_VLESS_FILE"
+                    mkdir -p /etc/sing-box
+                    printf '%s\n' "$new_url" > "$SINGBOX_VLESS_FILE"
                     parse_vless "$new_url"
-                    install_xray
+                    install_singbox
                     gen_config
-                    cp "$XRAY_SELF" "$XRAY_SELF.bak" 2>/dev/null || true
-                    start_xray
+                    start_singbox
                     setup_iptables
                     install_cron
                     info "Готово! VPS: ${SV_HOST}:${SV_PORT}"
@@ -442,7 +442,7 @@ show_menu() {
             ;;
         4)
             echo "--- Последние 30 строк лога ---"
-            tail -30 "$XRAY_LOG" 2>/dev/null || echo "Лог пустой"
+            tail -30 "$SINGBOX_LOG" 2>/dev/null || echo "Лог пустой"
             ;;
         5)
             self_update
@@ -463,48 +463,47 @@ case "${1:-}" in
         _watchdog
         ;;
     stop)
-        kill "$(cat "$XRAY_PID" 2>/dev/null)" 2>/dev/null || killall xray 2>/dev/null || true
+        kill "$(cat "$SINGBOX_PID" 2>/dev/null)" 2>/dev/null || killall sing-box 2>/dev/null || true
         cleanup_iptables
-        info "Xray остановлен"
+        info "sing-box остановлен"
         ;;
     restart)
-        if [ -f "$XRAY_VLESS_FILE" ]; then
-            VLESS_URL=$(cat "$XRAY_VLESS_FILE")
+        if [ -f "$SINGBOX_VLESS_FILE" ]; then
+            VLESS_URL=$(cat "$SINGBOX_VLESS_FILE")
             parse_vless "$VLESS_URL"
             gen_config
         fi
-        kill "$(cat "$XRAY_PID" 2>/dev/null)" 2>/dev/null || killall xray 2>/dev/null || true
+        kill "$(cat "$SINGBOX_PID" 2>/dev/null)" 2>/dev/null || killall sing-box 2>/dev/null || true
         sleep 1
-        start_xray
+        start_singbox
         setup_iptables
         ;;
     self-update)
         self_update
         ;;
     status)
-        if _xray_is_running; then
-            info "Xray работает (PID $(cat "$XRAY_PID"))"
-            [ -f "$XRAY_VLESS_FILE" ] && info "VPS: $(cat "$XRAY_VLESS_FILE" | sed 's/vless:\/\///' | sed 's/.*@//' | cut -d'?' -f1)"
+        if _is_running; then
+            info "sing-box работает (PID $(cat "$SINGBOX_PID"))"
+            [ -f "$SINGBOX_VLESS_FILE" ] && \
+                info "VPS: $(cat "$SINGBOX_VLESS_FILE" | sed 's/vless:\/\///' | sed 's/.*@//' | cut -d'?' -f1)"
         else
-            info "Xray не запущен"
+            info "sing-box не запущен"
         fi
         ;;
     vless://*)
-        # Прямая передача VLESS URL без меню
         VLESS_URL="$1"
-        mkdir -p /etc/xray
-        printf '%s\n' "$VLESS_URL" > "$XRAY_VLESS_FILE"
+        mkdir -p /etc/sing-box
+        printf '%s\n' "$VLESS_URL" > "$SINGBOX_VLESS_FILE"
         parse_vless "$VLESS_URL"
-        install_xray
+        install_singbox
         gen_config
-        cp "$0" "$XRAY_SELF" 2>/dev/null || true
-        start_xray
+        cp "$0" "$SINGBOX_SELF" 2>/dev/null || true
+        start_singbox
         setup_iptables
         install_cron
         info "Готово! VPS: ${SV_HOST}:${SV_PORT}"
         ;;
     *)
-        # Без аргументов — показать меню
         show_menu
         ;;
 esac
