@@ -3,7 +3,7 @@
 # Весь трафик → VPS, VPS решает маршрутизацию
 # Использование: sh setup.sh <vless://...>
 
-SCRIPT_VERSION="20260645"
+SCRIPT_VERSION="20260646"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -232,6 +232,15 @@ EOF
   ],
   "outbounds": [
     {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["proxy", "direct"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "1m",
+      "tolerance": 500,
+      "interrupt_exist_connections": false
+    },
+    {
       "type": "vless",
       "tag": "proxy",
       "server": "${SV_HOST}",
@@ -262,7 +271,7 @@ ${transport_block}
         "outbound": "direct"
       }
     ],
-    "final": "proxy"
+    "final": "auto"
   }
 }
 EOF
