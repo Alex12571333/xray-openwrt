@@ -3,7 +3,7 @@
 # Весь трафик → VPS, VPS решает маршрутизацию
 # Использование: sh setup.sh <vless://...>
 
-SCRIPT_VERSION="20260647"
+SCRIPT_VERSION="20260648"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -116,8 +116,10 @@ parse_vless() {
     SV_UUID="${rest%%@*}"
     local after_at="${rest#*@}"
     local hostport="${after_at%%\?*}"
+    hostport="${hostport%/}"            # убираем хвостовой слэш (3x-ui даёт host:443/?...)
     SV_HOST="${hostport%:*}"
     SV_PORT="${hostport##*:}"
+    SV_PORT="${SV_PORT%/}"              # на всякий случай
     local query="${after_at#*\?}"
     query="${query%%#*}"
 
@@ -159,10 +161,11 @@ _emit_vless_outbound() {
 }
 
 # Скачивает подписку, извлекает только whitelist-серверы, заполняет:
-#   WL_OUTBOUNDS_JSON — фрагмент JSON (каждый сервер с ведущей запятой+переносом)
-#   WL_SELECTOR       — элементы для urltest ( , "wl-1", "wl-2" ... )
+#   WL_OBJECTS  — JSON-объекты outbound'ов, через запятую, БЕЗ ведущей запятой
+#   WL_TAGS_CSV — теги для urltest: "wl-1", "wl-2" ...  (без ведущей запятой)
+#   WL_COUNT    — сколько серверов
 build_whitelist() {
-    WL_OUTBOUNDS_JSON=""; WL_SELECTOR=""
+    WL_OBJECTS=""; WL_TAGS_CSV=""; WL_COUNT=0
     [ -f "$SINGBOX_WHITELIST_FILE" ] || return 0
     local sub_url; sub_url=$(cat "$SINGBOX_WHITELIST_FILE" 2>/dev/null)
     [ -n "$sub_url" ] || return 0
@@ -181,22 +184,45 @@ build_whitelist() {
         fi
     fi
 
-    [ -s "$SINGBOX_WHITELIST_CACHE" ] || { warn "whitelist: серверы не найдены (нет связи и нет кэша)"; return 0; }
+    [ -s "$SINGBOX_WHITELIST_CACHE" ] || return 0
 
     local i=0 line tag ob
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        i=$((i + 1))
-        [ "$i" -gt "$SINGBOX_WHITELIST_MAX" ] && break
+        [ "$i" -ge "$SINGBOX_WHITELIST_MAX" ] && break
         parse_vless "$line"
-        [ -n "$SV_HOST" ] || { i=$((i - 1)); continue; }
+        [ -n "$SV_HOST" ] || continue
+        i=$((i + 1))
         tag="wl-$i"
         ob=$(_emit_vless_outbound "$tag")
-        WL_OUTBOUNDS_JSON="${WL_OUTBOUNDS_JSON},
+        if [ "$i" -eq 1 ]; then
+            WL_OBJECTS="$ob"
+            WL_TAGS_CSV="\"$tag\""
+        else
+            WL_OBJECTS="${WL_OBJECTS},
     ${ob}"
-        WL_SELECTOR="${WL_SELECTOR}, \"${tag}\""
+            WL_TAGS_CSV="${WL_TAGS_CSV}, \"$tag\""
+        fi
     done < "$SINGBOX_WHITELIST_CACHE"
-    [ "$i" -gt 0 ] && info "whitelist: подключено резервных серверов: $i"
+    WL_COUNT=$i
+    [ "$i" -gt 0 ] && info "whitelist: резервных серверов: $i"
+}
+
+# Скачивает базу RU-адресов (geoip-ru.srs) для роутинга «RU напрямую».
+# Не критично: если не вышло — RU-IP пойдут через VPN.
+download_geoip_ru() {
+    local dst="/etc/sing-box/geoip-ru.srs"
+    local url="https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs"
+    [ -s "$dst" ] && return 0
+    info "Скачиваю базу RU-адресов (geoip-ru)..."
+    wget --no-check-certificate -qO "${dst}.tmp" "$url" 2>/dev/null
+    if [ -s "${dst}.tmp" ]; then
+        mv "${dst}.tmp" "$dst"
+        info "geoip-ru загружен"
+    else
+        rm -f "${dst}.tmp"
+        warn "geoip-ru не скачан — RU-IP временно пойдут через VPN"
+    fi
 }
 
 # ─── Генерация конфига ───────────────────────────────────────────────────────
@@ -205,139 +231,83 @@ gen_config() {
     info "Генерирую конфиг..."
     mkdir -p /etc/sing-box
 
-    # Собираем whitelist-резерв (если настроен)
+    # Объект основного VPS захватываем ДО build_whitelist (он перезапишет SV_*)
+    local main_obj="" has_main=""
+    if [ -n "$SV_HOST" ]; then
+        has_main=1
+        main_obj=$(_emit_vless_outbound "proxy")
+    fi
+
+    # Собираем whitelist-резерв (перезаписывает SV_*)
     build_whitelist
+    # База RU-адресов для роутинга
+    download_geoip_ru
 
-    # TLS блок
-    local tls_block=""
-    case "$SV_SEC" in
-        reality)
-            tls_block=$(cat <<EOF
-      "tls": {
-        "enabled": true,
-        "server_name": "${SV_SNI}",
-        "utls": {
-          "enabled": true,
-          "fingerprint": "${SV_FP}"
-        },
-        "reality": {
-          "enabled": true,
-          "public_key": "${SV_PBK}",
-          "short_id": "${SV_SID}"
-        }
-      },
-EOF
-)
-            ;;
-        tls)
-            tls_block=$(cat <<EOF
-      "tls": {
-        "enabled": true,
-        "server_name": "${SV_SNI}",
-        "utls": {
-          "enabled": true,
-          "fingerprint": "${SV_FP}"
-        }
-      },
-EOF
-)
-            ;;
-    esac
+    # ── Селектор для urltest "auto" (VPN-входы; БЕЗ direct!) ──
+    # Если был бы direct — urltest всегда выбирал бы его (нулевой пинг) и VPN бы не работал.
+    local auto_sel=""
+    if [ -n "$has_main" ]; then
+        auto_sel="\"proxy\""
+        [ -n "$WL_TAGS_CSV" ] && auto_sel="${auto_sel}, ${WL_TAGS_CSV}"
+    elif [ -n "$WL_TAGS_CSV" ]; then
+        auto_sel="${WL_TAGS_CSV}"
+    else
+        die "Не настроен ни VPS, ни whitelist-подписка — нечего запускать"
+    fi
 
-    # Transport блок (ws/grpc)
-    local transport_block=""
-    case "$SV_TYPE" in
-        ws)
-            transport_block=$(cat <<EOF
-      "transport": {
-        "type": "ws",
-        "path": "${SV_PATH}",
-        "headers": { "Host": "${SV_HOST_HDR:-$SV_SNI}" }
-      },
-EOF
-)
-            ;;
-        grpc)
-            transport_block=$(cat <<EOF
-      "transport": {
-        "type": "grpc",
-        "service_name": "${SV_PATH}"
-      },
-EOF
-)
-            ;;
-    esac
+    # ── Собираем массив outbounds ──
+    local ob_proxy=""
+    [ -n "$has_main" ] && ob_proxy="    ${main_obj},
+"
+    local ob_wl=""
+    [ -n "$WL_OBJECTS" ] && ob_wl="    ${WL_OBJECTS},
+"
 
-    # Flow
-    local flow_line=""
-    [ -n "$SV_FLOW" ] && flow_line="\"flow\": \"${SV_FLOW}\","
+    # ── Правило geoip-ru (только если база скачалась) ──
+    local ruleset_decl="" ru_rule=""
+    if [ -s /etc/sing-box/geoip-ru.srs ]; then
+        ruleset_decl='
+  "rule_set": [
+    { "type": "local", "tag": "geoip-ru", "format": "binary", "path": "/etc/sing-box/geoip-ru.srs" }
+  ],'
+        ru_rule='
+      { "rule_set": "geoip-ru", "outbound": "direct" },'
+    fi
 
     cat > "$SINGBOX_CONFIG" <<EOF
 {
-  "log": {
-    "level": "warn",
-    "output": "${SINGBOX_LOG}"
-  },
+  "log": { "level": "warn", "output": "${SINGBOX_LOG}" },
   "inbounds": [
-    {
-      "type": "socks",
-      "tag": "socks-in",
-      "listen": "0.0.0.0",
-      "listen_port": 1080
-    },
-    {
-      "type": "http",
-      "tag": "http-in",
-      "listen": "0.0.0.0",
-      "listen_port": 1081
-    },
-    {
-      "type": "tproxy",
-      "tag": "tproxy-in",
-      "listen": "0.0.0.0",
-      "listen_port": 12345
-    }
+    { "type": "socks",  "tag": "socks-in",  "listen": "0.0.0.0", "listen_port": 1080 },
+    { "type": "http",   "tag": "http-in",   "listen": "0.0.0.0", "listen_port": 1081 },
+    { "type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": 12345 }
   ],
   "outbounds": [
     {
       "type": "urltest",
       "tag": "auto",
-      "outbounds": ["proxy"${WL_SELECTOR}, "direct"],
+      "outbounds": [${auto_sel}],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "1m",
       "tolerance": 500,
       "interrupt_exist_connections": false
     },
-    {
-      "type": "vless",
-      "tag": "proxy",
-      "server": "${SV_HOST}",
-      "server_port": ${SV_PORT},
-      "uuid": "${SV_UUID}",
-      ${flow_line}
-${tls_block}
-${transport_block}
-      "packet_encoding": "xudp"
-    }${WL_OUTBOUNDS_JSON},
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
+${ob_proxy}${ob_wl}    { "type": "direct", "tag": "direct" },
+    { "type": "block",  "tag": "block" }
   ],
-  "route": {
+  "route": {${ruleset_decl}
     "rules": [
-      {
-        "ip_cidr": [
-          "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8",
-          "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
-          "224.0.0.0/4", "240.0.0.0/4"
-        ],
-        "outbound": "direct"
-      }
+      { "action": "sniff" },
+      { "ip_is_private": true, "outbound": "direct" },
+      { "domain_suffix": ["4game.com","4game.ru","innova.ru","lineage2.com","ncsoft.com","l2.ru"],
+        "outbound": "direct" },
+      { "ip_cidr": ["109.105.128.0/17"], "outbound": "direct" },
+      { "domain_suffix": ["youtube.com","googlevideo.com","ytimg.com","youtu.be","ggpht.com",
+                          "instagram.com","cdninstagram.com","facebook.com","fbcdn.net",
+                          "twitter.com","x.com","twimg.com","discord.com","discord.gg","discordapp.com"],
+        "outbound": "auto" },
+${ru_rule}
+      { "domain_suffix": [".ru",".su",".xn--p1ai"], "outbound": "direct" }
     ],
     "final": "auto"
   }
@@ -490,16 +460,16 @@ show_menu() {
     echo ""
     case "$choice" in
         1)
-            if [ -f "$SINGBOX_VLESS_FILE" ]; then
-                VLESS_URL=$(cat "$SINGBOX_VLESS_FILE")
-                parse_vless "$VLESS_URL"
+            SV_HOST=""
+            [ -f "$SINGBOX_VLESS_FILE" ] && parse_vless "$(cat "$SINGBOX_VLESS_FILE")"
+            if [ -z "$SV_HOST" ] && [ ! -f "$SINGBOX_WHITELIST_FILE" ]; then
+                echo "Сначала укажи VLESS URL (пункт 3) или подписку (пункт 4)"
+            else
                 install_singbox
                 gen_config
                 start_singbox
                 setup_iptables
                 install_cron
-            else
-                echo "Сначала укажи VLESS URL (пункт 3)"
             fi
             ;;
         2)
@@ -538,19 +508,17 @@ show_menu() {
                     printf '%s\n' "$wl_url" > "$SINGBOX_WHITELIST_FILE"
                     rm -f "$SINGBOX_WHITELIST_CACHE"
                     info "Подписка сохранена, извлекаю whitelist-серверы..."
-                    if [ -f "$SINGBOX_VLESS_FILE" ]; then
-                        VLESS_URL=$(cat "$SINGBOX_VLESS_FILE")
-                        parse_vless "$VLESS_URL"
-                        gen_config
-                        start_singbox
-                        setup_iptables
-                        if [ -s "$SINGBOX_WHITELIST_CACHE" ]; then
-                            info "Готово! Whitelist-резерв активен ($(grep -c '^vless://' "$SINGBOX_WHITELIST_CACHE") серв.)"
-                        else
-                            warn "Whitelist-серверы не найдены в подписке (нет пометки Whitelist?)"
-                        fi
+                    install_singbox
+                    SV_HOST=""
+                    [ -f "$SINGBOX_VLESS_FILE" ] && parse_vless "$(cat "$SINGBOX_VLESS_FILE")"
+                    gen_config
+                    start_singbox
+                    setup_iptables
+                    install_cron
+                    if [ -s "$SINGBOX_WHITELIST_CACHE" ]; then
+                        info "Готово! Whitelist-резерв активен ($(grep -c '^vless://' "$SINGBOX_WHITELIST_CACHE") серв.)"
                     else
-                        warn "Сначала настрой основной VPS (пункт 3)"
+                        warn "Whitelist-серверы не найдены в подписке (нет пометки Whitelist?)"
                     fi
                     ;;
                 "")
@@ -589,9 +557,9 @@ case "${1:-}" in
         info "sing-box остановлен"
         ;;
     restart)
-        if [ -f "$SINGBOX_VLESS_FILE" ]; then
-            VLESS_URL=$(cat "$SINGBOX_VLESS_FILE")
-            parse_vless "$VLESS_URL"
+        SV_HOST=""
+        [ -f "$SINGBOX_VLESS_FILE" ] && parse_vless "$(cat "$SINGBOX_VLESS_FILE")"
+        if [ -n "$SV_HOST" ] || [ -f "$SINGBOX_WHITELIST_FILE" ]; then
             gen_config
         fi
         kill "$(cat "$SINGBOX_PID" 2>/dev/null)" 2>/dev/null || killall sing-box 2>/dev/null || true
@@ -608,18 +576,16 @@ case "${1:-}" in
         mkdir -p /etc/sing-box
         printf '%s\n' "$2" > "$SINGBOX_WHITELIST_FILE"
         rm -f "$SINGBOX_WHITELIST_CACHE"
-        if [ -f "$SINGBOX_VLESS_FILE" ]; then
-            VLESS_URL=$(cat "$SINGBOX_VLESS_FILE")
-            parse_vless "$VLESS_URL"
-            gen_config
-            start_singbox
-            setup_iptables
-            [ -s "$SINGBOX_WHITELIST_CACHE" ] \
-                && info "Whitelist-резерв активен ($(grep -c '^vless://' "$SINGBOX_WHITELIST_CACHE") серв.)" \
-                || warn "Whitelist-серверы не найдены в подписке"
-        else
-            warn "Сначала настрой основной VPS: sh $0 'vless://...'"
-        fi
+        install_singbox
+        SV_HOST=""
+        [ -f "$SINGBOX_VLESS_FILE" ] && parse_vless "$(cat "$SINGBOX_VLESS_FILE")"
+        gen_config
+        start_singbox
+        setup_iptables
+        install_cron
+        [ -s "$SINGBOX_WHITELIST_CACHE" ] \
+            && info "Whitelist-резерв активен ($(grep -c '^vless://' "$SINGBOX_WHITELIST_CACHE") серв.)" \
+            || warn "Whitelist-серверы не найдены в подписке"
         ;;
     status)
         if _is_running; then
