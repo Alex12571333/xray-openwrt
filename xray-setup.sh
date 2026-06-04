@@ -3,7 +3,7 @@
 # Один коннектор: весь трафик → VPS, VPS решает маршрутизацию
 # Использование: sh setup.sh <vless://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260651"
+SCRIPT_VERSION="20260652"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -60,6 +60,17 @@ _download() {
         uclient-fetch --no-check-certificate -O "$2" "$1"
     else
         wget --no-check-certificate -O "$2" "$1"
+    fi
+}
+
+# Декод base64 из stdin (на роутере может не быть команды base64 → пробуем openssl)
+_b64dec() {
+    if command -v base64 >/dev/null 2>&1; then
+        base64 -d 2>/dev/null
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl base64 -d -A 2>/dev/null
+    else
+        cat
     fi
 }
 
@@ -171,9 +182,9 @@ resolve_input() {
             raw=$(cat "$tmpf" 2>/dev/null); rm -f "$tmpf"
             [ -n "$raw" ] || die "Подписка пустая или недоступна: $1"
             # подписка обычно в base64; если декодировалось в vless — берём, иначе как есть
-            decoded=$(printf '%s' "$raw" | base64 -d 2>/dev/null)
+            decoded=$(printf '%s' "$raw" | _b64dec)
             printf '%s' "$decoded" | grep -q 'vless://' || decoded="$raw"
-            RESOLVED_VLESS=$(printf '%s\n' "$decoded" | tr -d '\r' | grep -o 'vless://[^[:space:]]*' | head -1)
+            RESOLVED_VLESS=$(printf '%s\n' "$decoded" | tr -d '\r' | grep '^vless://' | head -1)
             [ -n "$RESOLVED_VLESS" ] || die "В подписке не найдено vless://"
             ;;
         *)
