@@ -1,22 +1,26 @@
 #!/bin/sh
 # setup.sh — sing-box TPROXY туннель для OpenWrt
-# Один VLESS-коннектор: весь трафик → VPS, VPS решает маршрутизацию
-# Использование: sh setup.sh <vless://...>
+# Один коннектор: весь трафик → VPS, VPS решает маршрутизацию
+# Использование: sh setup.sh <vless://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260649"
+SCRIPT_VERSION="20260650"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
+
+# sing-box 1.13+ собираются ДИНАМИЧЕСКИ (glibc) и не запускаются на OpenWrt (musl).
+# Поэтому пинимся на последнюю СТАТИЧЕСКУЮ ветку 1.12.x.
+SINGBOX_VERSION="1.12.8"
 
 SINGBOX_BIN="/usr/bin/sing-box"
 SINGBOX_CONFIG="/etc/sing-box/config.json"
 SINGBOX_PID="/var/run/sing-box.pid"
 SINGBOX_VLESS_FILE="/etc/sing-box/vless_url"
+SINGBOX_SUB_FILE="/etc/sing-box/sub_url"          # URL подписки (если задан — источник истины)
 SINGBOX_LOG="/var/log/sing-box.log"
 SINGBOX_SELF="/etc/sing-box/setup.sh"
 SINGBOX_CRON="/etc/crontabs/root"
 CRON_MARKER="# sing-box-tunnel"
 IPTABLES_CHAIN="SBOX_TP"
-GITHUB_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 
 # ─── Утилиты ────────────────────────────────────────────────────────────────
 
@@ -47,50 +51,46 @@ detect_arch() {
 
 # ─── Установка sing-box ──────────────────────────────────────────────────────
 
+# Скачивание с поддержкой редиректа GitHub (busybox wget давится → пробуем curl)
+_download() {
+    # $1 = url, $2 = выходной файл
+    if command -v curl >/dev/null 2>&1; then
+        curl -Lk --max-time 180 -o "$2" "$1"
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch --no-check-certificate -O "$2" "$1"
+    else
+        wget --no-check-certificate -O "$2" "$1"
+    fi
+}
+
 install_singbox() {
-    if [ -x "$SINGBOX_BIN" ]; then
+    # бинарник есть И реально запускается?
+    if [ -x "$SINGBOX_BIN" ] && "$SINGBOX_BIN" version >/dev/null 2>&1; then
         info "sing-box уже установлен: $("$SINGBOX_BIN" version 2>/dev/null | head -1)"
         return 0
     fi
-    info "Устанавливаю sing-box..."
-    local arch; arch=$(detect_arch)
-    local json url ver archive tmpdir
+    info "Устанавливаю sing-box ${SINGBOX_VERSION} (статическая сборка)..."
+    local arch archive url tmpdir bin
+    arch=$(detect_arch)
+    archive="sing-box-${SINGBOX_VERSION}-${arch}.tar.gz"
+    url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${archive}"
     tmpdir=$(mktemp -d /tmp/singbox-XXXXXX)
     trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
-    info "Получаю последний релиз с GitHub..."
-    json=$(wget --no-check-certificate -qO- "$GITHUB_API") \
-        || die "Не удалось получить информацию о релизе"
+    info "Скачиваю ${archive}..."
+    _download "$url" "$tmpdir/sb.tar.gz" || die "Ошибка скачивания sing-box"
+    [ -s "$tmpdir/sb.tar.gz" ] || die "Архив пустой (проверь интернет на роутере)"
 
-    ver=$(printf '%s' "$json" \
-        | grep '"tag_name"' \
-        | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' \
-        | head -1)
-    [ -n "$ver" ] || die "Не удалось определить версию"
+    tar -xzf "$tmpdir/sb.tar.gz" -C "$tmpdir/" || die "Ошибка распаковки архива"
 
-    local ver_num="${ver#v}"
-    archive="sing-box-${ver_num}-${arch}.tar.gz"
-
-    url=$(printf '%s' "$json" \
-        | grep '"browser_download_url"' \
-        | grep "\"${archive}\"" \
-        | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' \
-        | head -1)
-    [ -n "$url" ] || die "Не найден URL для $archive"
-
-    info "Скачиваю $archive..."
-    wget --no-check-certificate -qO "$tmpdir/singbox.tar.gz" "$url" \
-        || die "Ошибка скачивания"
-    [ -s "$tmpdir/singbox.tar.gz" ] || die "Архив пустой"
-
-    tar -xzf "$tmpdir/singbox.tar.gz" -C "$tmpdir/" \
-        || die "Ошибка распаковки"
-
-    local bin; bin=$(find "$tmpdir" -name "sing-box" -type f | head -1)
+    bin=$(find "$tmpdir" -name "sing-box" -type f | head -1)
     [ -n "$bin" ] || die "Бинарник sing-box не найден в архиве"
 
     mv "$bin" "$SINGBOX_BIN"
     chmod +x "$SINGBOX_BIN"
+    # проверка совместимости (musl/динамический линкер)
+    "$SINGBOX_BIN" version >/dev/null 2>&1 \
+        || die "sing-box установлен, но не запускается (несовместимый бинарник)"
     info "sing-box установлен: $("$SINGBOX_BIN" version 2>/dev/null | head -1)"
 }
 
@@ -152,6 +152,48 @@ _emit_vless_outbound() {
     [ -n "$SV_FLOW" ] && flow="\"flow\":\"${SV_FLOW}\","
     printf '{"type":"vless","tag":"%s","server":"%s","server_port":%s,"uuid":"%s",%s%s%s"packet_encoding":"xudp"}' \
         "$tag" "$SV_HOST" "$SV_PORT" "$SV_UUID" "$flow" "$tls" "$tr"
+}
+
+# ─── Источник: vless:// напрямую или подписка http(s):// ─────────────────────
+# Принимает $1 = vless://... ИЛИ http(s)://.../sub/...
+# Результат — первая vless-ссылка в переменную RESOLVED_VLESS.
+resolve_input() {
+    RESOLVED_VLESS=""
+    case "$1" in
+        vless://*)
+            RESOLVED_VLESS="$1"
+            ;;
+        http://*|https://*)
+            info "Загружаю подписку..."
+            local raw decoded
+            raw=$(_download "$1" /dev/stdout 2>/dev/null)
+            [ -n "$raw" ] || die "Подписка пустая или недоступна: $1"
+            # подписка обычно в base64; если декодировалось в vless — берём, иначе как есть
+            decoded=$(printf '%s' "$raw" | base64 -d 2>/dev/null)
+            printf '%s' "$decoded" | grep -q 'vless://' || decoded="$raw"
+            RESOLVED_VLESS=$(printf '%s\n' "$decoded" | tr -d '\r' | grep -o 'vless://[^[:space:]]*' | head -1)
+            [ -n "$RESOLVED_VLESS" ] || die "В подписке не найдено vless://"
+            ;;
+        *)
+            die "Нужен vless:// или http(s):// (подписка)"
+            ;;
+    esac
+}
+
+# Загружает источник (подписку из sub_url, иначе vless_url), парсит в SV_*.
+# Возвращает 0 если получилось, 1 если источника нет.
+load_source() {
+    SV_HOST=""
+    if [ -f "$SINGBOX_SUB_FILE" ]; then
+        resolve_input "$(cat "$SINGBOX_SUB_FILE")"
+        printf '%s\n' "$RESOLVED_VLESS" > "$SINGBOX_VLESS_FILE"   # кэш на случай офлайна
+        parse_vless "$RESOLVED_VLESS"
+        return 0
+    elif [ -f "$SINGBOX_VLESS_FILE" ]; then
+        parse_vless "$(cat "$SINGBOX_VLESS_FILE")"
+        return 0
+    fi
+    return 1
 }
 
 # ─── Генерация конфига ───────────────────────────────────────────────────────
@@ -330,15 +372,14 @@ show_menu() {
     echo ""
     case "$choice" in
         1)
-            if [ -f "$SINGBOX_VLESS_FILE" ]; then
-                parse_vless "$(cat "$SINGBOX_VLESS_FILE")"
+            if load_source; then
                 install_singbox
                 gen_config
                 start_singbox
                 setup_iptables
                 install_cron
             else
-                echo "Сначала укажи VLESS URL (пункт 3)"
+                echo "Сначала укажи VLESS-ссылку или подписку (пункт 3)"
             fi
             ;;
         2)
@@ -348,14 +389,18 @@ show_menu() {
             info "sing-box остановлен, watchdog снят, трафик идёт напрямую"
             ;;
         3)
-            printf "Вставь VLESS URL: "
+            echo "Вставь vless:// ссылку ИЛИ http(s):// подписку:"
+            printf "URL: "
             read -r new_url
             case "$new_url" in
-                vless://*)
+                vless://*|http://*|https://*)
                     mkdir -p /etc/sing-box
-                    printf '%s\n' "$new_url" > "$SINGBOX_VLESS_FILE"
-                    parse_vless "$new_url"
+                    case "$new_url" in
+                        vless://*) rm -f "$SINGBOX_SUB_FILE"; printf '%s\n' "$new_url" > "$SINGBOX_VLESS_FILE" ;;
+                        *)         printf '%s\n' "$new_url" > "$SINGBOX_SUB_FILE" ;;
+                    esac
                     install_singbox
+                    load_source || { echo "Не удалось получить конфиг"; return 2>/dev/null || true; }
                     gen_config
                     cp "$0" "$SINGBOX_SELF" 2>/dev/null || true
                     start_singbox
@@ -364,7 +409,7 @@ show_menu() {
                     info "Готово! VPS: ${SV_HOST}:${SV_PORT}"
                     ;;
                 *)
-                    echo "Ошибка: URL должен начинаться с vless://"
+                    echo "Ошибка: нужен vless:// или http(s):// URL"
                     ;;
             esac
             ;;
@@ -397,9 +442,8 @@ case "${1:-}" in
         info "sing-box остановлен, watchdog снят, трафик идёт напрямую"
         ;;
     restart)
-        SV_HOST=""
-        [ -f "$SINGBOX_VLESS_FILE" ] && parse_vless "$(cat "$SINGBOX_VLESS_FILE")"
-        [ -n "$SV_HOST" ] && gen_config
+        # источник истины: подписка (пере-скачиваем) или сохранённый vless
+        if load_source; then gen_config; fi
         kill "$(cat "$SINGBOX_PID" 2>/dev/null)" 2>/dev/null || killall sing-box 2>/dev/null || true
         sleep 1
         start_singbox
@@ -417,12 +461,14 @@ case "${1:-}" in
             info "sing-box не запущен"
         fi
         ;;
-    vless://*)
-        VLESS_URL="$1"
+    vless://*|http://*|https://*)
         mkdir -p /etc/sing-box
-        printf '%s\n' "$VLESS_URL" > "$SINGBOX_VLESS_FILE"
-        parse_vless "$VLESS_URL"
+        case "$1" in
+            vless://*) rm -f "$SINGBOX_SUB_FILE"; printf '%s\n' "$1" > "$SINGBOX_VLESS_FILE" ;;
+            *)         printf '%s\n' "$1" > "$SINGBOX_SUB_FILE" ;;   # подписка
+        esac
         install_singbox
+        load_source || die "Не удалось получить конфиг из источника"
         gen_config
         cp "$0" "$SINGBOX_SELF" 2>/dev/null || true
         start_singbox
