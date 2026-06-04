@@ -3,7 +3,7 @@
 # Один коннектор: весь трафик → VPS, VPS решает маршрутизацию
 # Использование: sh setup.sh <vless://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260650"
+SCRIPT_VERSION="20260651"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -165,8 +165,10 @@ resolve_input() {
             ;;
         http://*|https://*)
             info "Загружаю подписку..."
-            local raw decoded
-            raw=$(_download "$1" /dev/stdout 2>/dev/null)
+            local raw decoded tmpf
+            tmpf=$(mktemp 2>/dev/null || echo "/tmp/sb_sub.$$")
+            _download "$1" "$tmpf" >/dev/null 2>&1
+            raw=$(cat "$tmpf" 2>/dev/null); rm -f "$tmpf"
             [ -n "$raw" ] || die "Подписка пустая или недоступна: $1"
             # подписка обычно в base64; если декодировалось в vless — берём, иначе как есть
             decoded=$(printf '%s' "$raw" | base64 -d 2>/dev/null)
