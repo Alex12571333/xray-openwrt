@@ -3,7 +3,7 @@
 # Один активный прокси-сервер, выбор и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260656"
+SCRIPT_VERSION="20260657"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -209,6 +209,7 @@ _parse_v2ray_query() {
     SV_TYPE=$(_query_value "$query" type)
     SV_SEC=$(_query_value "$query" security)
     SV_PATH=$(urldecode "$(_query_value "$query" path)")
+    [ -n "$SV_PATH" ] || SV_PATH=$(urldecode "$(_query_value "$query" serviceName)")
     SV_SNI=$(urldecode "$(_query_value "$query" sni)")
     SV_HOST_HDR=$(urldecode "$(_query_value "$query" host)")
     SV_FP=$(_query_value "$query" fp)
@@ -1047,10 +1048,11 @@ button,input,textarea,select{font:inherit}button,summary,label{touch-action:mani
 .server-meta{display:flex;align-items:center;gap:7px;margin-top:6px}.protocol{display:inline-flex;padding:2px 6px;border-radius:6px;background:#6573ef1c;color:#aeb7ff;font-size:9px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}.latency{white-space:nowrap;color:#8f9caf;font:10px ui-monospace,SFMono-Regular,Menlo,monospace}.server-health{display:grid;justify-items:end;gap:8px}.signal{display:flex;align-items:end;gap:2px;height:16px}.signal i{display:block;width:3px;border-radius:2px;background:#303b4e}.signal i:nth-child(1){height:4px}.signal i:nth-child(2){height:7px}.signal i:nth-child(3){height:11px}.signal i:nth-child(4){height:15px}.signal.q1 i:nth-child(-n+1),.signal.q2 i:nth-child(-n+2),.signal.q3 i:nth-child(-n+3),.signal.q4 i{background:var(--green)}.signal.q1 i:nth-child(-n+1){background:var(--red)}.signal.q2 i:nth-child(-n+2){background:#f6b94a}.protocol-filter{display:flex;flex-wrap:wrap;gap:6px;margin:-3px 0 13px}.protocol-filter input{position:absolute;opacity:0}.protocol-filter label{padding:6px 9px;border:1px solid var(--line);border-radius:9px;color:var(--muted);font-size:10px;font-weight:750;cursor:pointer}.protocol-filter input:checked+label{border-color:#6573ef;background:#6573ef20;color:#d8dcff}.protocol-filter input:focus-visible+label{outline:2px solid #94a0ff;outline-offset:2px}.server-select:has(#filter-vless:checked) .server-card:not(.p-vless),.server-select:has(#filter-vmess:checked) .server-card:not(.p-vmess),.server-select:has(#filter-trojan:checked) .server-card:not(.p-trojan),.server-select:has(#filter-shadowsocks:checked) .server-card:not(.p-shadowsocks),.server-select:has(#filter-hysteria2:checked) .server-card:not(.p-hysteria2),.server-select:has(#filter-tuic:checked) .server-card:not(.p-tuic){display:none}
 .empty{display:grid;grid-column:1/-1;place-items:center;min-height:210px;padding:30px;text-align:center;border:1px dashed #2b374a;border-radius:16px;background:#0b1018}.empty-icon{display:grid;place-items:center;width:48px;height:48px;margin-bottom:12px;border-radius:15px;background:#171f2d;color:#aeb7ff;font-size:22px}.empty strong{font-size:15px}.empty p{max-width:330px;margin:5px 0 0;color:var(--muted);font-size:13px}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:40px;padding:0 14px;border:1px solid transparent;border-radius:11px;color:white;background:#202a39;font-weight:700;font-size:13px;cursor:pointer;transition:filter .16s,transform .16s}.btn:hover{filter:brightness(1.12)}.btn:active{transform:translateY(1px)}.btn:disabled{opacity:.42;cursor:not-allowed;filter:none}.btn:focus-visible,summary:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid #94a0ff;outline-offset:2px}.btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));box-shadow:0 10px 25px #6d7cff2c}.btn.ghost{border-color:var(--line);background:#111823;color:#d9e0ea}.btn.danger{border-color:#ff687433;background:#ff687414;color:#ff9aa3}.btn.wide{width:100%;margin-top:12px}
-.add-source{margin-top:16px;border-top:1px solid var(--line);padding-top:14px}.add-source summary{display:flex;align-items:center;justify-content:space-between;color:#b9c4d3;font-weight:700;cursor:pointer;list-style:none}.add-source summary::-webkit-details-marker{display:none}.add-source summary:after{content:"+";display:grid;place-items:center;width:26px;height:26px;border-radius:9px;background:#192230;color:#aeb7c7;font-size:18px}.add-source[open] summary:after{content:"−"}.source-form{display:grid;grid-template-columns:1fr auto;align-items:end;gap:9px;margin-top:13px}.source-links{min-height:118px}
+.add-source{margin-top:16px;border-top:1px solid var(--line);padding-top:14px}.add-source summary{display:flex;align-items:center;justify-content:space-between;color:#b9c4d3;font-weight:700;cursor:pointer;list-style:none}.add-source summary::-webkit-details-marker{display:none}.add-source summary:after{content:"+";display:grid;place-items:center;width:26px;height:26px;border-radius:9px;background:#192230;color:#aeb7c7;font-size:18px}.add-source[open] summary:after{content:"−"}.source-form{display:grid;grid-template-columns:1fr auto;align-items:end;gap:9px;margin-top:13px}.source-links{height:118px;min-height:118px}
 .field-label{display:block;margin:16px 0 7px;color:#c8d1dd;font-size:12px;font-weight:700}.text-input,textarea{width:100%;border:1px solid #2a3547;border-radius:12px;background:#090f17;color:var(--text);transition:border-color .16s,box-shadow .16s}.text-input{height:42px;padding:0 12px}.text-input:focus,textarea:focus{border-color:#6573ef;box-shadow:0 0 0 3px #6573ef1e}
-.segment{display:grid;grid-template-columns:1fr 1fr;gap:8px}.route-option{position:relative;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c121b;cursor:pointer}.route-option:has(input:checked){border-color:#6573ef;background:#141b31}.route-option input{position:absolute;opacity:0}.route-option b,.route-option small{display:block}.route-option b{font-size:13px}.route-option small{margin-top:4px;color:var(--muted);font-size:11px}.route-option:focus-within{outline:2px solid #94a0ff;outline-offset:2px}textarea{min-height:170px;padding:12px;resize:vertical;line-height:1.55}.hint{margin:8px 0 0;color:var(--muted);font-size:11px}
+.segment{display:grid;grid-template-columns:1fr 1fr;gap:8px}.route-option{position:relative;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c121b;cursor:pointer}.route-option:has(input:checked){border-color:#6573ef;background:#141b31}.route-option input{position:absolute;opacity:0}.route-option b,.route-option small{display:block}.route-option b{font-size:13px}.route-option small{margin-top:4px;color:var(--muted);font-size:11px}.route-option:focus-within{outline:2px solid #94a0ff;outline-offset:2px}textarea{height:170px;min-height:170px;padding:12px;resize:none;overflow:auto;line-height:1.55}.hint{margin:8px 0 0;color:var(--muted);font-size:11px}
 .notice{margin:0 0 14px;padding:12px 14px;border:1px solid #35d39a32;border-radius:13px;background:#35d39a12;color:#a9f0d5;font-size:13px}.notice.error{border-color:#ff68743d;background:#ff687414;color:#ffabb2}
+body[data-busy]{cursor:progress}body[data-busy] form{pointer-events:none}body[data-busy]:before{content:"";position:fixed;z-index:20;top:0;left:0;width:32%;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent-2));box-shadow:0 0 18px var(--accent);animation:progress 1s ease-in-out infinite}@keyframes progress{0%{transform:translateX(-110%)}100%{transform:translateX(420%)}}
 @media(max-width:1020px){.overview{grid-template-columns:1fr 1fr}.hero{grid-column:1/-1}}@media(max-width:900px){.workspace{grid-template-columns:1fr}}@media(max-width:620px){.shell{padding:20px 14px 36px}.topbar,.hero{align-items:flex-start;flex-direction:column}.status-pill{align-self:flex-start}.overview{grid-template-columns:1fr 1fr}.hero{padding:20px}.controls{justify-content:flex-start}.server-grid,.segment{grid-template-columns:1fr}.source-form{grid-template-columns:1fr}.server-identity h2{font-size:20px}.metric{min-height:120px;padding:16px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 </style></head><body><main class="shell">
 EOF
@@ -1133,7 +1135,35 @@ EOF
     <button class="btn primary wide" type="submit">Применить правила</button>
   </form>
 </section>
-</div></main></body></html>
+</div></main>
+<script>
+document.addEventListener('submit',async event=>{
+  const form=event.target
+  if(form.method!=='post'||document.body.dataset.busy)return
+  event.preventDefault()
+  const data=new FormData(form),button=event.submitter,label=button?.textContent
+  if(button?.name)data.set(button.name,button.value)
+  const action=data.get('action'),working={ping:'Проверяю…',select:'Подключаю…',refresh:'Обновляю…',source:'Сохраняю…',routing:'Применяю…',start:'Запускаю…',stop:'Останавливаю…'}
+  document.body.dataset.busy='true'
+  document.body.setAttribute('aria-busy','true')
+  if(button){button.disabled=true;button.textContent=working[action]||'Выполняю…'}
+  try{
+    const response=await fetch(location.href,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:new URLSearchParams(data)})
+    if(!response.ok)throw new Error('HTTP '+response.status)
+    const next=new DOMParser().parseFromString(await response.text(),'text/html')
+    if(!next.querySelector('main'))throw new Error('Некорректный ответ')
+    document.body.replaceWith(next.body)
+  }catch(error){
+    delete document.body.dataset.busy
+    document.body.removeAttribute('aria-busy')
+    if(button){button.disabled=false;button.textContent=label}
+    const notice=document.createElement('p')
+    notice.className='notice error';notice.setAttribute('aria-live','polite')
+    notice.textContent='Ошибка: '+error.message
+    document.querySelector('main').prepend(notice)
+  }
+})
+</script></body></html>
 EOF
 }
 
@@ -1162,7 +1192,7 @@ self_update() {
 
 # Минимальная проверка ссылок, списка доменов и обоих режимов маршрутизации.
 self_test() {
-    local test_dir normalized links link protocols=""
+    local test_dir normalized links link protocols="" expected
     test_dir=$(mktemp -d /tmp/singbox-test-XXXXXX) || die "mktemp failed"
     SINGBOX_BIN="${SINGBOX_TEST_BIN:-true}"
     SINGBOX_CONFIG="$test_dir/config.json"
@@ -1181,6 +1211,8 @@ self_test() {
     parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:8443#No query'
     [ "$SV_HOST" = "example.com" ] && [ "$SV_PORT" = "8443" ] \
         || { rm -rf "$test_dir"; die "fragment self-test failed"; }
+    parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=grpc&security=tls&serviceName=grpc-vless'
+    [ "$SV_PATH" = "grpc-vless" ] || { rm -rf "$test_dir"; die "gRPC serviceName self-test failed"; }
     [ "$(server_flag 'vless://id@nl.example:443#Amsterdam NL')" = "🇳🇱" ] \
         || { rm -rf "$test_dir"; die "server_flag self-test failed"; }
     normalized=$(printf 'Example.COM\r\n*.blocked.test\nhttps://foo.example?x=1\nbad$host\nfoo..test\nexample.com\n' | normalize_domains)
@@ -1197,7 +1229,7 @@ self_test() {
         grep -q '"final": "direct"' "$SINGBOX_CONFIG" \
         || { rm -rf "$test_dir"; die "list routing self-test failed"; }
     printf 'all\n' > "$SINGBOX_MODE_FILE"
-    links='vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls&sni=edge.example.com&path=%2Fws#VLESS
+    links='vless://11111111-1111-1111-1111-111111111111@example.com:443?type=grpc&security=tls&sni=edge.example.com&serviceName=grpc-vless#VLESS
 vmess://eyJ2IjoiMiIsInBzIjoiVG9reW8gVk1lc3MiLCJhZGQiOiJ2bWVzcy5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjIyMjIyMjIyLTIyMjItMjIyMi0yMjIyLTIyMjIyMjIyMjIyMiIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0Ijoid3MiLCJ0eXBlIjoibm9uZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJwYXRoIjoiL3ZtZXNzIiwidGxzIjoidGxzIiwic25pIjoiZWRnZS5leGFtcGxlLmNvbSJ9
 trojan://secret@trojan.example.com:443?security=tls&sni=trojan.example.com&type=tcp#Trojan
 ss://YWVzLTI1Ni1nY206dGVzdHBhc3M=@ss.example.com:8388#Shadowsocks
@@ -1207,6 +1239,10 @@ tuic://33333333-3333-3333-3333-333333333333:secret@tuic.example.com:443?sni=tuic
         parse_server "$link"
         protocols="${protocols}${SV_PROTOCOL} "
         gen_config >/dev/null
+        expected="\"type\":\"${SV_PROTOCOL}\",\"tag\":\"proxy\""
+        grep -Fq "$expected" "$SINGBOX_CONFIG" \
+            || { rm -rf "$test_dir"; die "${SV_PROTOCOL} outbound self-test failed"; }
+        printf '%s: OK\n' "$(server_protocol "$link")"
     done <<EOF
 $links
 EOF
@@ -1217,6 +1253,10 @@ EOF
     save_source "$(printf '%s\n' "$links" | sed -n '1p;3p')"
     [ "$(wc -l < "$SINGBOX_SERVERS_FILE" | tr -d ' ')" = 2 ] \
         || { rm -rf "$test_dir"; die "multiple links self-test failed"; }
+    select_server 2
+    gen_config >/dev/null
+    grep -Fq '"type":"trojan","tag":"proxy"' "$SINGBOX_CONFIG" \
+        || { rm -rf "$test_dir"; die "server selection self-test failed"; }
     [ "$(ping_quality 79)" = 4 ] && [ "$(ping_quality 301)" = 1 ] && [ "$(ping_quality timeout)" = 0 ] \
         || { rm -rf "$test_dir"; die "ping quality self-test failed"; }
     : > "$SINGBOX_CRON"
