@@ -1,288 +1,144 @@
-# xray-openwrt
+# VLESS-туннель для OpenWrt
 
-Автономный shell-скрипт для установки [Xray-core](https://github.com/XTLS/Xray-core) на роутер OpenWrt с поддержкой VLESS-подписок.
+Shell-скрипт для подключения OpenWrt к одному VLESS-серверу через
+[sing-box](https://github.com/SagerNet/sing-box).
 
-- Работает на **OpenWrt 22.02+**, BusyBox ash (`#!/bin/sh`, без bash)
-- Поддерживает архитектуры: `aarch64`, `armv7l`, `armv6l`, `x86_64`, `mips`, `mipsel`
-- Выбирает **3 лучших сервера** по TCP-латентности из подписки
-- Генерирует `config.json` с балансировщиком `leastPing` + автопереключением
-- Трафик `geoip:ru` и `geosite:ru` идёт напрямую, остальное — через прокси
+Интернет-трафик клиентов локальной сети перенаправляется на промежуточный
+VLESS-сервер. Дальнейшую маршрутизацию выполняет сервер.
 
----
+## Возможности
 
-## Быстрый старт
+- OpenWrt 22.02+ и BusyBox `ash`
+- прямая `vless://`-ссылка или HTTP(S)-подписка
+- один VLESS-сервер без балансировки
+- прозрачный прокси TCP и UDP через TPROXY
+- локальные SOCKS5- и HTTP-прокси
+- watchdog через cron
+- обновление скрипта из GitHub
+- `sing-box` 1.12.8 со статическими сборками для OpenWrt
+
+## Быстрый запуск
+
+С подпиской:
 
 ```sh
 wget --no-check-certificate -qO- \
   'https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh' \
-  | sh -s -- 'https://your-subscription-url'
+  | sh -s -- 'https://example.com/subscription'
 ```
 
-Или скачать и запустить вручную:
+С готовой VLESS-ссылкой:
 
 ```sh
-wget --no-check-certificate -O /tmp/xray-setup.sh \
-  'https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh'
-sh /tmp/xray-setup.sh 'https://your-subscription-url'
+wget --no-check-certificate -qO- \
+  'https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh' \
+  | sh -s -- 'vless://UUID@SERVER:PORT?...'
 ```
 
----
+Скрипт сохраняется на роутере в `/etc/sing-box/setup.sh`.
 
-## Интерактивное меню
+## Как это работает
 
-Запуск без аргументов открывает меню (после первой установки скрипт живёт в `/etc/xray/setup.sh`):
+1. Скрипт определяет архитектуру роутера и устанавливает совместимую сборку
+   `sing-box`.
+2. Из прямой ссылки или подписки извлекается один VLESS-сервер. Для подписки
+   используется первая найденная `vless://`-ссылка.
+3. Создаётся единственный VLESS-outbound с тегом `proxy`.
+4. `sing-box` принимает SOCKS5, HTTP и TPROXY-трафик.
+5. Правила `iptables` перенаправляют TCP и UDP клиентов локальной сети в
+   TPROXY.
+6. Весь принятый внешний трафик отправляется через `proxy`; приватные адреса
+   идут напрямую.
 
-```sh
-sh /etc/xray/setup.sh
-```
+## Маршрутизация
 
-```
-╔══════════════════════════════════╗
-║     Xray Setup / OpenWrt         ║
-║     ▶ запущен                    ║
-╠══════════════════════════════════╣
-║  1  Установить / обновить        ║
-║  2  Статус                       ║
-║  3  Перезапустить                ║
-║  4  Остановить                   ║
-║  5  Автозапуск при загрузке      ║
-║  6  Автообновление подписки      ║
-║  7  Удалить всё                  ║
-║  8  Тесты                        ║
-║  0  Выход                        ║
-╚══════════════════════════════════╝
-Выбор:
-```
+| Трафик | Маршрут |
+|---|---|
+| Приватные и служебные IPv4-сети | напрямую |
+| TCP с портом назначения `22` | напрямую |
+| Остальной TCP/UDP с `br-lan`, `br0`, `eth1` | VLESS-сервер |
+| Трафик, созданный самим роутером | напрямую |
 
----
+Скрипт настраивает только IPv4. Для другой схемы интерфейсов измените список
+`br-lan br0 eth1` в функции `setup_iptables`.
 
-## Пример вывода при установке
-
-```
->>> === Установка Xray ===
->>> Xray не найден — устанавливаю из GitHub...
->>> Архитектура: aarch64 → Xray-linux-arm64-v8a.zip
->>> Скачиваю Xray-linux-arm64-v8a.zip...
->>> Xray установлен: Xray 25.1.1 (Xray, Penetrates Everything)
-
->>> === Загрузка подписки ===
->>> Скачиваю подписку...
->>> Найдено серверов: 86
-
->>> === Выбор лучших серверов ===
->>> Тестирую серверы (первые 20 из 86)...
-  [ 1/20] cdn4-35.vk-cdnvideo.com:8443         120ms ✓
-  [ 2/20] cdn3-87.vk-cdnvideo.com:8443         115ms ✓
-  [ 3/20] cdn9-20.vk-cdnvideo.com:8443         130ms ✓
-  [ 4/20] cdn3-25.vk-cdnvideo.com:8443         310ms ✓
-  ...
->>> Доступно: 19 — беру топ-3 по латентности
-
->>> === Парсинг ===
->>>   Сервер 1: cdn3-87.vk-cdnvideo.com:8443  type=tcp  security=tls
->>>   Сервер 2: cdn4-35.vk-cdnvideo.com:8443  type=tcp  security=tls
->>>   Сервер 3: cdn9-20.vk-cdnvideo.com:8443  type=tcp  security=tls
-
->>> === Генерация конфига ===
->>> Конфиг записан
-
->>> === Запуск ===
->>> Xray запущен, PID 1234
-
-  SOCKS5 : 127.0.0.1:1080
-  HTTP   : 127.0.0.1:1081
-  TProxy : 0.0.0.0:12345
-```
-
----
-
-## Статус
-
-```sh
-sh /etc/xray/setup.sh  # → пункт 2
-```
-
-```
-  Xray        : Xray 25.1.1 (Xray, Penetrates Everything)
-  Процесс     : запущен (PID 1234)
-  Конфиг      : /etc/xray/config.json
-  Подписка    : https://your-subscription-url
-  Автозапуск  : включён
-  Автообновл. : каждые 6 ч.
-```
-
----
-
-## Автозапуск при загрузке
-
-Через меню → пункт **5**, или вручную:
-
-```sh
-# Включить
-sh /etc/xray/setup.sh   # → 5 → 1
-
-# Проверить
-ls -la /etc/init.d/xray
-/etc/init.d/xray enabled && echo "включён"
-```
-
-Устанавливает procd init-скрипт `/etc/init.d/xray` с автоперезапуском при падении.
-
----
-
-## Автообновление подписки (cron)
-
-Меню → пункт **6**:
-
-```
-Автообновление подписки: выключено
-
-  1  Каждые 6 часов
-  2  Каждые 12 часов
-  3  Каждые 24 часа
-  4  Выключить
-  0  Назад
-```
-
-Записывает задание в `/etc/crontabs/root`. Логи обновлений: `/var/log/xray-update.log`.
-
----
-
-## Удаление
-
-Меню → пункт **7**:
-
-```
-Будет удалено:
-  /usr/bin/xray, /etc/xray/,
-  автозапуск (/etc/init.d/xray),
-  автообновление (cron),
-  логи /var/log/xray*.log
-
-Подтвердите удаление [y/N]:
-```
-
----
-
-## Порты и маршрутизация
+## Порты
 
 | Порт | Протокол | Назначение |
-|------|----------|------------|
-| 1080 | SOCKS5 | Прокси для приложений |
-| 1081 | HTTP | HTTP-прокси |
-| 12345 | TProxy | Прозрачный прокси (iptables) |
+|---|---|---|
+| `1080` | SOCKS5 | прокси для приложений |
+| `1081` | HTTP | HTTP-прокси |
+| `12345` | TPROXY | прозрачный прокси для `iptables` |
 
-**Правила маршрутизации:**
-- `geoip:private` (192.168.x.x, 10.x.x.x и т.д.) → direct
-- `geosite:ru` + `geoip:ru` → direct
-- Всё остальное → балансировщик `leastPing` (3 сервера)
+Все три входа слушают `0.0.0.0`. Ограничьте доступ к портам правилами firewall
+роутера.
 
----
+## Управление
 
-## Проверка работы
+Интерактивное меню:
 
 ```sh
-# Через SOCKS5
-curl -x socks5://127.0.0.1:1080 https://ipinfo.io
-
-# Через HTTP-прокси
-curl -x http://127.0.0.1:1081 https://ipinfo.io
-
-# Логи Xray (макс. 256 КБ, ротация автоматически)
-tail -f /var/log/xray.log
-tail -100 /var/log/xray.log
+sh /etc/sing-box/setup.sh
 ```
 
----
-
-## Тесты
+Команды:
 
 ```sh
-sh xray-setup.sh test
+sh /etc/sing-box/setup.sh status
+sh /etc/sing-box/setup.sh restart
+sh /etc/sing-box/setup.sh stop
+sh /etc/sing-box/setup.sh self-update
 ```
 
-```
--- urldecode
-  [PASS] путь %2F
-  [PASS] запятая %2C
-  [PASS] пробел %20
-  [PASS] знак равно %3D
-  [PASS] процент %25
-  [PASS] без кодирования
+В меню можно запустить или остановить туннель, сменить VLESS-сервер, посмотреть
+лог и обновить скрипт.
 
--- alpn_to_json
-  [PASS] два значения
-  [PASS] одно значение
-  [PASS] три значения
+## Проверка
 
--- detect_arch
-  [PASS] detect_arch: arm64-v8a
+Статус процесса:
 
--- parse_vless (tls+ws)
-  [PASS] uuid
-  [PASS] host
-  [PASS] port
-  [PASS] type
-  [PASS] security
-  [PASS] path
-  [PASS] sni
-  [PASS] alpn
-  [PASS] host_hdr
-
--- parse_vless (reality+tcp)
-  [PASS] host
-  [PASS] port
-  [PASS] security
-  [PASS] fp
-  [PASS] pbk
-  [PASS] sid
-  [PASS] flow
-
--- интеграция
-  [PASS] бинарник: /usr/bin/xray
-  [PASS] конфиг: /etc/xray/config.json
-  [PASS] процесс запущен (PID 1234)
-  [PASS] SOCKS5 :1080 работает (IP: 1.2.3.4)
-
-  Итог: 27 пройдено, 0 провалено
+```sh
+sh /etc/sing-box/setup.sh status
 ```
 
-На не-OpenWrt машине интеграционные тесты пропускаются (`[SKIP]`).
+Правила TPROXY:
 
----
+```sh
+iptables -t mangle -L SBOX_TP -n -v
+```
 
-## Файлы
+Проверка через SOCKS5, если установлен `curl`:
 
-| Путь | Описание |
-|------|----------|
-| `/usr/bin/xray` | Бинарник Xray-core |
-| `/etc/xray/config.json` | Конфигурация |
-| `/etc/xray/sub_url` | URL подписки |
-| `/etc/xray/setup.sh` | Скрипт (постоянная копия) |
-| `/etc/init.d/xray` | Procd init-скрипт автозапуска |
-| `/var/run/xray.pid` | PID запущенного процесса |
-| `/var/log/xray.log` | Лог (макс. 256 КБ, ротация при запуске) |
+```sh
+curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
+```
 
----
+Лог:
+
+```sh
+tail -f /var/log/sing-box.log
+```
+
+## Файлы на роутере
+
+| Путь | Назначение |
+|---|---|
+| `/usr/bin/sing-box` | исполняемый файл |
+| `/etc/sing-box/config.json` | активная конфигурация |
+| `/etc/sing-box/vless_url` | выбранная VLESS-ссылка |
+| `/etc/sing-box/sub_url` | URL подписки |
+| `/etc/sing-box/setup.sh` | установленная копия скрипта |
+| `/var/run/sing-box.pid` | PID процесса |
+| `/var/log/sing-box.log` | журнал |
+| `/etc/crontabs/root` | watchdog |
 
 ## Требования
 
-- OpenWrt 22.02+ (проверено на 23.05)
-- BusyBox: `wget`, `base64`, `unzip`, `nc`, `grep`, `sed`, `awk`, `mktemp`
-- Архитектуры: aarch64 (Brume 3), armv7l, x86_64, mips и другие
+- OpenWrt 22.02+
+- `iptables` с поддержкой TPROXY
+- `ip`, `tar`, `grep`, `sed`, `awk`, `find`, `mktemp`
+- `curl`, `uclient-fetch` или `wget`
+- `base64` или `openssl` для закодированных подписок
 
----
-
-## Тестирование в QEMU (для разработчиков)
-
-Запускает OpenWrt 23.05 aarch64 в эмуляторе и прогоняет тесты:
-
-```sh
-# Установить QEMU (macOS)
-brew install qemu
-
-# Запустить тесты
-sh test-qemu.sh
-```
-
-Образы скачиваются автоматически при первом запуске (~80 МБ). Повторные запуски используют кэш.
+Поддерживаемые архитектуры: `aarch64`, `armv7l`, `armv6l`, `x86_64`,
+`i686`, `i386`, `mips` и `mipsel`.
