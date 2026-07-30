@@ -3,7 +3,7 @@
 # Один активный прокси-сервер, выбор и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260657"
+SCRIPT_VERSION="20260658"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -19,6 +19,7 @@ SINGBOX_SUB_FILE="${SINGBOX_SUB_FILE:-/etc/sing-box/sub_url}"
 SINGBOX_SERVERS_FILE="${SINGBOX_SERVERS_FILE:-/etc/sing-box/servers}"
 SINGBOX_MODE_FILE="${SINGBOX_MODE_FILE:-/etc/sing-box/route_mode}"
 SINGBOX_DOMAINS_FILE="${SINGBOX_DOMAINS_FILE:-/etc/sing-box/proxy_domains}"
+SINGBOX_TELEGRAM_FILE="${SINGBOX_TELEGRAM_FILE:-/etc/sing-box/telegram_calls}"
 SINGBOX_PING_FILE="${SINGBOX_PING_FILE:-/etc/sing-box/ping_cache}"
 SINGBOX_DISABLED_FILE="/etc/sing-box/disabled"
 SINGBOX_LOG="/var/log/sing-box.log"
@@ -680,7 +681,7 @@ gen_config() {
     mkdir -p "$(dirname "$SINGBOX_CONFIG")"
     [ -n "$SV_HOST" ] || die "Не задан сервер"
 
-    local main_obj mode final rules domain domain_json escaped tmp
+    local main_obj mode final rules domain domain_json escaped telegram_calls tmp
     main_obj=$(_emit_outbound "proxy")
     mode=$(cat "$SINGBOX_MODE_FILE" 2>/dev/null)
     [ "$mode" = "list" ] || mode="all"
@@ -702,6 +703,11 @@ gen_config() {
     else
         final="proxy"
         rules='      { "ip_is_private": true, "action": "route", "outbound": "direct" }'
+    fi
+    telegram_calls=$(cat "$SINGBOX_TELEGRAM_FILE" 2>/dev/null)
+    if [ "$telegram_calls" = 1 ]; then
+        rules="${rules},
+      { \"ip_cidr\": [\"91.108.56.0/22\",\"91.108.4.0/22\",\"91.108.8.0/22\",\"91.108.16.0/22\",\"91.108.12.0/22\",\"149.154.160.0/20\",\"91.105.192.0/23\",\"91.108.20.0/22\",\"185.76.151.0/24\"], \"action\": \"route\", \"outbound\": \"proxy\" }"
     fi
 
     tmp="${SINGBOX_CONFIG}.new"
@@ -929,7 +935,7 @@ _form_value() {
 }
 
 _panel_action() {
-    local action source index mode domains tmp count
+    local action source index mode domains telegram_calls tmp count
     mkdir "$PANEL_LOCK" 2>/dev/null || die "Другое изменение ещё выполняется"
     trap 'rmdir "$PANEL_LOCK" 2>/dev/null' EXIT INT TERM
     action=$(_form_value action)
@@ -959,12 +965,16 @@ _panel_action() {
             mode=$(_form_value mode)
             case "$mode" in all|list) ;; *) die "Некорректный режим маршрутизации" ;; esac
             domains=$(_form_value domains)
+            telegram_calls=$(_form_value telegram_calls)
+            [ "$telegram_calls" = 1 ] || telegram_calls=0
             tmp=$(mktemp /tmp/sb-domains-XXXXXX) || die "Не удалось создать временный файл"
             printf '%s' "$domains" | normalize_domains > "$tmp"
             mv "$tmp" "$SINGBOX_DOMAINS_FILE"
             printf '%s\n' "$mode" > "${SINGBOX_MODE_FILE}.new"
             mv "${SINGBOX_MODE_FILE}.new" "$SINGBOX_MODE_FILE"
-            chmod 600 "$SINGBOX_DOMAINS_FILE" "$SINGBOX_MODE_FILE"
+            printf '%s\n' "$telegram_calls" > "${SINGBOX_TELEGRAM_FILE}.new"
+            mv "${SINGBOX_TELEGRAM_FILE}.new" "$SINGBOX_TELEGRAM_FILE"
+            chmod 600 "$SINGBOX_DOMAINS_FILE" "$SINGBOX_MODE_FILE" "$SINGBOX_TELEGRAM_FILE"
             apply_configuration
             count=$(wc -l < "$SINGBOX_DOMAINS_FILE" | tr -d ' ')
             echo "Маршрутизация применена, доменов в списке: ${count}."
@@ -984,7 +994,7 @@ _panel_action() {
 }
 
 panel_cgi() {
-    local message="" action_output csrf expected length mode status status_class start_label stop_disabled selected
+    local message="" action_output csrf expected length mode telegram_calls status status_class start_label stop_disabled selected
     local server_count domain_count route_label selected_name selected_host selected_flag selected_protocol
     if [ "${REQUEST_METHOD:-GET}" = "POST" ]; then
         case "${CONTENT_TYPE:-}" in application/x-www-form-urlencoded*) ;; *) die "Unsupported Content-Type" ;; esac
@@ -1006,6 +1016,8 @@ panel_cgi() {
     csrf=$(cat "$PANEL_CSRF" 2>/dev/null)
     mode=$(cat "$SINGBOX_MODE_FILE" 2>/dev/null)
     [ "$mode" = "list" ] || mode="all"
+    telegram_calls=$(cat "$SINGBOX_TELEGRAM_FILE" 2>/dev/null)
+    [ "$telegram_calls" = 1 ] || telegram_calls=0
     selected=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
     server_count=$(grep -c '.' "$SINGBOX_SERVERS_FILE" 2>/dev/null)
     server_count="${server_count:-0}"
@@ -1050,7 +1062,7 @@ button,input,textarea,select{font:inherit}button,summary,label{touch-action:mani
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:40px;padding:0 14px;border:1px solid transparent;border-radius:11px;color:white;background:#202a39;font-weight:700;font-size:13px;cursor:pointer;transition:filter .16s,transform .16s}.btn:hover{filter:brightness(1.12)}.btn:active{transform:translateY(1px)}.btn:disabled{opacity:.42;cursor:not-allowed;filter:none}.btn:focus-visible,summary:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid #94a0ff;outline-offset:2px}.btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));box-shadow:0 10px 25px #6d7cff2c}.btn.ghost{border-color:var(--line);background:#111823;color:#d9e0ea}.btn.danger{border-color:#ff687433;background:#ff687414;color:#ff9aa3}.btn.wide{width:100%;margin-top:12px}
 .add-source{margin-top:16px;border-top:1px solid var(--line);padding-top:14px}.add-source summary{display:flex;align-items:center;justify-content:space-between;color:#b9c4d3;font-weight:700;cursor:pointer;list-style:none}.add-source summary::-webkit-details-marker{display:none}.add-source summary:after{content:"+";display:grid;place-items:center;width:26px;height:26px;border-radius:9px;background:#192230;color:#aeb7c7;font-size:18px}.add-source[open] summary:after{content:"−"}.source-form{display:grid;grid-template-columns:1fr auto;align-items:end;gap:9px;margin-top:13px}.source-links{height:118px;min-height:118px}
 .field-label{display:block;margin:16px 0 7px;color:#c8d1dd;font-size:12px;font-weight:700}.text-input,textarea{width:100%;border:1px solid #2a3547;border-radius:12px;background:#090f17;color:var(--text);transition:border-color .16s,box-shadow .16s}.text-input{height:42px;padding:0 12px}.text-input:focus,textarea:focus{border-color:#6573ef;box-shadow:0 0 0 3px #6573ef1e}
-.segment{display:grid;grid-template-columns:1fr 1fr;gap:8px}.route-option{position:relative;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c121b;cursor:pointer}.route-option:has(input:checked){border-color:#6573ef;background:#141b31}.route-option input{position:absolute;opacity:0}.route-option b,.route-option small{display:block}.route-option b{font-size:13px}.route-option small{margin-top:4px;color:var(--muted);font-size:11px}.route-option:focus-within{outline:2px solid #94a0ff;outline-offset:2px}textarea{height:170px;min-height:170px;padding:12px;resize:none;overflow:auto;line-height:1.55}.hint{margin:8px 0 0;color:var(--muted);font-size:11px}
+.segment{display:grid;grid-template-columns:1fr 1fr;gap:8px}.route-option{position:relative;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c121b;cursor:pointer}.route-option:has(input:checked){border-color:#6573ef;background:#141b31}.route-option input{position:absolute;opacity:0}.route-option b,.route-option small{display:block}.route-option b{font-size:13px}.route-option small{margin-top:4px;color:var(--muted);font-size:11px}.route-option:focus-within{outline:2px solid #94a0ff;outline-offset:2px}.feature-toggle{position:relative;display:flex;align-items:center;gap:12px;margin-top:10px;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c121b;cursor:pointer}.feature-toggle:has(input:checked){border-color:#249fd1;background:#0e1d29}.feature-toggle input{position:absolute;opacity:0}.feature-toggle:focus-within{outline:2px solid #94a0ff;outline-offset:2px}.feature-copy{min-width:0;flex:1}.feature-copy b,.feature-copy small{display:block}.feature-copy b{font-size:13px}.feature-copy small{margin-top:4px;color:var(--muted);font-size:11px}.switch{position:relative;flex:none;width:42px;height:24px;border-radius:999px;background:#303b4e;transition:background .16s}.switch:before{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 2px 7px #0007;transition:transform .16s}.feature-toggle input:checked+.switch{background:#249fd1}.feature-toggle input:checked+.switch:before{transform:translateX(18px)}textarea{height:170px;min-height:170px;padding:12px;resize:none;overflow:auto;line-height:1.55}.hint{margin:8px 0 0;color:var(--muted);font-size:11px}
 .notice{margin:0 0 14px;padding:12px 14px;border:1px solid #35d39a32;border-radius:13px;background:#35d39a12;color:#a9f0d5;font-size:13px}.notice.error{border-color:#ff68743d;background:#ff687414;color:#ffabb2}
 body[data-busy]{cursor:progress}body[data-busy] form{pointer-events:none}body[data-busy]:before{content:"";position:fixed;z-index:20;top:0;left:0;width:32%;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent-2));box-shadow:0 0 18px var(--accent);animation:progress 1s ease-in-out infinite}@keyframes progress{0%{transform:translateX(-110%)}100%{transform:translateX(420%)}}
 @media(max-width:1020px){.overview{grid-template-columns:1fr 1fr}.hero{grid-column:1/-1}}@media(max-width:900px){.workspace{grid-template-columns:1fr}}@media(max-width:620px){.shell{padding:20px 14px 36px}.topbar,.hero{align-items:flex-start;flex-direction:column}.status-pill{align-self:flex-start}.overview{grid-template-columns:1fr 1fr}.hero{padding:20px}.controls{justify-content:flex-start}.server-grid,.segment{grid-template-columns:1fr}.source-form{grid-template-columns:1fr}.server-identity h2{font-size:20px}.metric{min-height:120px;padding:16px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
@@ -1129,6 +1141,7 @@ EOF
       <label class="route-option"><input type="radio" name="mode" value="all"$([ "$mode" = all ] && printf ' checked')><span><b>Весь трафик</b><small>кроме локальных сетей</small></span></label>
       <label class="route-option"><input type="radio" name="mode" value="list"$([ "$mode" = list ] && printf ' checked')><span><b>Только список</b><small>остальное напрямую</small></span></label>
     </div>
+    <label class="feature-toggle"><span class="feature-copy"><b>Обход звонков Telegram</b><small>Официальные сети Telegram через прокси</small></span><input type="checkbox" name="telegram_calls" value="1"$([ "$telegram_calls" = 1 ] && printf ' checked')><span class="switch" aria-hidden="true"></span></label>
     <label class="field-label" for="domains">Домены для прокси</label>
     <textarea id="domains" name="domains" spellcheck="false" placeholder="youtube.com&#10;instagram.com">$(_html_escape "$(cat "$SINGBOX_DOMAINS_FILE" 2>/dev/null)")</textarea>
     <p class="hint">Один домен на строку. example.com включает все поддомены.</p>
@@ -1201,6 +1214,7 @@ self_test() {
     SINGBOX_SERVERS_FILE="$test_dir/servers"
     SINGBOX_MODE_FILE="$test_dir/mode"
     SINGBOX_DOMAINS_FILE="$test_dir/domains"
+    SINGBOX_TELEGRAM_FILE="$test_dir/telegram_calls"
     SINGBOX_PING_FILE="$test_dir/pings"
     SINGBOX_LOG="$test_dir/sing-box.log"
     SINGBOX_CRON="$test_dir/cron"
@@ -1220,15 +1234,18 @@ self_test() {
         || { rm -rf "$test_dir"; die "domain self-test failed"; }
     printf '%s\n' "$normalized" > "$SINGBOX_DOMAINS_FILE"
     printf 'list\n' > "$SINGBOX_MODE_FILE"
+    printf '1\n' > "$SINGBOX_TELEGRAM_FILE"
     gen_config >/dev/null
     if command -v python3 >/dev/null 2>&1; then
         python3 -m json.tool "$SINGBOX_CONFIG" >/dev/null \
             || { rm -rf "$test_dir"; die "JSON self-test failed"; }
     fi
     grep -q '"domain_suffix": \["example.com","blocked.test","foo.example"\]' "$SINGBOX_CONFIG" &&
+        grep -q '"91.108.56.0/22"' "$SINGBOX_CONFIG" &&
         grep -q '"final": "direct"' "$SINGBOX_CONFIG" \
         || { rm -rf "$test_dir"; die "list routing self-test failed"; }
     printf 'all\n' > "$SINGBOX_MODE_FILE"
+    printf '0\n' > "$SINGBOX_TELEGRAM_FILE"
     links='vless://11111111-1111-1111-1111-111111111111@example.com:443?type=grpc&security=tls&sni=edge.example.com&serviceName=grpc-vless#VLESS
 vmess://eyJ2IjoiMiIsInBzIjoiVG9reW8gVk1lc3MiLCJhZGQiOiJ2bWVzcy5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjIyMjIyMjIyLTIyMjItMjIyMi0yMjIyLTIyMjIyMjIyMjIyMiIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0Ijoid3MiLCJ0eXBlIjoibm9uZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJwYXRoIjoiL3ZtZXNzIiwidGxzIjoidGxzIiwic25pIjoiZWRnZS5leGFtcGxlLmNvbSJ9
 trojan://secret@trojan.example.com:443?security=tls&sni=trojan.example.com&type=tcp#Trojan
@@ -1248,7 +1265,8 @@ $links
 EOF
     [ "$protocols" = "vless vmess trojan shadowsocks hysteria2 tuic " ] \
         || { rm -rf "$test_dir"; die "protocol parser self-test failed"; }
-    grep -q '"final": "proxy"' "$SINGBOX_CONFIG" \
+    grep -q '"final": "proxy"' "$SINGBOX_CONFIG" &&
+        ! grep -q '"91.108.56.0/22"' "$SINGBOX_CONFIG" \
         || { rm -rf "$test_dir"; die "all routing self-test failed"; }
     save_source "$(printf '%s\n' "$links" | sed -n '1p;3p')"
     [ "$(wc -l < "$SINGBOX_SERVERS_FILE" | tr -d ' ')" = 2 ] \
