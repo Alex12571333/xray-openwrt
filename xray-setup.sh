@@ -3,9 +3,14 @@
 # Один активный прокси-сервер, выбор и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260660"
+SCRIPT_VERSION="20260661"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
+
+REFILTER_DOMAINS_URL="https://github.com/1andrevich/Re-filter-lists/releases/latest/download/ruleset-domain-refilter_domains.srs"
+REFILTER_IPS_URL="https://github.com/1andrevich/Re-filter-lists/releases/latest/download/ruleset-ip-refilter_ipsum.srs"
+RUSSIA_BLOCKED_URL="https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/srs/ru-blocked.srs"
+RUSSIA_BLOCKED_COMMUNITY_URL="https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/srs/ru-blocked-community.srs"
 
 # Для OpenWrt выбираем официальную musl/статическую сборку, а не glibc.
 SINGBOX_VERSION="1.13.12"
@@ -19,10 +24,17 @@ SINGBOX_SERVERS_FILE="${SINGBOX_SERVERS_FILE:-/etc/sing-box/servers}"
 SINGBOX_MODE_FILE="${SINGBOX_MODE_FILE:-/etc/sing-box/route_mode}"
 SINGBOX_DOMAINS_FILE="${SINGBOX_DOMAINS_FILE:-/etc/sing-box/proxy_domains}"
 SINGBOX_TELEGRAM_FILE="${SINGBOX_TELEGRAM_FILE:-/etc/sing-box/telegram_calls}"
+SINGBOX_REFILTER_FILE="${SINGBOX_REFILTER_FILE:-/etc/sing-box/refilter_enabled}"
+SINGBOX_RUSSIA_BLOCKED_FILE="${SINGBOX_RUSSIA_BLOCKED_FILE:-/etc/sing-box/russia_blocked_enabled}"
 SINGBOX_PING_FILE="${SINGBOX_PING_FILE:-/etc/sing-box/ping_cache}"
-SINGBOX_DISABLED_FILE="/etc/sing-box/disabled"
+SINGBOX_DISABLED_FILE="${SINGBOX_DISABLED_FILE:-/etc/sing-box/disabled}"
 SINGBOX_LOG="/var/log/sing-box.log"
 SINGBOX_SELF="/etc/sing-box/setup.sh"
+SINGBOX_RULESET_DIR="${SINGBOX_RULESET_DIR:-/etc/sing-box/rules}"
+REFILTER_DOMAINS_FILE="${REFILTER_DOMAINS_FILE:-${SINGBOX_RULESET_DIR}/refilter-domains.srs}"
+REFILTER_IPS_FILE="${REFILTER_IPS_FILE:-${SINGBOX_RULESET_DIR}/refilter-ips.srs}"
+RUSSIA_BLOCKED_FILE="${RUSSIA_BLOCKED_FILE:-${SINGBOX_RULESET_DIR}/russia-blocked.srs}"
+RUSSIA_BLOCKED_COMMUNITY_FILE="${RUSSIA_BLOCKED_COMMUNITY_FILE:-${SINGBOX_RULESET_DIR}/russia-blocked-community.srs}"
 SINGBOX_CRON="${SINGBOX_CRON:-/etc/crontabs/root}"
 PANEL_ROOT="/etc/sing-box/www"
 PANEL_PID="/var/run/sing-box-panel.pid"
@@ -33,6 +45,7 @@ PANEL_URL_FILE="/etc/sing-box/panel_url"
 PANEL_LOCK="/var/run/sing-box-panel.lock"
 PANEL_PORT="8088"
 CRON_MARKER="# sing-box-tunnel"
+# Оставлен только для удаления cron-заданий старых версий.
 SUB_REFRESH_MARKER="# sing-box-sub-refresh"
 IPTABLES_CHAIN="SBOX_TP"
 
@@ -65,7 +78,13 @@ _html_escape() {
 }
 
 persist_self() {
+    local installed_ver
     mkdir -p /etc/sing-box
+    installed_ver=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9]*\)"$/\1/p' "$SINGBOX_SELF" 2>/dev/null | head -1)
+    case "$installed_ver" in
+        ''|*[!0-9]*) ;;
+        *) [ "$installed_ver" -gt "$SCRIPT_VERSION" ] && { chmod 700 "$SINGBOX_SELF"; return 0; } ;;
+    esac
     if [ -r "$0" ] && [ -r "$SINGBOX_SELF" ] && cmp -s "$0" "$SINGBOX_SELF"; then
         chmod 700 "$SINGBOX_SELF"
         return 0
@@ -78,6 +97,17 @@ persist_self() {
         mv "$tmp" "$SINGBOX_SELF"
     fi
     chmod 700 "$SINGBOX_SELF"
+}
+
+_with_lock() {
+    local status
+    mkdir "$PANEL_LOCK" 2>/dev/null || die "Другое изменение ещё выполняется"
+    trap 'rmdir "$PANEL_LOCK" 2>/dev/null' EXIT INT TERM
+    "$@"
+    status=$?
+    rmdir "$PANEL_LOCK" 2>/dev/null
+    trap - EXIT INT TERM
+    return "$status"
 }
 
 # ─── Архитектура ────────────────────────────────────────────────────────────
@@ -106,6 +136,51 @@ _download() {
         uclient-fetch --no-check-certificate -O "$2" "$1"
     else
         wget --no-check-certificate -O "$2" "$1"
+    fi
+}
+
+_fetch_ruleset() {
+    # $1 = URL, $2 = временный файл
+    local size
+    rm -f "$2"
+    _download "$1" "$2" >/dev/null 2>&1 || return 1
+    [ -s "$2" ] || return 1
+    size=$(wc -c < "$2" | tr -d ' ')
+    [ "$size" -le 4194304 ] || return 1
+    "$SINGBOX_BIN" rule-set match --format binary "$2" 127.0.0.1 >/dev/null 2>&1
+}
+
+sync_rule_sets() {
+    # $1 = 1 для ручного обновления, $2/$3 = желаемые состояния или текущие файлы-флаги.
+    local force="${1:-0}" refilter="${2:-}" russia="${3:-}" first second
+    [ -n "$refilter" ] || refilter=$(cat "$SINGBOX_REFILTER_FILE" 2>/dev/null)
+    [ -n "$russia" ] || russia=$(cat "$SINGBOX_RUSSIA_BLOCKED_FILE" 2>/dev/null)
+    [ "$refilter" = 1 ] || refilter=0
+    [ "$russia" = 1 ] || russia=0
+    mkdir -p "$SINGBOX_RULESET_DIR"
+
+    if [ "$refilter" = 1 ] && { [ "$force" = 1 ] || [ ! -s "$REFILTER_DOMAINS_FILE" ] || [ ! -s "$REFILTER_IPS_FILE" ]; }; then
+        info "Загружаю список Re:filter..."
+        first="${REFILTER_DOMAINS_FILE}.new"; second="${REFILTER_IPS_FILE}.new"
+        if ! _fetch_ruleset "$REFILTER_DOMAINS_URL" "$first" || ! _fetch_ruleset "$REFILTER_IPS_URL" "$second"; then
+            rm -f "$first" "$second"
+            die "Не удалось скачать или проверить Re:filter; старые файлы сохранены"
+        fi
+        chmod 600 "$first" "$second"
+        mv "$first" "$REFILTER_DOMAINS_FILE" && mv "$second" "$REFILTER_IPS_FILE" \
+            || { rm -f "$first" "$second"; die "Не удалось сохранить Re:filter"; }
+    fi
+
+    if [ "$russia" = 1 ] && { [ "$force" = 1 ] || [ ! -s "$RUSSIA_BLOCKED_FILE" ] || [ ! -s "$RUSSIA_BLOCKED_COMMUNITY_FILE" ]; }; then
+        info "Загружаю списки заблокированных IP..."
+        first="${RUSSIA_BLOCKED_FILE}.new"; second="${RUSSIA_BLOCKED_COMMUNITY_FILE}.new"
+        if ! _fetch_ruleset "$RUSSIA_BLOCKED_URL" "$first" || ! _fetch_ruleset "$RUSSIA_BLOCKED_COMMUNITY_URL" "$second"; then
+            rm -f "$first" "$second"
+            die "Не удалось скачать или проверить списки IP; старые файлы сохранены"
+        fi
+        chmod 600 "$first" "$second"
+        mv "$first" "$RUSSIA_BLOCKED_FILE" && mv "$second" "$RUSSIA_BLOCKED_COMMUNITY_FILE" \
+            || { rm -f "$first" "$second"; die "Не удалось сохранить списки IP"; }
     fi
 }
 
@@ -495,6 +570,7 @@ refresh_subscription() {
     if [ -n "$old" ] && grep -Fqx "$old" "$tmp"; then selected="$old"; else selected=$(head -1 "$tmp"); fi
     parse_server "$selected"
     if [ -x "$SINGBOX_BIN" ]; then
+        sync_rule_sets 0
         active_config="$SINGBOX_CONFIG"
         check_config="${tmp}.json"
         SINGBOX_CONFIG="$check_config"
@@ -684,7 +760,7 @@ gen_config() {
     mkdir -p "$(dirname "$SINGBOX_CONFIG")"
     [ -n "$SV_HOST" ] || die "Не задан сервер"
 
-    local main_obj mode final rules domain domain_json escaped telegram_calls tmp
+    local main_obj mode final rules domain domain_json escaped telegram_calls refilter russia rule_sets tmp
     main_obj=$(_emit_outbound "proxy")
     mode=$(cat "$SINGBOX_MODE_FILE" 2>/dev/null)
     [ "$mode" = "list" ] || mode="all"
@@ -706,6 +782,23 @@ gen_config() {
     else
         final="proxy"
         rules='      { "ip_is_private": true, "action": "route", "outbound": "direct" }'
+    fi
+    rule_sets=""
+    refilter=$(cat "$SINGBOX_REFILTER_FILE" 2>/dev/null)
+    if [ "$refilter" = 1 ]; then
+        rules="${rules},
+      { \"rule_set\": [\"refilter-domains\",\"refilter-ips\"], \"action\": \"route\", \"outbound\": \"proxy\" }"
+        rule_sets="      { \"type\": \"local\", \"tag\": \"refilter-domains\", \"format\": \"binary\", \"path\": \"$(_json_escape "$REFILTER_DOMAINS_FILE")\" },
+      { \"type\": \"local\", \"tag\": \"refilter-ips\", \"format\": \"binary\", \"path\": \"$(_json_escape "$REFILTER_IPS_FILE")\" }"
+    fi
+    russia=$(cat "$SINGBOX_RUSSIA_BLOCKED_FILE" 2>/dev/null)
+    if [ "$russia" = 1 ]; then
+        rules="${rules},
+      { \"rule_set\": [\"russia-blocked\",\"russia-blocked-community\"], \"action\": \"route\", \"outbound\": \"proxy\" }"
+        [ -n "$rule_sets" ] && rule_sets="${rule_sets},
+"
+        rule_sets="${rule_sets}      { \"type\": \"local\", \"tag\": \"russia-blocked\", \"format\": \"binary\", \"path\": \"$(_json_escape "$RUSSIA_BLOCKED_FILE")\" },
+      { \"type\": \"local\", \"tag\": \"russia-blocked-community\", \"format\": \"binary\", \"path\": \"$(_json_escape "$RUSSIA_BLOCKED_COMMUNITY_FILE")\" }"
     fi
     telegram_calls=$(cat "$SINGBOX_TELEGRAM_FILE" 2>/dev/null)
     if [ "$telegram_calls" = 1 ]; then
@@ -730,6 +823,9 @@ gen_config() {
     "rules": [
 ${rules}
     ],
+    "rule_set": [
+${rule_sets}
+    ],
     "final": "${final}"
   }
 }
@@ -748,12 +844,11 @@ EOF
 setup_iptables() {
     info "Настраиваю iptables TPROXY..."
 
+    cleanup_iptables quiet
+
     ip rule add fwmark 0x1 table 100 2>/dev/null || true
     ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
 
-    iptables -t mangle -D PREROUTING -j "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t mangle -N "$IPTABLES_CHAIN"
 
     iptables -t mangle -A "$IPTABLES_CHAIN" -d 0.0.0.0/8      -j RETURN
@@ -777,12 +872,16 @@ setup_iptables() {
 }
 
 cleanup_iptables() {
-    iptables -t mangle -D PREROUTING -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    local br
+    for br in br-lan br0 eth1; do
+        while iptables -t mangle -D PREROUTING -i "$br" -j "$IPTABLES_CHAIN" 2>/dev/null; do :; done
+    done
+    while iptables -t mangle -D PREROUTING -j "$IPTABLES_CHAIN" 2>/dev/null; do :; done
     iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
-    ip rule del fwmark 0x1 table 100 2>/dev/null || true
-    ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
-    info "TPROXY правила удалены"
+    while ip rule del fwmark 0x1 table 100 2>/dev/null; do :; done
+    while ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null; do :; done
+    [ "${1:-}" = quiet ] || info "TPROXY правила удалены"
 }
 
 # ─── Запуск sing-box ─────────────────────────────────────────────────────────
@@ -811,22 +910,23 @@ start_singbox() {
 # ─── Watchdog ────────────────────────────────────────────────────────────────
 
 install_cron() {
-    local changed=0
+    local changed=0 tmp
+    if grep -Fq "$SUB_REFRESH_MARKER" "$SINGBOX_CRON" 2>/dev/null; then
+        tmp=$(mktemp /tmp/sb-cron-XXXXXX) || die "Не удалось обновить cron"
+        grep -Fv "$SUB_REFRESH_MARKER" "$SINGBOX_CRON" > "$tmp" || true
+        mv "$tmp" "$SINGBOX_CRON"
+        changed=1
+    fi
     if ! grep -Fq "$CRON_MARKER" "$SINGBOX_CRON" 2>/dev/null; then
         printf '* * * * * sh %s watchdog %s\n' "$SINGBOX_SELF" "$CRON_MARKER" >> "$SINGBOX_CRON"
         changed=1
     fi
-    if [ -s "$SINGBOX_SUB_FILE" ] && ! grep -Fq "$SUB_REFRESH_MARKER" "$SINGBOX_CRON" 2>/dev/null; then
-        printf '17 */6 * * * sh %s refresh >/dev/null 2>&1 %s\n' "$SINGBOX_SELF" "$SUB_REFRESH_MARKER" >> "$SINGBOX_CRON"
-        changed=1
-    fi
     [ "$changed" -eq 1 ] || return 0
     /etc/init.d/cron restart 2>/dev/null || true
-    info "Watchdog и автообновление подписки установлены в cron"
+    info "Watchdog установлен в cron"
 }
 
-_watchdog() {
-    _panel_is_running || start_panel >/dev/null 2>&1 || true
+_watchdog_locked() {
     [ -f "$SINGBOX_DISABLED_FILE" ] && return 0
     _is_running && return 0
     logger -t singbox-watchdog "sing-box не запущен — перезапускаю"
@@ -834,46 +934,101 @@ _watchdog() {
     setup_iptables
 }
 
-auto_refresh_subscription() {
-    [ -s "$SINGBOX_SUB_FILE" ] || return 0
-    install_singbox
+_watchdog() {
+    _panel_is_running || start_panel >/dev/null 2>&1 || true
+    (_with_lock _watchdog_locked) >/dev/null 2>&1 || true
+}
+
+refresh_subscription_and_apply() {
+    [ -s "$SINGBOX_SUB_FILE" ] || die "URL подписки не настроен"
     refresh_subscription
-    if [ -f "$SINGBOX_DISABLED_FILE" ]; then
-        load_source
-        gen_config
-        info "Подписка и конфигурация обновлены; туннель оставлен остановленным"
-    else
-        apply_configuration
-        info "Подписка и подключение обновлены"
-    fi
-    logger -t singbox-refresh "подписка успешно обновлена"
+    apply_configuration preserve
+    info "Подписка и конфигурация обновлены"
 }
 
 # ─── Применение и веб-панель ────────────────────────────────────────────────
 
-apply_configuration() {
-    install_singbox
-    load_source || die "Сначала добавь ссылку сервера или подписку"
-    gen_config
+_activate_configuration() {
+    if [ "${1:-start}" = preserve ] && [ -f "$SINGBOX_DISABLED_FILE" ]; then
+        _is_running && stop_tunnel || cleanup_iptables quiet
+        install_cron
+        info "Конфигурация обновлена; туннель оставлен остановленным"
+        return 0
+    fi
     rm -f "$SINGBOX_DISABLED_FILE"
     start_singbox
     setup_iptables
     install_cron
 }
 
-apply_update() {
-    local running=0
-    _is_running && running=1
+apply_configuration() {
+    local state="${1:-start}" force="${2:-0}"
     install_singbox
+    sync_rule_sets "$force"
+    load_source || die "Сначала добавь ссылку сервера или подписку"
+    gen_config
+    _activate_configuration "$state"
+}
+
+apply_update() {
+    install_singbox
+    sync_rule_sets 1
+    install_cron
     if load_source; then
         gen_config
-        if [ "$running" -eq 1 ]; then start_singbox; setup_iptables; fi
+        _activate_configuration preserve
     fi
     info "Скрипт и sing-box обновлены"
 }
 
+save_routing_settings() {
+    # Единый путь сохранения для CLI и веб-панели.
+    local mode="$1" domains="$2" telegram="$3" refilter="$4" russia="$5"
+    local domains_new config_new file
+    case "$mode" in all|list) ;; *) die "Некорректный режим маршрутизации" ;; esac
+    [ "$telegram" = 1 ] || telegram=0
+    [ "$refilter" = 1 ] || refilter=0
+    [ "$russia" = 1 ] || russia=0
+
+    install_singbox
+    sync_rule_sets 0 "$refilter" "$russia"
+    mkdir -p "$(dirname "$SINGBOX_MODE_FILE")"
+    domains_new="${SINGBOX_DOMAINS_FILE}.new"
+    printf '%s' "$domains" | normalize_domains > "$domains_new"
+    printf '%s\n' "$mode" > "${SINGBOX_MODE_FILE}.new"
+    printf '%s\n' "$telegram" > "${SINGBOX_TELEGRAM_FILE}.new"
+    printf '%s\n' "$refilter" > "${SINGBOX_REFILTER_FILE}.new"
+    printf '%s\n' "$russia" > "${SINGBOX_RUSSIA_BLOCKED_FILE}.new"
+    chmod 600 "$domains_new" "${SINGBOX_MODE_FILE}.new" "${SINGBOX_TELEGRAM_FILE}.new" \
+        "${SINGBOX_REFILTER_FILE}.new" "${SINGBOX_RUSSIA_BLOCKED_FILE}.new"
+
+    config_new="${SINGBOX_CONFIG}.routing"
+    rm -f "$config_new" "${config_new}.new"
+    if ! (
+        SINGBOX_DOMAINS_FILE="$domains_new"
+        SINGBOX_MODE_FILE="${SINGBOX_MODE_FILE}.new"
+        SINGBOX_TELEGRAM_FILE="${SINGBOX_TELEGRAM_FILE}.new"
+        SINGBOX_REFILTER_FILE="${SINGBOX_REFILTER_FILE}.new"
+        SINGBOX_RUSSIA_BLOCKED_FILE="${SINGBOX_RUSSIA_BLOCKED_FILE}.new"
+        SINGBOX_CONFIG="$config_new"
+        load_source || die "Сначала добавь ссылку сервера или подписку"
+        gen_config
+    ); then
+        rm -f "$domains_new" "${SINGBOX_MODE_FILE}.new" "${SINGBOX_TELEGRAM_FILE}.new" \
+            "${SINGBOX_REFILTER_FILE}.new" "${SINGBOX_RUSSIA_BLOCKED_FILE}.new" "$config_new" "${config_new}.new"
+        die "Правила не прошли проверку; прежние настройки сохранены"
+    fi
+
+    for file in "$SINGBOX_DOMAINS_FILE" "$SINGBOX_MODE_FILE" "$SINGBOX_TELEGRAM_FILE" \
+        "$SINGBOX_REFILTER_FILE" "$SINGBOX_RUSSIA_BLOCKED_FILE"; do
+        mv "${file}.new" "$file" || die "Не удалось сохранить настройки маршрутизации"
+    done
+    mv "$config_new" "$SINGBOX_CONFIG" || die "Не удалось применить конфигурацию"
+    _activate_configuration preserve
+}
+
 stop_tunnel() {
-    mkdir -p /etc/sing-box
+    mkdir -p "$(dirname "$SINGBOX_DISABLED_FILE")"
     : > "$SINGBOX_DISABLED_FILE"
     kill "$(cat "$SINGBOX_PID" 2>/dev/null)" 2>/dev/null || killall sing-box 2>/dev/null || true
     rm -f "$SINGBOX_PID"
@@ -948,21 +1103,18 @@ _form_value() {
         done
 }
 
-_panel_action() {
-    local action source index mode domains telegram_calls tmp count
-    mkdir "$PANEL_LOCK" 2>/dev/null || die "Другое изменение ещё выполняется"
-    trap 'rmdir "$PANEL_LOCK" 2>/dev/null' EXIT INT TERM
+_panel_action_unlocked() {
+    local action source index mode domains telegram_calls refilter russia count
     action=$(_form_value action)
     case "$action" in
         source)
             source=$(_form_value source)
             save_source "$source"
-            apply_configuration
-            echo "Источник сохранён и подключение применено."
+            apply_configuration preserve
+            echo "Источник сохранён; конфигурация обновлена."
             ;;
         refresh)
-            refresh_subscription
-            apply_configuration
+            refresh_subscription_and_apply
             echo "Подписка обновлена; текущий сервер сохранён, если он ещё доступен."
             ;;
         ping)
@@ -972,24 +1124,16 @@ _panel_action() {
         select)
             index=$(_form_value server)
             select_server "$index"
-            apply_configuration
-            echo "Выбранный сервер подключён."
+            apply_configuration preserve
+            echo "Сервер выбран; конфигурация обновлена."
             ;;
         routing)
             mode=$(_form_value mode)
-            case "$mode" in all|list) ;; *) die "Некорректный режим маршрутизации" ;; esac
             domains=$(_form_value domains)
             telegram_calls=$(_form_value telegram_calls)
-            [ "$telegram_calls" = 1 ] || telegram_calls=0
-            tmp=$(mktemp /tmp/sb-domains-XXXXXX) || die "Не удалось создать временный файл"
-            printf '%s' "$domains" | normalize_domains > "$tmp"
-            mv "$tmp" "$SINGBOX_DOMAINS_FILE"
-            printf '%s\n' "$mode" > "${SINGBOX_MODE_FILE}.new"
-            mv "${SINGBOX_MODE_FILE}.new" "$SINGBOX_MODE_FILE"
-            printf '%s\n' "$telegram_calls" > "${SINGBOX_TELEGRAM_FILE}.new"
-            mv "${SINGBOX_TELEGRAM_FILE}.new" "$SINGBOX_TELEGRAM_FILE"
-            chmod 600 "$SINGBOX_DOMAINS_FILE" "$SINGBOX_MODE_FILE" "$SINGBOX_TELEGRAM_FILE"
-            apply_configuration
+            refilter=$(_form_value refilter)
+            russia=$(_form_value russia_blocked)
+            save_routing_settings "$mode" "$domains" "$telegram_calls" "$refilter" "$russia"
             count=$(wc -l < "$SINGBOX_DOMAINS_FILE" | tr -d ' ')
             echo "Маршрутизация применена, доменов в списке: ${count}."
             ;;
@@ -1002,8 +1146,7 @@ _panel_action() {
             echo "Туннель остановлен."
             ;;
         upgrade)
-            self_update || die "Не удалось проверить обновление скрипта"
-            sh "$SINGBOX_SELF" apply-update
+            update_system
             echo "Скрипт и sing-box обновлены."
             ;;
         *)
@@ -1012,8 +1155,12 @@ _panel_action() {
     esac
 }
 
+_panel_action() {
+    _with_lock _panel_action_unlocked
+}
+
 panel_cgi() {
-    local message="" action_output csrf expected length mode telegram_calls status status_class start_label stop_disabled selected
+    local message="" action_output csrf expected length mode telegram_calls refilter russia status status_class start_label stop_disabled selected
     local server_count domain_count route_label selected_name selected_host selected_flag selected_protocol
     if [ "${REQUEST_METHOD:-GET}" = "POST" ]; then
         case "${CONTENT_TYPE:-}" in application/x-www-form-urlencoded*) ;; *) die "Unsupported Content-Type" ;; esac
@@ -1037,6 +1184,10 @@ panel_cgi() {
     [ "$mode" = "list" ] || mode="all"
     telegram_calls=$(cat "$SINGBOX_TELEGRAM_FILE" 2>/dev/null)
     [ "$telegram_calls" = 1 ] || telegram_calls=0
+    refilter=$(cat "$SINGBOX_REFILTER_FILE" 2>/dev/null)
+    [ "$refilter" = 1 ] || refilter=0
+    russia=$(cat "$SINGBOX_RUSSIA_BLOCKED_FILE" 2>/dev/null)
+    [ "$russia" = 1 ] || russia=0
     selected=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
     server_count=$(grep -c '.' "$SINGBOX_SERVERS_FILE" 2>/dev/null)
     server_count="${server_count:-0}"
@@ -1090,7 +1241,7 @@ EOF
     cat <<EOF
 <header class="topbar">
   <div class="brand"><span class="brand-mark" aria-hidden="true">S</span><div><h1>SingBox Router</h1><p>OpenWrt control plane · v${SCRIPT_VERSION}</p></div></div>
-  <div class="topbar-actions"><form method="post"><input type="hidden" name="csrf" value="$(_html_escape "$csrf")"><button class="btn ghost" name="action" value="upgrade" title="Обновить скрипт и sing-box">↑ Обновить</button></form><div class="status-pill ${status_class}"><span class="status-dot"></span>$(_html_escape "$status")</div></div>
+  <div class="topbar-actions"><form method="post"><input type="hidden" name="csrf" value="$(_html_escape "$csrf")"><button class="btn ghost" name="action" value="upgrade" title="Обновить скрипт, sing-box и включённые списки">↑ Обновить</button></form><div class="status-pill ${status_class}"><span class="status-dot"></span>$(_html_escape "$status")</div></div>
 </header>
 EOF
     if [ -n "$message" ]; then
@@ -1160,10 +1311,12 @@ EOF
       <label class="route-option"><input type="radio" name="mode" value="all"$([ "$mode" = all ] && printf ' checked')><span><b>Весь трафик</b><small>кроме локальных сетей</small></span></label>
       <label class="route-option"><input type="radio" name="mode" value="list"$([ "$mode" = list ] && printf ' checked')><span><b>Только список</b><small>остальное напрямую</small></span></label>
     </div>
+    <label class="feature-toggle"><span class="feature-copy"><b>Re:filter</b><small>Заблокированные домены и IP через прокси</small></span><input type="checkbox" name="refilter" value="1"$([ "$refilter" = 1 ] && printf ' checked')><span class="switch" aria-hidden="true"></span></label>
+    <label class="feature-toggle"><span class="feature-copy"><b>Заблокированные IP РФ</b><small>Основной и community-списки РКН через прокси</small></span><input type="checkbox" name="russia_blocked" value="1"$([ "$russia" = 1 ] && printf ' checked')><span class="switch" aria-hidden="true"></span></label>
     <label class="feature-toggle"><span class="feature-copy"><b>Обход звонков Telegram</b><small>Официальные сети Telegram через прокси</small></span><input type="checkbox" name="telegram_calls" value="1"$([ "$telegram_calls" = 1 ] && printf ' checked')><span class="switch" aria-hidden="true"></span></label>
     <label class="field-label" for="domains">Домены для прокси</label>
     <textarea id="domains" name="domains" spellcheck="false" placeholder="youtube.com&#10;instagram.com">$(_html_escape "$(cat "$SINGBOX_DOMAINS_FILE" 2>/dev/null)")</textarea>
-    <p class="hint">Один домен на строку. example.com включает все поддомены.</p>
+    <p class="hint">Один домен на строку. example.com включает все поддомены. Внешние списки обновляются только вручную кнопкой «Обновить».</p>
     <button class="btn primary wide" type="submit">Применить правила</button>
   </form>
 </section>
@@ -1226,9 +1379,16 @@ self_update() {
     info "Скрипт обновлён до $remote_ver"
 }
 
+update_system() {
+    [ -s "$SINGBOX_SELF" ] || persist_self
+    self_update || die "Не удалось проверить обновление скрипта"
+    SINGBOX_LOCK_HELD=1 sh "$SINGBOX_SELF" apply-update \
+        || die "Не удалось обновить sing-box или списки"
+}
+
 # Минимальная проверка ссылок, списка доменов и обоих режимов маршрутизации.
 self_test() {
-    local test_dir normalized links link protocols="" expected
+    local test_dir normalized links link protocols="" expected rule_source
     test_dir=$(mktemp -d /tmp/singbox-test-XXXXXX) || die "mktemp failed"
     SINGBOX_BIN="${SINGBOX_TEST_BIN:-true}"
     SINGBOX_CONFIG="$test_dir/config.json"
@@ -1238,9 +1398,29 @@ self_test() {
     SINGBOX_MODE_FILE="$test_dir/mode"
     SINGBOX_DOMAINS_FILE="$test_dir/domains"
     SINGBOX_TELEGRAM_FILE="$test_dir/telegram_calls"
+    SINGBOX_REFILTER_FILE="$test_dir/refilter_enabled"
+    SINGBOX_RUSSIA_BLOCKED_FILE="$test_dir/russia_blocked_enabled"
     SINGBOX_PING_FILE="$test_dir/pings"
+    SINGBOX_DISABLED_FILE="$test_dir/disabled"
     SINGBOX_LOG="$test_dir/sing-box.log"
     SINGBOX_CRON="$test_dir/cron"
+    SINGBOX_RULESET_DIR="$test_dir/rules"
+    REFILTER_DOMAINS_FILE="$SINGBOX_RULESET_DIR/refilter-domains.srs"
+    REFILTER_IPS_FILE="$SINGBOX_RULESET_DIR/refilter-ips.srs"
+    RUSSIA_BLOCKED_FILE="$SINGBOX_RULESET_DIR/russia-blocked.srs"
+    RUSSIA_BLOCKED_COMMUNITY_FILE="$SINGBOX_RULESET_DIR/russia-blocked-community.srs"
+    mkdir -p "$SINGBOX_RULESET_DIR"
+    rule_source="$test_dir/rule.json"
+    if [ "$SINGBOX_BIN" = true ]; then
+        : > "$REFILTER_DOMAINS_FILE"
+    else
+        printf '%s\n' '{"version":1,"rules":[{"domain_suffix":["blocked.test"],"ip_cidr":["203.0.113.0/24"]}]}' > "$rule_source"
+        "$SINGBOX_BIN" rule-set compile --output "$REFILTER_DOMAINS_FILE" "$rule_source" >/dev/null \
+            || { rm -rf "$test_dir"; die "rule-set compile self-test failed"; }
+    fi
+    cp "$REFILTER_DOMAINS_FILE" "$REFILTER_IPS_FILE"
+    cp "$REFILTER_DOMAINS_FILE" "$RUSSIA_BLOCKED_FILE"
+    cp "$REFILTER_DOMAINS_FILE" "$RUSSIA_BLOCKED_COMMUNITY_FILE"
 
     [ "$( (uname() { echo aarch64; }; detect_arch) )" = "linux-arm64-musl" ] \
         || { rm -rf "$test_dir"; die "OpenWrt architecture self-test failed"; }
@@ -1267,6 +1447,8 @@ self_test() {
     printf '%s\n' "$normalized" > "$SINGBOX_DOMAINS_FILE"
     printf 'list\n' > "$SINGBOX_MODE_FILE"
     printf '1\n' > "$SINGBOX_TELEGRAM_FILE"
+    printf '1\n' > "$SINGBOX_REFILTER_FILE"
+    printf '1\n' > "$SINGBOX_RUSSIA_BLOCKED_FILE"
     gen_config >/dev/null
     if command -v python3 >/dev/null 2>&1; then
         python3 -m json.tool "$SINGBOX_CONFIG" >/dev/null \
@@ -1274,10 +1456,14 @@ self_test() {
     fi
     grep -q '"domain_suffix": \["example.com","blocked.test","foo.example"\]' "$SINGBOX_CONFIG" &&
         grep -q '"91.108.56.0/22"' "$SINGBOX_CONFIG" &&
+        grep -q '"refilter-domains","refilter-ips"' "$SINGBOX_CONFIG" &&
+        grep -q '"russia-blocked","russia-blocked-community"' "$SINGBOX_CONFIG" &&
         grep -q '"final": "direct"' "$SINGBOX_CONFIG" \
         || { rm -rf "$test_dir"; die "list routing self-test failed"; }
     printf 'all\n' > "$SINGBOX_MODE_FILE"
     printf '0\n' > "$SINGBOX_TELEGRAM_FILE"
+    printf '0\n' > "$SINGBOX_REFILTER_FILE"
+    printf '0\n' > "$SINGBOX_RUSSIA_BLOCKED_FILE"
     links='vless://11111111-1111-1111-1111-111111111111@example.com:443?type=grpc&security=tls&sni=edge.example.com&serviceName=grpc-vless#VLESS
 vmess://eyJ2IjoiMiIsInBzIjoiVG9reW8gVk1lc3MiLCJhZGQiOiJ2bWVzcy5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjIyMjIyMjIyLTIyMjItMjIyMi0yMjIyLTIyMjIyMjIyMjIyMiIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0Ijoid3MiLCJ0eXBlIjoibm9uZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJwYXRoIjoiL3ZtZXNzIiwidGxzIjoidGxzIiwic25pIjoiZWRnZS5leGFtcGxlLmNvbSJ9
 trojan://secret@trojan.example.com:443?security=tls&sni=trojan.example.com&type=tcp#Trojan
@@ -1309,18 +1495,112 @@ EOF
         || { rm -rf "$test_dir"; die "server selection self-test failed"; }
     [ "$(ping_quality 79)" = 4 ] && [ "$(ping_quality 301)" = 1 ] && [ "$(ping_quality timeout)" = 0 ] \
         || { rm -rf "$test_dir"; die "ping quality self-test failed"; }
-    : > "$SINGBOX_CRON"
+    printf '17 */6 * * * sh /old/setup.sh refresh %s\n5 4 * * * echo keep\n' "$SUB_REFRESH_MARKER" > "$SINGBOX_CRON"
     printf '%s\n' 'https://example.com/subscription' > "$SINGBOX_SUB_FILE"
     install_cron >/dev/null
     install_cron >/dev/null
     [ "$(wc -l < "$SINGBOX_CRON" | tr -d ' ')" = 2 ] &&
-        grep -Fq "$CRON_MARKER" "$SINGBOX_CRON" && grep -Fq "$SUB_REFRESH_MARKER" "$SINGBOX_CRON" \
+        grep -Fq "$CRON_MARKER" "$SINGBOX_CRON" && ! grep -Fq "$SUB_REFRESH_MARKER" "$SINGBOX_CRON" \
         || { rm -rf "$test_dir"; die "cron self-test failed"; }
+    : > "$SINGBOX_DISABLED_FILE"
+    (
+        _is_running() { return 1; }; cleanup_iptables() { :; }; install_cron() { :; }
+        start_singbox() { : > "$test_dir/unexpected-start"; }; setup_iptables() { :; }
+        _activate_configuration preserve
+    ) >/dev/null
+    [ ! -f "$test_dir/unexpected-start" ] || { rm -rf "$test_dir"; die "stopped state self-test failed"; }
+    rm -f "$SINGBOX_DISABLED_FILE"
+    (
+        start_singbox() { : > "$test_dir/expected-start"; }; setup_iptables() { :; }; install_cron() { :; }
+        _activate_configuration preserve
+    ) >/dev/null
+    [ -f "$test_dir/expected-start" ] || { rm -rf "$test_dir"; die "running state self-test failed"; }
     rm -rf "$test_dir"
     echo "Итог: OK"
 }
 
 # ─── Меню ────────────────────────────────────────────────────────────────────
+
+configure_source() {
+    save_source "$1"
+    persist_self
+    install_panel
+    apply_configuration "${2:-preserve}"
+    info "Источник серверов сохранён"
+}
+
+prompt_source_cli() {
+    local source="" line
+    echo "Вставь ссылку подписки или несколько ссылок серверов. Пустая строка завершает ввод:"
+    while IFS= read -r line; do
+        [ -n "$line" ] || break
+        if [ -n "$source" ]; then source="$source
+$line"; else source="$line"; fi
+    done
+    [ -n "$source" ] || die "Источник не указан"
+    configure_source "$source" preserve
+}
+
+choose_server_cli() {
+    local i=0 url index
+    [ -s "$SINGBOX_SERVERS_FILE" ] || die "Список серверов пуст"
+    while IFS= read -r url; do
+        i=$((i + 1))
+        printf '  %s) %s · %s · %s\n' "$i" "$(server_name "$url")" "$(server_protocol "$url")" "$(server_host "$url")"
+    done < "$SINGBOX_SERVERS_FILE"
+    printf "Номер сервера: "
+    read -r index
+    select_server "$index"
+    apply_configuration preserve
+    info "Сервер выбран"
+}
+
+_prompt_toggle() {
+    local label="$1" current="$2" answer suffix="нет"
+    [ "$current" = 1 ] && suffix="да"
+    printf '%s [да/нет] (сейчас %s, Enter — оставить): ' "$label" "$suffix"
+    read -r answer
+    case "$answer" in
+        '') PROMPT_VALUE="$current" ;;
+        1|y|Y|yes|YES|д|Д|да|ДА) PROMPT_VALUE=1 ;;
+        0|n|N|no|NO|н|Н|нет|НЕТ) PROMPT_VALUE=0 ;;
+        *) die "Ответь да или нет" ;;
+    esac
+}
+
+configure_routing_cli() {
+    local mode domains telegram refilter russia answer line
+    mode=$(cat "$SINGBOX_MODE_FILE" 2>/dev/null); [ "$mode" = list ] || mode=all
+    domains=$(cat "$SINGBOX_DOMAINS_FILE" 2>/dev/null)
+    telegram=$(cat "$SINGBOX_TELEGRAM_FILE" 2>/dev/null); [ "$telegram" = 1 ] || telegram=0
+    refilter=$(cat "$SINGBOX_REFILTER_FILE" 2>/dev/null); [ "$refilter" = 1 ] || refilter=0
+    russia=$(cat "$SINGBOX_RUSSIA_BLOCKED_FILE" 2>/dev/null); [ "$russia" = 1 ] || russia=0
+
+    printf 'Режим [all/list] (сейчас %s, Enter — оставить): ' "$mode"
+    read -r answer
+    [ -n "$answer" ] && mode="$answer"
+    case "$mode" in all|list) ;; *) die "Режим должен быть all или list" ;; esac
+    _prompt_toggle "Re:filter" "$refilter"; refilter="$PROMPT_VALUE"
+    _prompt_toggle "Заблокированные IP РФ" "$russia"; russia="$PROMPT_VALUE"
+    _prompt_toggle "Звонки Telegram" "$telegram"; telegram="$PROMPT_VALUE"
+
+    echo "Домены: Enter первой строкой — оставить, '-' — очистить, иначе вводи по одному и заверши пустой строкой."
+    read -r line
+    case "$line" in
+        '') ;;
+        -) domains="" ;;
+        *)
+            domains="$line"
+            while IFS= read -r line; do
+                [ -n "$line" ] || break
+                domains="$domains
+$line"
+            done
+            ;;
+    esac
+    save_routing_settings "$mode" "$domains" "$telegram" "$refilter" "$russia"
+    info "Маршрутизация сохранена"
+}
 
 show_menu() {
     local vps_info status_str
@@ -1346,51 +1626,49 @@ show_menu() {
     echo "------------------------------"
     echo "  1) Запустить / перезапустить"
     echo "  2) Остановить туннель"
-    echo "  3) Сменить сервер / подписку"
-    echo "  4) Показать логи"
-    echo "  5) Обновить скрипт"
-    echo "  6) Адрес веб-панели"
-    echo "  7) Выход"
+    echo "  3) Добавить / заменить серверы"
+    echo "  4) Выбрать сервер"
+    echo "  5) Настроить маршрутизацию"
+    echo "  6) Обновить подписку вручную"
+    echo "  7) Показать логи"
+    echo "  8) Обновить скрипт, sing-box и списки"
+    echo "  9) Адрес веб-панели"
+    echo "  0) Выход"
     echo "=============================="
     printf "Выбор: "
     read -r choice
     echo ""
     case "$choice" in
         1)
-            apply_configuration
+            _with_lock apply_configuration
             ;;
         2)
-            stop_tunnel
+            _with_lock stop_tunnel
             ;;
         3)
-            echo "Вставь ссылку сервера ИЛИ http(s):// подписку:"
-            printf "URL: "
-            read -r new_url
-            case "$new_url" in
-                vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*|tuic://*|http://*|https://*)
-                    save_source "$new_url"
-                    persist_self
-                    install_panel
-                    apply_configuration
-                    info "Готово! Сервер: ${SV_HOST}:${SV_PORT}"
-                    ;;
-                *)
-                    echo "Ошибка: тип ссылки не поддерживается"
-                    ;;
-            esac
+            _with_lock prompt_source_cli
             ;;
         4)
+            _with_lock choose_server_cli
+            ;;
+        5)
+            _with_lock configure_routing_cli
+            ;;
+        6)
+            _with_lock refresh_subscription_and_apply
+            ;;
+        7)
             echo "--- Последние 30 строк лога ---"
             tail -30 "$SINGBOX_LOG" 2>/dev/null || echo "Лог пустой"
             ;;
-        5)
-            self_update
+        8)
+            _with_lock update_system
             ;;
-        6)
-            install_panel
+        9)
+            _with_lock install_panel
             info "Панель: $(cat "$PANEL_URL_FILE" 2>/dev/null)"
             ;;
-        7)
+        0)
             exit 0
             ;;
         *)
@@ -1409,25 +1687,28 @@ case "${1:-}" in
         _watchdog
         ;;
     refresh)
-        (auto_refresh_subscription) || {
-            logger -t singbox-refresh "ошибка автообновления подписки"
-            exit 1
-        }
+        _with_lock refresh_subscription_and_apply
         ;;
     stop)
-        stop_tunnel
+        _with_lock stop_tunnel
         ;;
     restart)
-        apply_configuration
+        _with_lock apply_configuration
         ;;
     apply-update)
-        apply_update
+        if [ "${SINGBOX_LOCK_HELD:-0}" = 1 ]; then apply_update; else _with_lock apply_update; fi
         ;;
     panel-start)
-        install_panel
+        _with_lock install_panel
         ;;
     self-update)
-        self_update
+        _with_lock update_system
+        ;;
+    routing)
+        _with_lock configure_routing_cli
+        ;;
+    servers)
+        _with_lock choose_server_cli
         ;;
     status)
         if _is_running; then
@@ -1443,11 +1724,8 @@ case "${1:-}" in
         self_test
         ;;
     vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*|tuic://*|http://*|https://*)
-        save_source "$1"
-        persist_self
-        install_panel
-        apply_configuration
-        info "Готово! Сервер: ${SV_HOST}:${SV_PORT}"
+        _with_lock configure_source "$1" start
+        info "Готово!"
         info "Панель: $(cat "$PANEL_URL_FILE")"
         ;;
     *)
