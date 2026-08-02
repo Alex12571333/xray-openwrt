@@ -1,9 +1,9 @@
 #!/bin/sh
 # setup.sh — sing-box TPROXY туннель для OpenWrt
-# Один активный прокси-сервер, выбор и маршрутизация через веб-панель
+# Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260661"
+SCRIPT_VERSION="20260662"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -17,6 +17,7 @@ SINGBOX_VERSION="1.13.12"
 
 SINGBOX_BIN="/usr/bin/sing-box"
 SINGBOX_CONFIG="/etc/sing-box/config.json"
+SINGBOX_GOOD_CONFIG="${SINGBOX_GOOD_CONFIG:-/etc/sing-box/config.good.json}"
 SINGBOX_PID="/var/run/sing-box.pid"
 SINGBOX_VLESS_FILE="${SINGBOX_VLESS_FILE:-/etc/sing-box/vless_url}"
 SINGBOX_SUB_FILE="${SINGBOX_SUB_FILE:-/etc/sing-box/sub_url}"
@@ -28,6 +29,7 @@ SINGBOX_REFILTER_FILE="${SINGBOX_REFILTER_FILE:-/etc/sing-box/refilter_enabled}"
 SINGBOX_RUSSIA_BLOCKED_FILE="${SINGBOX_RUSSIA_BLOCKED_FILE:-/etc/sing-box/russia_blocked_enabled}"
 SINGBOX_PING_FILE="${SINGBOX_PING_FILE:-/etc/sing-box/ping_cache}"
 SINGBOX_DISABLED_FILE="${SINGBOX_DISABLED_FILE:-/etc/sing-box/disabled}"
+SINGBOX_AUTO_FILE="${SINGBOX_AUTO_FILE:-/etc/sing-box/auto_select}"
 SINGBOX_LOG="/var/log/sing-box.log"
 SINGBOX_SELF="/etc/sing-box/setup.sh"
 SINGBOX_RULESET_DIR="${SINGBOX_RULESET_DIR:-/etc/sing-box/rules}"
@@ -44,10 +46,17 @@ PANEL_CSRF="/etc/sing-box/panel_csrf"
 PANEL_URL_FILE="/etc/sing-box/panel_url"
 PANEL_LOCK="/var/run/sing-box-panel.lock"
 PANEL_PORT="8088"
+SINGBOX_INIT="${SINGBOX_INIT:-/etc/init.d/sing-box-tunnel}"
+SINGBOX_FIREWALL_INCLUDE="${SINGBOX_FIREWALL_INCLUDE:-/etc/sing-box/firewall.include}"
 CRON_MARKER="# sing-box-tunnel"
 # Оставлен только для удаления cron-заданий старых версий.
 SUB_REFRESH_MARKER="# sing-box-sub-refresh"
 IPTABLES_CHAIN="SBOX_TP"
+IP6TABLES_CHAIN="SBOX_TP6"
+TPROXY_MARK="0x2333"
+TPROXY_TABLE="233"
+TPROXY_RULE_PRIORITY="12330"
+SINGBOX_BINARY_CHANGED=0
 
 # ─── Утилиты ────────────────────────────────────────────────────────────────
 
@@ -58,7 +67,9 @@ warn() { echo "[sing-box] WARN: $*" >&2; }
 _is_running() {
     [ -f "$SINGBOX_PID" ] || return 1
     local pid; pid=$(cat "$SINGBOX_PID" 2>/dev/null)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ ! -r "/proc/$pid/comm" ] || [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = sing-box ]
 }
 
 _panel_is_running() {
@@ -68,13 +79,21 @@ _panel_is_running() {
 }
 
 _json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+    case "$1" in
+        *\\*|*\"*) printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 
 _html_escape() {
-    printf '%s' "$1" | sed \
-        -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
-        -e 's/"/\&quot;/g' -e "s/'/\&#39;/g"
+    case "$1" in
+        *'&'*|*'<'*|*'>'*|*'"'*|*"'"*)
+            printf '%s' "$1" | sed \
+                -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+                -e 's/"/\&quot;/g' -e "s/'/\&#39;/g"
+            ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 
 persist_self() {
@@ -100,13 +119,94 @@ persist_self() {
 }
 
 _with_lock() {
-    local status
-    mkdir "$PANEL_LOCK" 2>/dev/null || die "Другое изменение ещё выполняется"
-    trap 'rmdir "$PANEL_LOCK" 2>/dev/null' EXIT INT TERM
+    local status owner command
+    if ! mkdir "$PANEL_LOCK" 2>/dev/null; then
+        owner=$(cat "$PANEL_LOCK/pid" 2>/dev/null)
+        command=""
+        [ ! -r "/proc/${owner:-0}/cmdline" ] || command=$(tr '\000' ' ' < "/proc/${owner:-0}/cmdline")
+        if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null && printf '%s' "$command" | grep -Fq 'setup.sh'; then
+            die "Другое изменение ещё выполняется"
+        fi
+        rm -f "$PANEL_LOCK/pid" 2>/dev/null
+        rmdir "$PANEL_LOCK" 2>/dev/null
+        mkdir "$PANEL_LOCK" 2>/dev/null || die "Не удалось получить блокировку"
+    fi
+    printf '%s\n' "$$" > "$PANEL_LOCK/pid"
+    trap 'rm -f "$PANEL_LOCK/pid"; rmdir "$PANEL_LOCK" 2>/dev/null' EXIT INT TERM
     "$@"
     status=$?
+    rm -f "$PANEL_LOCK/pid"
     rmdir "$PANEL_LOCK" 2>/dev/null
     trap - EXIT INT TERM
+    return "$status"
+}
+
+_state_files() {
+    printf '%s\n' "$SINGBOX_CONFIG" "$SINGBOX_GOOD_CONFIG" "$SINGBOX_VLESS_FILE" \
+        "$SINGBOX_SUB_FILE" "$SINGBOX_SERVERS_FILE" "$SINGBOX_MODE_FILE" \
+        "$SINGBOX_DOMAINS_FILE" "$SINGBOX_TELEGRAM_FILE" "$SINGBOX_REFILTER_FILE" \
+        "$SINGBOX_RUSSIA_BLOCKED_FILE" "$SINGBOX_PING_FILE" "$SINGBOX_DISABLED_FILE" \
+        "$SINGBOX_AUTO_FILE" "$SINGBOX_SELF"
+}
+
+_snapshot_state() {
+    local backup="$1" file index=0
+    mkdir -p "$backup" || return 1
+    for file in $(_state_files); do
+        index=$((index + 1))
+        printf '%s\n' "$file" > "$backup/$index.path" || return 1
+        if [ -e "$file" ]; then
+            cp -p "$file" "$backup/$index.data" || return 1
+        else
+            : > "$backup/$index.missing" || return 1
+        fi
+    done
+}
+
+_restore_state() {
+    local backup="$1" path_file file stem
+    for path_file in "$backup"/*.path; do
+        [ -f "$path_file" ] || continue
+        file=$(cat "$path_file")
+        stem="${path_file%.path}"
+        if [ -f "$stem.missing" ]; then
+            [ "$file" = "$SINGBOX_SELF" ] || rm -f "$file"
+        else
+            mkdir -p "$(dirname "$file")"
+            cp -p "$stem.data" "$file" || return 1
+        fi
+    done
+}
+
+_state_transaction() {
+    local backup was_running=0 status
+    backup=$(mktemp -d /tmp/sb-state-XXXXXX) || die "Не удалось сохранить рабочее состояние"
+    _is_running && was_running=1
+    _snapshot_state "$backup" || { rm -rf "$backup"; die "Не удалось сохранить рабочее состояние"; }
+    ( "$@" )
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        warn "Изменение отклонено; восстанавливаю прежние настройки"
+        _restore_state "$backup" || warn "Не все файлы состояния удалось восстановить"
+        if [ "$was_running" -eq 1 ]; then
+            if _is_running && health_check; then
+                _iptables_ready || setup_iptables
+            elif [ -x "$SINGBOX_INIT" ]; then
+                "$SINGBOX_INIT" restart >/dev/null 2>&1 || true
+                _wait_healthy 20 || warn "Прежнее соединение требует ручной проверки"
+            else
+                cleanup_iptables quiet
+                warn "Прежнее соединение требует ручного запуска"
+            fi
+        else
+            mkdir -p "$(dirname "$SINGBOX_DISABLED_FILE")"
+            : > "$SINGBOX_DISABLED_FILE"
+            chmod 600 "$SINGBOX_DISABLED_FILE"
+            [ ! -x "$SINGBOX_INIT" ] || "$SINGBOX_INIT" stop >/dev/null 2>&1 || true
+            cleanup_iptables quiet
+        fi
+    fi
+    rm -rf "$backup"
     return "$status"
 }
 
@@ -133,9 +233,44 @@ _download() {
     if command -v curl >/dev/null 2>&1; then
         curl -Lk --max-time 180 -o "$2" "$1"
     elif command -v uclient-fetch >/dev/null 2>&1; then
-        uclient-fetch --no-check-certificate -O "$2" "$1"
+        uclient-fetch --no-check-certificate -T 180 -O "$2" "$1"
     else
-        wget --no-check-certificate -O "$2" "$1"
+        wget --no-check-certificate -T 180 -O "$2" "$1"
+    fi
+}
+
+_busybox_has_applet() {
+    command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -Fqx "$1"
+}
+
+install_runtime_dependencies() {
+    local packages="" apk_packages=""
+    if ! command -v base64 >/dev/null 2>&1 && ! command -v openssl >/dev/null 2>&1 && ! _busybox_has_applet base64; then
+        packages="${packages} coreutils-base64"
+        apk_packages="${apk_packages} coreutils-base64"
+    fi
+    if ! ip -Version >/dev/null 2>&1; then
+        packages="${packages} ip-full"
+        apk_packages="${apk_packages} ip-full"
+    fi
+    if ! command -v iptables >/dev/null 2>&1 || ! iptables -j TPROXY -h >/dev/null 2>&1; then
+        packages="${packages} iptables-mod-tproxy"
+        apk_packages="${apk_packages} iptables-nft iptables-mod-tproxy"
+    fi
+    if ! command -v ip6tables >/dev/null 2>&1; then
+        packages="${packages} ip6tables"
+        apk_packages="${apk_packages} ip6tables-nft"
+    fi
+    [ -n "$packages" ] || return 0
+    info "Устанавливаю компоненты OpenWrt:${packages}"
+    if command -v opkg >/dev/null 2>&1; then
+        opkg update >/dev/null 2>&1 && opkg install $packages >/dev/null 2>&1 \
+            || die "Не удалось установить компоненты OpenWrt:${packages}"
+    elif command -v apk >/dev/null 2>&1; then
+        apk -U add $apk_packages >/dev/null 2>&1 \
+            || die "Не удалось установить компоненты OpenWrt:${apk_packages}"
+    else
+        die "Не хватает системных компонентов:${packages}"
     fi
 }
 
@@ -188,6 +323,8 @@ sync_rule_sets() {
 _b64dec() {
     if command -v base64 >/dev/null 2>&1; then
         base64 -d 2>/dev/null
+    elif _busybox_has_applet base64; then
+        busybox base64 -d 2>/dev/null
     elif command -v openssl >/dev/null 2>&1; then
         openssl base64 -d -A 2>/dev/null
     else
@@ -196,7 +333,7 @@ _b64dec() {
 }
 
 install_singbox() {
-    local installed arch archive url tmpdir bin new_bin
+    local installed arch archive url tmpdir bin new_bin previous
     installed=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 { print $3 }')
     if [ "$installed" = "$SINGBOX_VERSION" ]; then
         info "sing-box уже установлен: $installed"
@@ -213,19 +350,27 @@ install_singbox() {
     tmpdir=$(mktemp -d /tmp/singbox-XXXXXX)
 
     info "Скачиваю ${archive}..."
-    _download "$url" "$tmpdir/sb.tar.gz" || die "Ошибка скачивания sing-box"
-    [ -s "$tmpdir/sb.tar.gz" ] || die "Архив пустой (проверь интернет на роутере)"
+    _download "$url" "$tmpdir/sb.tar.gz" || { rm -rf "$tmpdir"; die "Ошибка скачивания sing-box"; }
+    [ -s "$tmpdir/sb.tar.gz" ] || { rm -rf "$tmpdir"; die "Архив пустой (проверь интернет на роутере)"; }
 
-    tar -xzf "$tmpdir/sb.tar.gz" -C "$tmpdir/" || die "Ошибка распаковки архива"
+    tar -xzf "$tmpdir/sb.tar.gz" -C "$tmpdir/" || { rm -rf "$tmpdir"; die "Ошибка распаковки архива"; }
 
     bin=$(find "$tmpdir" -name "sing-box" -type f | head -1)
-    [ -n "$bin" ] || die "Бинарник sing-box не найден в архиве"
+    [ -n "$bin" ] || { rm -rf "$tmpdir"; die "Бинарник sing-box не найден в архиве"; }
 
     new_bin="${SINGBOX_BIN}.new"
     cp "$bin" "$new_bin" && chmod +x "$new_bin" || { rm -rf "$tmpdir" "$new_bin"; die "Не удалось установить sing-box"; }
     "$new_bin" version >/dev/null 2>&1 \
         || { rm -rf "$tmpdir" "$new_bin"; die "Новый sing-box не запускается; старый бинарник сохранён"; }
+    if [ -s "$SINGBOX_CONFIG" ]; then
+        "$new_bin" check -c "$SINGBOX_CONFIG" >/dev/null 2>&1 \
+            || { rm -rf "$tmpdir" "$new_bin"; die "Новый sing-box несовместим с текущим конфигом; старый бинарник сохранён"; }
+    fi
+    previous="${SINGBOX_BIN}.previous"
+    [ ! -x "$SINGBOX_BIN" ] || cp "$SINGBOX_BIN" "$previous" \
+        || { rm -rf "$tmpdir" "$new_bin"; die "Не удалось сохранить предыдущий sing-box"; }
     mv "$new_bin" "$SINGBOX_BIN"
+    SINGBOX_BINARY_CHANGED=1
     rm -rf "$tmpdir"
     info "sing-box установлен: $("$SINGBOX_BIN" version 2>/dev/null | head -1)"
 }
@@ -234,7 +379,9 @@ install_singbox() {
 
 urldecode() {
     if command -v uhttpd >/dev/null 2>&1; then
-        uhttpd -d "$(printf '%s' "$1" | sed 's/+/ /g')"
+        local encoded="$1"
+        case "$encoded" in *+*) encoded=$(printf '%s' "$encoded" | sed 's/+/ /g') ;; esac
+        uhttpd -d "$encoded"
     else
         printf '%s' "$1" | sed \
             -e 's/%2[Ff]/\//g' -e 's/%2[Cc]/,/g' -e 's/%3[Dd]/=/g' \
@@ -244,7 +391,12 @@ urldecode() {
 }
 
 _query_value() {
-    printf '%s' "$1" | tr '&' '\n' | sed -n "s/^$2=//p" | head -1
+    local query="$1" key="$2" pair
+    while [ -n "$query" ]; do
+        pair=${query%%&*}
+        if [ "$pair" = "$query" ]; then query=""; else query=${query#*&}; fi
+        case "$pair" in "$key="*) printf '%s' "${pair#*=}"; return ;; esac
+    done
 }
 
 _b64url_decode() {
@@ -283,6 +435,43 @@ _parse_hostport() {
     [ "$SV_PORT" -ge 1 ] && [ "$SV_PORT" -le 65535 ] || die "Некорректный порт сервера"
 }
 
+_parse_hysteria2_hostport() {
+    local value="$1" host ports old_ifs token start end item first="" json=""
+    value="${value%/}"
+    case "$value" in
+        \[*\]:*) host="${value%%]*}"; host="${host#\[}"; ports="${value##*:}" ;;
+        *:*) host="${value%:*}"; ports="${value##*:}" ;;
+        *) host="$value"; ports=443 ;;
+    esac
+    [ -n "$host" ] || die "В Hysteria2-ссылке нет адреса сервера"
+    case "$ports" in *[!0-9,-]*|'') die "Некорректные порты Hysteria2" ;; esac
+    case "$ports" in
+        *,*|*-*)
+            old_ifs=$IFS; IFS=,; set -- $ports; IFS=$old_ifs
+            for token in "$@"; do
+                case "$token" in
+                    *-*)
+                        start="${token%%-*}"; end="${token#*-}"
+                        case "$start:$end" in *[!0-9:]*) die "Некорректный диапазон портов Hysteria2" ;; esac
+                        [ -n "$start" ] && [ -n "$end" ] && [ "$start" -ge 1 ] && [ "$end" -le 65535 ] && [ "$start" -le "$end" ] \
+                            || die "Некорректный диапазон портов Hysteria2"
+                        item="\"${start}:${end}\""
+                        ;;
+                    *)
+                        [ "$token" -ge 1 ] && [ "$token" -le 65535 ] || die "Некорректный порт Hysteria2"
+                        start="$token"; item="\"${token}:${token}\""
+                        ;;
+                esac
+                [ -n "$first" ] || first="$start"
+                [ -z "$json" ] || json="${json},"
+                json="${json}${item}"
+            done
+            SV_HOST="$host"; SV_PORT="$first"; SV_SERVER_PORTS="$json"
+            ;;
+        *) _parse_hostport "$value" 443 ;;
+    esac
+}
+
 _parse_v2ray_query() {
     local query="$1"
     SV_TYPE=$(_query_value "$query" type)
@@ -295,12 +484,15 @@ _parse_v2ray_query() {
     SV_PBK=$(_query_value "$query" pbk)
     SV_SID=$(_query_value "$query" sid)
     SV_FLOW=$(_query_value "$query" flow)
+    SV_PACKET_ENCODING=$(_query_value "$query" packetEncoding)
+    [ -n "$SV_PACKET_ENCODING" ] || SV_PACKET_ENCODING=$(_query_value "$query" packet_encoding)
     SV_INSECURE=$(_query_value "$query" allowInsecure)
     [ -n "$SV_INSECURE" ] || SV_INSECURE=$(_query_value "$query" insecure)
     SV_TYPE="${SV_TYPE:-tcp}"
     SV_SEC="${SV_SEC:-none}"
     SV_FP="${SV_FP:-chrome}"
     case "$SV_TYPE" in tcp|ws|grpc) ;; *) die "Транспорт '$SV_TYPE' пока не поддерживается" ;; esac
+    case "$SV_PACKET_ENCODING" in ''|packetaddr|xudp) ;; *) die "Некорректный packet encoding" ;; esac
     case "$SV_INSECURE" in ''|0|false) SV_INSECURE=false ;; 1|true) SV_INSECURE=true ;;
         *) die "Некорректный allowInsecure" ;; esac
 }
@@ -308,7 +500,6 @@ _parse_v2ray_query() {
 parse_vless() {
     local url="$1"
     case "$url" in vless://*) ;; *) die "Некорректная VLESS-ссылка" ;; esac
-    printf '%s' "$url" | LC_ALL=C grep -q '[[:cntrl:]]' && die "VLESS-ссылка содержит управляющие символы"
     local rest="${url#vless://}"
     SV_UUID="${rest%%@*}"
     local after_at="${rest#*@}"
@@ -340,6 +531,8 @@ parse_vmess() {
     SV_FP=$(printf '%s' "$payload" | _json_value fp)
     SV_SECURITY=$(printf '%s' "$payload" | _json_value scy)
     SV_ALTER_ID=$(printf '%s' "$payload" | _json_value aid)
+    SV_PACKET_ENCODING=$(printf '%s' "$payload" | _json_value packetEncoding)
+    [ -n "$SV_PACKET_ENCODING" ] || SV_PACKET_ENCODING=$(printf '%s' "$payload" | _json_value packet_encoding)
     SV_NAME=$(printf '%s' "$payload" | _json_value ps)
     SV_TYPE="${SV_TYPE:-tcp}"; SV_SEC="${SV_SEC:-none}"; SV_SECURITY="${SV_SECURITY:-auto}"
     SV_FP="${SV_FP:-chrome}"; SV_ALTER_ID="${SV_ALTER_ID:-0}"; SV_INSECURE=false
@@ -347,6 +540,7 @@ parse_vmess() {
     case "$SV_SEC" in none|tls) ;; *) die "Security VMess '$SV_SEC' пока не поддерживается" ;; esac
     case "$SV_SECURITY" in auto|none|zero|aes-128-gcm|chacha20-poly1305|aes-128-ctr) ;;
         *) die "Некорректное шифрование VMess" ;; esac
+    case "$SV_PACKET_ENCODING" in ''|packetaddr|xudp) ;; *) die "Некорректный packet encoding VMess" ;; esac
     case "$SV_ALTER_ID" in ''|*[!0-9]*) die "Некорректный alterId VMess" ;; esac
     _parse_hostport "${SV_HOST}:${SV_PORT}" ""
     [ -n "$SV_UUID" ] || die "В VMess-ссылке нет UUID"
@@ -355,7 +549,6 @@ parse_vmess() {
 
 parse_trojan() {
     local rest="${1#trojan://}" after_at hostport query
-    printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]' && die "Trojan-ссылка содержит управляющие символы"
     SV_PASSWORD=$(urldecode "${rest%%@*}")
     after_at="${rest#*@}"; hostport="${after_at%%\?*}"; hostport="${hostport%%#*}"
     query="${after_at#*\?}"; query="${query%%#*}"
@@ -398,7 +591,7 @@ parse_hysteria2() {
     after_at="${rest#*@}"; hostport="${after_at%%\?*}"; hostport="${hostport%%#*}"
     query="${after_at#*\?}"; query="${query%%#*}"
     [ "$after_at" != "$rest" ] && [ -n "$SV_PASSWORD" ] || die "В Hysteria2-ссылке нет пароля"
-    _parse_hostport "$hostport" "443"
+    _parse_hysteria2_hostport "$hostport"
     SV_SNI=$(urldecode "$(_query_value "$query" sni)"); SV_SNI="${SV_SNI:-$SV_HOST}"
     SV_INSECURE=$(_query_value "$query" insecure)
     case "$SV_INSECURE" in ''|0|false) SV_INSECURE=false ;; 1|true) SV_INSECURE=true ;;
@@ -424,7 +617,13 @@ parse_tuic() {
     case "$SV_INSECURE" in ''|0|false) SV_INSECURE=false ;; 1|true) SV_INSECURE=true ;;
         *) die "Некорректный allow_insecure TUIC" ;; esac
     SV_CONGESTION=$(_query_value "$query" congestion_control); SV_CONGESTION="${SV_CONGESTION:-cubic}"
-    SV_UDP_RELAY=$(_query_value "$query" udp_relay_mode); SV_UDP_RELAY="${SV_UDP_RELAY:-native}"
+    SV_UDP_RELAY=$(_query_value "$query" udp_relay_mode)
+    SV_UDP_OVER_STREAM=$(_query_value "$query" udp_over_stream)
+    case "$SV_UDP_OVER_STREAM" in ''|0|false) SV_UDP_OVER_STREAM=false ;; 1|true) SV_UDP_OVER_STREAM=true ;;
+        *) die "Некорректный udp_over_stream TUIC" ;; esac
+    [ "$SV_UDP_OVER_STREAM" != true ] || [ -z "$SV_UDP_RELAY" ] \
+        || die "TUIC udp_over_stream конфликтует с udp_relay_mode"
+    [ -n "$SV_UDP_RELAY" ] || SV_UDP_RELAY=native
     case "$SV_CONGESTION" in cubic|new_reno|bbr) ;; *) die "Некорректный congestion_control TUIC" ;; esac
     case "$SV_UDP_RELAY" in native|quic) ;; *) die "Некорректный udp_relay_mode TUIC" ;; esac
 }
@@ -433,7 +632,8 @@ parse_server() {
     SV_NAME=""; SV_PROTOCOL=""; SV_HOST=""; SV_PORT=""; SV_TYPE=""; SV_SEC=""; SV_UUID=""
     SV_PASSWORD=""; SV_PATH=""; SV_SNI=""; SV_HOST_HDR=""; SV_FP=""; SV_PBK=""; SV_SID=""
     SV_FLOW=""; SV_INSECURE=false; SV_SECURITY=""; SV_ALTER_ID=""; SV_METHOD=""; SV_PLUGIN=""
-    SV_OBFS=""; SV_OBFS_PASSWORD=""; SV_CONGESTION=""; SV_UDP_RELAY=""
+    SV_OBFS=""; SV_OBFS_PASSWORD=""; SV_CONGESTION=""; SV_UDP_RELAY=""; SV_SERVER_PORTS=""
+    SV_UDP_OVER_STREAM=false; SV_PACKET_ENCODING=""
     [ "${#1}" -le 8192 ] || die "Ссылка сервера слишком длинная"
     printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]' && die "Ссылка содержит управляющие символы"
     case "$1" in
@@ -475,11 +675,12 @@ server_protocol_key() {
 }
 
 _emit_v2ray_transport() {
-    local path host_hdr
+    local path host_hdr headers=""
     path=$(_json_escape "$SV_PATH")
-    host_hdr=$(_json_escape "${SV_HOST_HDR:-$SV_SNI}")
+    host_hdr=$(_json_escape "$SV_HOST_HDR")
+    [ -z "$host_hdr" ] || headers=",\"headers\":{\"Host\":\"${host_hdr}\"}"
     case "$SV_TYPE" in
-        ws) printf '"transport":{"type":"ws","path":"%s","headers":{"Host":"%s"}},' "$path" "$host_hdr" ;;
+        ws) printf '"transport":{"type":"ws","path":"%s"%s},' "$path" "$headers" ;;
         grpc) printf '"transport":{"type":"grpc","service_name":"%s"},' "$path" ;;
     esac
 }
@@ -499,18 +700,20 @@ _emit_tls() {
 }
 
 _emit_outbound() {
-    local tag="$1" host uuid password flow tls tr obfs
+    local tag="$1" host uuid password flow tls tr obfs packet_encoding udp_mode server_port
     host=$(_json_escape "$SV_HOST"); uuid=$(_json_escape "$SV_UUID")
     password=$(_json_escape "$SV_PASSWORD"); tls=$(_emit_tls); tr=$(_emit_v2ray_transport)
     case "$SV_PROTOCOL" in
         vless)
             flow=""; [ -n "$SV_FLOW" ] && flow="\"flow\":\"$(_json_escape "$SV_FLOW")\","
-            printf '{"type":"vless","tag":"%s","server":"%s","server_port":%s,"uuid":"%s",%s%s%s"packet_encoding":"xudp"}' \
-                "$tag" "$host" "$SV_PORT" "$uuid" "$flow" "$tls" "$tr"
+            packet_encoding=""; [ -n "$SV_PACKET_ENCODING" ] && packet_encoding="\"packet_encoding\":\"${SV_PACKET_ENCODING}\","
+            printf '{"type":"vless","tag":"%s","server":"%s","server_port":%s,"uuid":"%s",%s%s%s%s"tcp_keep_alive":"2m","tcp_keep_alive_interval":"30s"}' \
+                "$tag" "$host" "$SV_PORT" "$uuid" "$flow" "$tls" "$tr" "$packet_encoding"
             ;;
         vmess)
-            printf '{"type":"vmess","tag":"%s","server":"%s","server_port":%s,"uuid":"%s","security":"%s","alter_id":%s,%s%s"packet_encoding":"xudp"}' \
-                "$tag" "$host" "$SV_PORT" "$uuid" "$(_json_escape "$SV_SECURITY")" "$SV_ALTER_ID" "$tls" "$tr"
+            packet_encoding=""; [ -n "$SV_PACKET_ENCODING" ] && packet_encoding="\"packet_encoding\":\"${SV_PACKET_ENCODING}\","
+            printf '{"type":"vmess","tag":"%s","server":"%s","server_port":%s,"uuid":"%s","security":"%s","alter_id":%s,%s%s%s"tcp_keep_alive":"2m","tcp_keep_alive_interval":"30s"}' \
+                "$tag" "$host" "$SV_PORT" "$uuid" "$(_json_escape "$SV_SECURITY")" "$SV_ALTER_ID" "$tls" "$tr" "$packet_encoding"
             ;;
         trojan)
             printf '{"type":"trojan","tag":"%s","server":"%s","server_port":%s,"password":"%s",%s%s}' \
@@ -522,14 +725,38 @@ _emit_outbound() {
             ;;
         hysteria2)
             obfs=""; [ -n "$SV_OBFS" ] && obfs="\"obfs\":{\"type\":\"${SV_OBFS}\",\"password\":\"$(_json_escape "$SV_OBFS_PASSWORD")\"},"
-            printf '{"type":"hysteria2","tag":"%s","server":"%s","server_port":%s,"password":"%s",%s"tls":{"enabled":true,"server_name":"%s","insecure":%s}}' \
-                "$tag" "$host" "$SV_PORT" "$password" "$obfs" "$(_json_escape "$SV_SNI")" "$SV_INSECURE"
+            if [ -n "$SV_SERVER_PORTS" ]; then server_port="\"server_ports\":[${SV_SERVER_PORTS}]"; else server_port="\"server_port\":${SV_PORT}"; fi
+            printf '{"type":"hysteria2","tag":"%s","server":"%s",%s,"password":"%s",%s"tls":{"enabled":true,"server_name":"%s","insecure":%s}}' \
+                "$tag" "$host" "$server_port" "$password" "$obfs" "$(_json_escape "$SV_SNI")" "$SV_INSECURE"
             ;;
         tuic)
-            printf '{"type":"tuic","tag":"%s","server":"%s","server_port":%s,"uuid":"%s","password":"%s","congestion_control":"%s","udp_relay_mode":"%s","tls":{"enabled":true,"server_name":"%s","insecure":%s}}' \
-                "$tag" "$host" "$SV_PORT" "$uuid" "$password" "$SV_CONGESTION" "$SV_UDP_RELAY" "$(_json_escape "$SV_SNI")" "$SV_INSECURE"
+            if [ "$SV_UDP_OVER_STREAM" = true ]; then udp_mode='"udp_over_stream":true'; else udp_mode="\"udp_relay_mode\":\"${SV_UDP_RELAY}\""; fi
+            printf '{"type":"tuic","tag":"%s","server":"%s","server_port":%s,"uuid":"%s","password":"%s","congestion_control":"%s",%s,"tls":{"enabled":true,"server_name":"%s","insecure":%s}}' \
+                "$tag" "$host" "$SV_PORT" "$uuid" "$password" "$SV_CONGESTION" "$udp_mode" "$(_json_escape "$SV_SNI")" "$SV_INSECURE"
             ;;
     esac
+}
+
+_emit_outbound_set() {
+    local selected default_tag="" tags="" url tag i=0
+    selected=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
+    while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        i=$((i + 1)); tag="server-${i}"
+        parse_server "$url"
+        [ "$i" -eq 1 ] || printf ',\n'
+        printf '    '
+        _emit_outbound "$tag"
+        [ -z "$tags" ] || tags="${tags},"
+        tags="${tags}\"${tag}\""
+        [ "$url" != "$selected" ] || default_tag="$tag"
+    done < "$SINGBOX_SERVERS_FILE" 2>/dev/null
+    [ "$i" -gt 0 ] || die "Список серверов пуст"
+    [ -n "$default_tag" ] || default_tag=server-1
+    [ ! -f "$SINGBOX_AUTO_FILE" ] || default_tag=auto
+    printf ',\n    {"type":"urltest","tag":"auto","outbounds":[%s],"interval":"1m","interrupt_exist_connections":false},\n' "$tags"
+    printf '    {"type":"selector","tag":"proxy","outbounds":["auto",%s],"default":"%s","interrupt_exist_connections":false},\n' "$tags" "$default_tag"
+    printf '    {"type":"direct","tag":"direct"}'
 }
 
 # ─── Источники и выбор сервера ──────────────────────────────────────────────
@@ -558,8 +785,20 @@ _subscription_servers() {
     rm -f "$raw" "$decoded"
 }
 
+_preserve_selected_server() {
+    local old="$1" file="$2" line identity
+    if [ -n "$old" ]; then
+        grep -Fqx "$old" "$file" && { printf '%s\n' "$old"; return; }
+        identity=${old%%#*}
+        while IFS= read -r line; do
+            [ "${line%%#*}" != "$identity" ] || { printf '%s\n' "$line"; return; }
+        done < "$file"
+    fi
+    head -1 "$file"
+}
+
 refresh_subscription() {
-    local url="${1:-}" tmp selected old active_config check_config
+    local url="${1:-}" tmp selected old check_config selected_file
     [ -n "$url" ] || url=$(cat "$SINGBOX_SUB_FILE" 2>/dev/null)
     case "$url" in http://*|https://*) ;; *) die "URL подписки не настроен" ;; esac
     info "Обновляю список серверов..."
@@ -567,21 +806,26 @@ refresh_subscription() {
     tmp=$(mktemp /tmp/sb-servers-XXXXXX) || die "Не удалось создать временный файл"
     _subscription_servers "$url" "$tmp"
     old=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
-    if [ -n "$old" ] && grep -Fqx "$old" "$tmp"; then selected="$old"; else selected=$(head -1 "$tmp"); fi
+    selected=$(_preserve_selected_server "$old" "$tmp")
     parse_server "$selected"
     if [ -x "$SINGBOX_BIN" ]; then
         sync_rule_sets 0
-        active_config="$SINGBOX_CONFIG"
         check_config="${tmp}.json"
-        SINGBOX_CONFIG="$check_config"
-        gen_config >/dev/null
-        rm -f "$check_config"
-        SINGBOX_CONFIG="$active_config"
+        selected_file="${tmp}.selected"
+        printf '%s\n' "$selected" > "$selected_file"
+        (
+            SINGBOX_SERVERS_FILE="$tmp"
+            SINGBOX_VLESS_FILE="$selected_file"
+            SINGBOX_CONFIG="$check_config"
+            gen_config >/dev/null
+        ) || { rm -f "$tmp" "$check_config" "$selected_file"; die "Новая подписка не прошла проверку"; }
+        rm -f "$check_config" "$selected_file"
     fi
     mv "$tmp" "$SINGBOX_SERVERS_FILE"
     printf '%s\n' "$selected" > "${SINGBOX_VLESS_FILE}.new"
     mv "${SINGBOX_VLESS_FILE}.new" "$SINGBOX_VLESS_FILE"
     chmod 600 "$SINGBOX_SERVERS_FILE" "$SINGBOX_VLESS_FILE"
+    [ -n "$old" ] || : > "$SINGBOX_AUTO_FILE"
     rm -f "$SINGBOX_PING_FILE"
 }
 
@@ -620,16 +864,25 @@ EOF
     awk '!seen[$0]++' "$tmp" > "$unique"
     rm -f "$tmp"
     old=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
-    if [ -n "$old" ] && grep -Fqx "$old" "$unique"; then selected="$old"; else selected=$(head -1 "$unique"); fi
+    selected=$(_preserve_selected_server "$old" "$unique")
     mv "$unique" "$SINGBOX_SERVERS_FILE"
     printf '%s\n' "$selected" > "${SINGBOX_VLESS_FILE}.new"
     mv "${SINGBOX_VLESS_FILE}.new" "$SINGBOX_VLESS_FILE"
     chmod 600 "$SINGBOX_SERVERS_FILE" "$SINGBOX_VLESS_FILE"
+    [ -n "$old" ] || : > "$SINGBOX_AUTO_FILE"
     rm -f "$SINGBOX_SUB_FILE" "$SINGBOX_PING_FILE"
 }
 
 select_server() {
-    case "$1" in ''|*[!0-9]*) die "Некорректный номер сервера" ;; esac
+    case "$1" in
+        auto|0)
+            mkdir -p "$(dirname "$SINGBOX_AUTO_FILE")"
+            : > "$SINGBOX_AUTO_FILE"
+            SELECTED_TAG=auto
+            return 0
+            ;;
+        ''|*[!0-9]*) die "Некорректный номер сервера" ;;
+    esac
     local selected
     selected=$(sed -n "${1}p" "$SINGBOX_SERVERS_FILE" 2>/dev/null)
     [ -n "$selected" ] || die "Сервер не найден"
@@ -637,11 +890,54 @@ select_server() {
     printf '%s\n' "$selected" > "${SINGBOX_VLESS_FILE}.new"
     mv "${SINGBOX_VLESS_FILE}.new" "$SINGBOX_VLESS_FILE"
     chmod 600 "$SINGBOX_VLESS_FILE"
+    rm -f "$SINGBOX_AUTO_FILE"
+    SELECTED_TAG="server-$1"
+}
+
+_switch_selector_live() {
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -fsS --max-time 5 -X PUT -H 'Content-Type: application/json' \
+        --data "{\"name\":\"$(_json_escape "$1")\"}" \
+        http://127.0.0.1:9090/proxies/proxy >/dev/null 2>&1
+}
+
+apply_server_selection() {
+    local old_tag=server-1 old_url url i=0
+    old_url=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
+    if [ -f "$SINGBOX_AUTO_FILE" ]; then
+        old_tag=auto
+    else
+        while IFS= read -r url; do
+            [ -n "$url" ] || continue
+            i=$((i + 1))
+            [ "$url" != "$old_url" ] || { old_tag="server-$i"; break; }
+        done < "$SINGBOX_SERVERS_FILE" 2>/dev/null
+    fi
+    select_server "$1"
+    load_source || die "Список серверов пуст"
+    gen_config
+    if [ -f "$SINGBOX_DISABLED_FILE" ]; then
+        info "Выбор сохранён; туннель оставлен остановленным"
+    elif _is_running && _switch_selector_live "$SELECTED_TAG"; then
+        if _wait_healthy 12; then
+            cp "$SINGBOX_CONFIG" "$SINGBOX_GOOD_CONFIG"
+            info "Сервер переключён без перезапуска sing-box"
+        else
+            _switch_selector_live "$old_tag" || true
+            die "Выбранный сервер не прошёл проверку соединения"
+        fi
+    else
+        start_singbox
+    fi
 }
 
 # Загружает уже выбранный сервер, не сбрасывая выбор при перезапуске.
 load_source() {
     SV_HOST=""
+    if [ ! -s "$SINGBOX_SERVERS_FILE" ] && [ -s "$SINGBOX_VLESS_FILE" ]; then
+        cp "$SINGBOX_VLESS_FILE" "$SINGBOX_SERVERS_FILE"
+        chmod 600 "$SINGBOX_SERVERS_FILE"
+    fi
     if [ ! -s "$SINGBOX_VLESS_FILE" ] && [ -s "$SINGBOX_SERVERS_FILE" ]; then
         head -1 "$SINGBOX_SERVERS_FILE" > "$SINGBOX_VLESS_FILE"
         chmod 600 "$SINGBOX_VLESS_FILE"
@@ -657,7 +953,7 @@ server_name() {
     local url="$1" fragment parsed
     fragment="${url#*#}"
     [ "$fragment" = "$url" ] && fragment=""
-    fragment=$(urldecode "$fragment")
+    case "$fragment" in *%*|*+*) fragment=$(urldecode "$fragment") ;; esac
     if [ -n "$fragment" ]; then
         printf '%s' "$fragment"
     elif [ "${url#vmess://}" != "$url" ]; then
@@ -669,12 +965,25 @@ server_name() {
 }
 
 server_host() {
+    case "$1" in
+        vless://*|trojan://*|hysteria2://*|hy2://*|tuic://*)
+            local rest="${1#*://}" hostport
+            rest="${rest#*@}"; hostport="${rest%%\?*}"; hostport="${hostport%%#*}"; hostport="${hostport%/}"
+            [ -n "$hostport" ] && { printf '%s' "$hostport"; return; }
+            ;;
+    esac
     (parse_server "$1" >/dev/null 2>&1 && printf '%s:%s' "$SV_HOST" "$SV_PORT") || printf 'неизвестный сервер'
 }
 
 server_flag() {
-    local hint
-    hint=" $(printf '%s %s' "$(server_name "$1")" "$(server_host "$1")" | tr '[:upper:]' '[:lower:]') "
+    local hint name="${2:-}" host="${3:-}"
+    [ -n "$name" ] || name=$(server_name "$1")
+    [ -n "$host" ] || host=$(server_host "$1")
+    hint=" $name $host "
+    case "$hint" in
+        *🇳🇱*|*🇩🇪*|*🇺🇸*|*🇬🇧*|*🇫🇷*|*🇫🇮*|*🇸🇪*|*🇳🇴*|*🇨🇭*|*🇵🇱*|*🇨🇿*|*🇦🇹*|*🇪🇸*|*🇮🇹*|*🇨🇦*|*🇯🇵*|*🇸🇬*|*🇰🇷*|*🇭🇰*|*🇦🇪*|*🇮🇳*|*🇦🇺*|*🇧🇷*|*🇹🇷*|*🇰🇿*|*🇷🇺*) ;;
+        *) hint=" $(printf '%s %s' "$name" "$host" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz') " ;;
+    esac
     case "$hint" in
         *🇳🇱*|*netherlands*|*amsterdam*|*" nl "*) printf '🇳🇱' ;;
         *🇩🇪*|*germany*|*frankfurt*|*" de "*) printf '🇩🇪' ;;
@@ -742,7 +1051,7 @@ refresh_pings() {
 
 normalize_domains() {
     # stdin: произвольный список; stdout: по одному безопасному домену на строку.
-    tr -d '\r' | tr '[:upper:] ,;\t' '[:lower:]\n\n\n\n' |
+    tr -d '\r' | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' | tr ' ,;\t' '\n\n\n\n' |
         sed -e 's#^[a-z][a-z0-9+.-]*://##' -e 's#/.*##' -e 's/[?#].*//' -e 's/:[0-9]*$//' \
             -e 's/^\*\.//' -e 's/^\.//' -e 's/\.$//' -e '/^$/d' |
         awk '{
@@ -760,13 +1069,13 @@ gen_config() {
     mkdir -p "$(dirname "$SINGBOX_CONFIG")"
     [ -n "$SV_HOST" ] || die "Не задан сервер"
 
-    local main_obj mode final rules domain domain_json escaped telegram_calls refilter russia rule_sets tmp
-    main_obj=$(_emit_outbound "proxy")
+    local mode final rules domain domain_json escaped telegram_calls refilter russia rule_sets tmp
     mode=$(cat "$SINGBOX_MODE_FILE" 2>/dev/null)
     [ "$mode" = "list" ] || mode="all"
     if [ "$mode" = "list" ]; then
         final="direct"
-        rules='      { "action": "sniff" },
+        rules='      { "inbound": "health-in", "action": "route", "outbound": "proxy" },
+      { "action": "sniff" },
       { "ip_is_private": true, "action": "route", "outbound": "direct" }'
         domain_json=""
         while IFS= read -r domain; do
@@ -781,7 +1090,8 @@ gen_config() {
         fi
     else
         final="proxy"
-        rules='      { "ip_is_private": true, "action": "route", "outbound": "direct" }'
+        rules='      { "inbound": "health-in", "action": "route", "outbound": "proxy" },
+      { "ip_is_private": true, "action": "route", "outbound": "direct" }'
     fi
     rule_sets=""
     refilter=$(cat "$SINGBOX_REFILTER_FILE" 2>/dev/null)
@@ -813,11 +1123,14 @@ gen_config() {
   "inbounds": [
     { "type": "socks",  "tag": "socks-in",  "listen": "0.0.0.0", "listen_port": 1080 },
     { "type": "http",   "tag": "http-in",   "listen": "0.0.0.0", "listen_port": 1081 },
-    { "type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": 12345 }
+    { "type": "http",   "tag": "health-in", "listen": "127.0.0.1", "listen_port": 1082 },
+    { "type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": 12345 },
+    { "type": "tproxy", "tag": "tproxy6-in", "listen": "::", "listen_port": 12346 }
   ],
   "outbounds": [
-    ${main_obj},
-    { "type": "direct", "tag": "direct" }
+EOF
+    _emit_outbound_set >> "$tmp"
+    cat >> "$tmp" <<EOF
   ],
   "route": {
     "rules": [
@@ -827,7 +1140,8 @@ ${rules}
 ${rule_sets}
     ],
     "final": "${final}"
-  }
+  },
+  "experimental": { "clash_api": { "external_controller": "127.0.0.1:9090" } }
 }
 EOF
     chmod 600 "$tmp"
@@ -841,70 +1155,257 @@ EOF
 
 # ─── TPROXY iptables ─────────────────────────────────────────────────────────
 
+_lan_interfaces() {
+    local zone networks network device result=""
+    if [ -n "${SINGBOX_LAN_INTERFACES:-}" ]; then
+        printf '%s\n' $SINGBOX_LAN_INTERFACES
+        return
+    fi
+    if command -v uci >/dev/null 2>&1; then
+        zone=$(uci -q show firewall | sed -n "s/^firewall\.\([^=]*\)\.name='lan'$/\1/p" | head -1)
+        [ -z "$zone" ] || networks=$(uci -q get "firewall.${zone}.network")
+        [ -n "$networks" ] || networks=lan
+        for network in $networks; do
+            device=$(uci -q get "network.${network}.device")
+            [ -n "$device" ] || device=$(uci -q get "network.${network}.ifname")
+            [ -n "$device" ] || [ "$network" != lan ] || device=br-lan
+            case " $result " in *" $device "*) ;; *) [ -z "$device" ] || result="${result} ${device}" ;; esac
+        done
+    fi
+    [ -n "$result" ] && printf '%s\n' $result || printf '%s\n' br-lan
+}
+
+_ipv6_active() {
+    command -v ip >/dev/null 2>&1 && ip -6 route show default 2>/dev/null | grep -q .
+}
+
+_iptables_ready() {
+    local br
+    iptables -t mangle -S "$IPTABLES_CHAIN" >/dev/null 2>&1 || return 1
+    ip rule show 2>/dev/null | grep -Eq "fwmark (0x)?0*2333(/0xffffffff)? .*lookup ${TPROXY_TABLE}" || return 1
+    ip route show table "$TPROXY_TABLE" 2>/dev/null | grep -q 'dev lo' || return 1
+    for br in $(_lan_interfaces); do
+        iptables -t mangle -C PREROUTING -i "$br" -j "$IPTABLES_CHAIN" >/dev/null 2>&1 || return 1
+    done
+    if _ipv6_active; then
+        command -v ip6tables >/dev/null 2>&1 || return 1
+        ip6tables -t mangle -S "$IP6TABLES_CHAIN" >/dev/null 2>&1 || return 1
+        ip -6 rule show 2>/dev/null | grep -Eq "fwmark (0x)?0*2333(/0xffffffff)? .*lookup ${TPROXY_TABLE}" || return 1
+        ip -6 route show table "$TPROXY_TABLE" 2>/dev/null | grep -q 'dev lo' || return 1
+        for br in $(_lan_interfaces); do
+            ip6tables -t mangle -C PREROUTING -i "$br" -j "$IP6TABLES_CHAIN" >/dev/null 2>&1 || return 1
+        done
+    fi
+}
+
 setup_iptables() {
-    info "Настраиваю iptables TPROXY..."
-
+    local br bridges added=0
+    command -v ip >/dev/null 2>&1 || die "Не найдена команда ip"
+    command -v iptables >/dev/null 2>&1 || die "Не найден iptables с поддержкой TPROXY"
+    bridges=$(_lan_interfaces)
+    [ -n "$bridges" ] || die "Не найден LAN-интерфейс"
     cleanup_iptables quiet
-
-    ip rule add fwmark 0x1 table 100 2>/dev/null || true
-    ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
-
-    iptables -t mangle -N "$IPTABLES_CHAIN"
-
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 0.0.0.0/8      -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 10.0.0.0/8     -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 127.0.0.0/8    -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 169.254.0.0/16 -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 172.16.0.0/12  -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 192.168.0.0/16 -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 224.0.0.0/4    -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -d 240.0.0.0/4    -j RETURN
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 22 -j RETURN
-
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp -j TPROXY --on-port 12345 --tproxy-mark 1
-    iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -j TPROXY --on-port 12345 --tproxy-mark 1
-
-    for br in br-lan br0 eth1; do
-        iptables -t mangle -A PREROUTING -i "$br" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    ip rule add priority "$TPROXY_RULE_PRIORITY" fwmark "${TPROXY_MARK}/0xffffffff" table "$TPROXY_TABLE" >/dev/null 2>&1 &&
+        ip route add local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" >/dev/null 2>&1 &&
+        iptables -t mangle -N "$IPTABLES_CHAIN" >/dev/null 2>&1 \
+        || { cleanup_iptables quiet; die "Не удалось создать IPv4 TPROXY route"; }
+    for br in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+        iptables -t mangle -A "$IPTABLES_CHAIN" -d "$br" -j RETURN >/dev/null 2>&1 \
+            || { cleanup_iptables quiet; die "Не удалось заполнить IPv4 TPROXY chain"; }
+    done
+    iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp --dport 22 -j RETURN >/dev/null 2>&1 &&
+        iptables -t mangle -A "$IPTABLES_CHAIN" -p tcp -j TPROXY --on-port 12345 --tproxy-mark "${TPROXY_MARK}/0xffffffff" >/dev/null 2>&1 &&
+        iptables -t mangle -A "$IPTABLES_CHAIN" -p udp -j TPROXY --on-port 12345 --tproxy-mark "${TPROXY_MARK}/0xffffffff" >/dev/null 2>&1 \
+        || { cleanup_iptables quiet; die "Ядро не поддерживает IPv4 TPROXY"; }
+    for br in $bridges; do
+        iptables -t mangle -A PREROUTING -i "$br" -j "$IPTABLES_CHAIN" >/dev/null 2>&1 \
+            || { cleanup_iptables quiet; die "Не удалось подключить TPROXY к $br"; }
+        added=$((added + 1))
     done
 
+    if _ipv6_active; then
+        command -v ip6tables >/dev/null 2>&1 || { cleanup_iptables quiet; die "IPv6 активен, но ip6tables отсутствует"; }
+        ip -6 rule add priority "$TPROXY_RULE_PRIORITY" fwmark "${TPROXY_MARK}/0xffffffff" table "$TPROXY_TABLE" >/dev/null 2>&1 &&
+            ip -6 route add local ::/0 dev lo table "$TPROXY_TABLE" >/dev/null 2>&1 &&
+            ip6tables -t mangle -N "$IP6TABLES_CHAIN" >/dev/null 2>&1 \
+            || { cleanup_iptables quiet; die "Не удалось создать IPv6 TPROXY route"; }
+        for br in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8; do
+            ip6tables -t mangle -A "$IP6TABLES_CHAIN" -d "$br" -j RETURN >/dev/null 2>&1 \
+                || { cleanup_iptables quiet; die "Не удалось заполнить IPv6 TPROXY chain"; }
+        done
+        ip6tables -t mangle -A "$IP6TABLES_CHAIN" -p tcp --dport 22 -j RETURN >/dev/null 2>&1 &&
+            ip6tables -t mangle -A "$IP6TABLES_CHAIN" -p tcp -j TPROXY --on-port 12346 --tproxy-mark "${TPROXY_MARK}/0xffffffff" >/dev/null 2>&1 &&
+            ip6tables -t mangle -A "$IP6TABLES_CHAIN" -p udp -j TPROXY --on-port 12346 --tproxy-mark "${TPROXY_MARK}/0xffffffff" >/dev/null 2>&1 \
+            || { cleanup_iptables quiet; die "Ядро не поддерживает IPv6 TPROXY"; }
+        for br in $bridges; do
+            ip6tables -t mangle -A PREROUTING -i "$br" -j "$IP6TABLES_CHAIN" >/dev/null 2>&1 \
+                || { cleanup_iptables quiet; die "Не удалось подключить IPv6 TPROXY к $br"; }
+        done
+    fi
+    [ "$added" -gt 0 ] || { cleanup_iptables quiet; die "TPROXY не подключён ни к одному LAN-интерфейсу"; }
     info "TPROXY настроен"
 }
 
-cleanup_iptables() {
-    local br
-    for br in br-lan br0 eth1; do
-        while iptables -t mangle -D PREROUTING -i "$br" -j "$IPTABLES_CHAIN" 2>/dev/null; do :; done
+_delete_chain_hooks() {
+    local firewall="$1" chain="$2" rule
+    while :; do
+        rule=$("$firewall" -t mangle -S PREROUTING 2>/dev/null |
+            awk -v chain="$chain" '$1 == "-A" && $2 == "PREROUTING" && $(NF-1) == "-j" && $NF == chain { $1="-D"; print; exit }')
+        [ -n "$rule" ] || return 0
+        set -- $rule
+        "$firewall" -t mangle "$@" >/dev/null 2>&1 || return 1
     done
-    while iptables -t mangle -D PREROUTING -j "$IPTABLES_CHAIN" 2>/dev/null; do :; done
-    iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
-    while ip rule del fwmark 0x1 table 100 2>/dev/null; do :; done
-    while ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null; do :; done
+}
+
+cleanup_iptables() {
+    if command -v iptables >/dev/null 2>&1; then
+        _delete_chain_hooks iptables "$IPTABLES_CHAIN" || true
+        iptables -t mangle -F "$IPTABLES_CHAIN" 2>/dev/null || true
+        iptables -t mangle -X "$IPTABLES_CHAIN" 2>/dev/null || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        _delete_chain_hooks ip6tables "$IP6TABLES_CHAIN" || true
+        ip6tables -t mangle -F "$IP6TABLES_CHAIN" 2>/dev/null || true
+        ip6tables -t mangle -X "$IP6TABLES_CHAIN" 2>/dev/null || true
+    fi
+    while ip rule del priority "$TPROXY_RULE_PRIORITY" fwmark "${TPROXY_MARK}/0xffffffff" table "$TPROXY_TABLE" 2>/dev/null; do :; done
+    while ip -6 rule del priority "$TPROXY_RULE_PRIORITY" fwmark "${TPROXY_MARK}/0xffffffff" table "$TPROXY_TABLE" 2>/dev/null; do :; done
+    while ip route del local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null; do :; done
+    while ip -6 route del local ::/0 dev lo table "$TPROXY_TABLE" 2>/dev/null; do :; done
     [ "${1:-}" = quiet ] || info "TPROXY правила удалены"
 }
 
 # ─── Запуск sing-box ─────────────────────────────────────────────────────────
 
-start_singbox() {
-    info "Запускаю sing-box..."
-    mkdir -p /var/run /var/log
+install_firewall_hook() {
+    command -v uci >/dev/null 2>&1 || return 0
+    mkdir -p "$(dirname "$SINGBOX_FIREWALL_INCLUDE")"
+    cat > "$SINGBOX_FIREWALL_INCLUDE" <<EOF
+#!/bin/sh
+[ ! -f "$SINGBOX_DISABLED_FILE" ] && [ -x "$SINGBOX_SELF" ] && "$SINGBOX_SELF" firewall-up >/dev/null 2>&1 || true
+EOF
+    chmod 700 "$SINGBOX_FIREWALL_INCLUDE"
+    uci -q batch <<EOF
+set firewall.singbox_tproxy=include
+set firewall.singbox_tproxy.type='script'
+set firewall.singbox_tproxy.path='$SINGBOX_FIREWALL_INCLUDE'
+set firewall.singbox_tproxy.reload='1'
+set firewall.singbox_tproxy.fw4_compatible='1'
+EOF
+    [ "$?" -eq 0 ] || die "Не удалось настроить firewall hook"
+    uci -q commit firewall || die "Не удалось сохранить firewall hook"
+}
 
-    if [ -f "$SINGBOX_PID" ]; then
-        kill "$(cat "$SINGBOX_PID")" 2>/dev/null || true
-        rm -f "$SINGBOX_PID"
-    fi
-    killall sing-box 2>/dev/null || true
-    sleep 1
+install_service() {
+    mkdir -p "$(dirname "$SINGBOX_INIT")"
+    cat > "$SINGBOX_INIT" <<EOF
+#!/bin/sh /etc/rc.common
+USE_PROCD=1
+START=95
+STOP=10
+start_service() {
+    [ ! -f "$SINGBOX_DISABLED_FILE" ] || return 0
+    procd_open_instance main
+    procd_set_param command "$SINGBOX_SELF" run-managed
+    procd_set_param respawn 30 2 5
+    procd_set_param term_timeout 5
+    procd_set_param reload_signal HUP
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+reload_service() { procd_send_signal sing-box-tunnel main HUP; }
+stop_service() { "$SINGBOX_SELF" firewall-down >/dev/null 2>&1 || true; }
+EOF
+    chmod 755 "$SINGBOX_INIT"
+    install_firewall_hook
+    "$SINGBOX_INIT" enable >/dev/null 2>&1 || die "Не удалось включить procd-сервис"
+}
 
-    "$SINGBOX_BIN" run -c "$SINGBOX_CONFIG" >> "$SINGBOX_LOG" 2>&1 &
-    echo $! > "$SINGBOX_PID"
-    sleep 2
-    if _is_running; then
-        info "sing-box запущен (PID $(cat "$SINGBOX_PID"))"
+run_managed() {
+    [ ! -f "$SINGBOX_DISABLED_FILE" ] || exit 0
+    "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" >/dev/null 2>&1 || exit 1
+    setup_iptables
+    printf '%s\n' "$$" > "$SINGBOX_PID"
+    exec "$SINGBOX_BIN" run -c "$SINGBOX_CONFIG"
+}
+
+_listener_ready() {
+    _is_running || return 1
+    awk '$2 ~ /:3039$/ && $4 == "0A" { found=1 } END { exit !found }' \
+        /proc/net/tcp /proc/net/tcp6 >/dev/null 2>&1
+}
+
+_proxy_probe() {
+    local url="$1" proxy="http://127.0.0.1:1082"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fkLsS -x "$proxy" --connect-timeout 2 --max-time 4 -o /dev/null "$url" 2>/dev/null
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        http_proxy="$proxy" https_proxy="$proxy" no_proxy= \
+            uclient-fetch --no-check-certificate -q -T 4 -O /dev/null "$url"
     else
-        die "sing-box не запустился — проверь лог: $SINGBOX_LOG"
+        http_proxy="$proxy" https_proxy="$proxy" no_proxy= \
+            wget --no-check-certificate -q -T 4 -O /dev/null "$url"
     fi
+}
+
+health_check() {
+    _listener_ready && { _proxy_probe https://cp.cloudflare.com/generate_204 \
+        || _proxy_probe https://www.gstatic.com/generate_204; }
+}
+
+_wait_healthy() {
+    local timeout="${1:-20}" old_pid="${2:-}" deadline current_pid
+    deadline=$(($(date +%s) + timeout))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        current_pid=$(cat "$SINGBOX_PID" 2>/dev/null)
+        if { [ -z "$old_pid" ] || [ "$current_pid" != "$old_pid" ]; } && health_check; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+_restore_last_good() {
+    [ -s "$SINGBOX_GOOD_CONFIG" ] || return 1
+    cp "$SINGBOX_GOOD_CONFIG" "$SINGBOX_CONFIG" || return 1
+    "$SINGBOX_INIT" restart >/dev/null 2>&1 || return 1
+    _wait_healthy 20 && return 0
+    if [ -x "${SINGBOX_BIN}.previous" ]; then
+        cp "${SINGBOX_BIN}.previous" "$SINGBOX_BIN" || return 1
+        "$SINGBOX_INIT" restart >/dev/null 2>&1 || return 1
+        _wait_healthy 20
+    fi
+}
+
+start_singbox() {
+    local old_pid=""
+    info "Активирую sing-box через procd..."
+    mkdir -p /var/run /var/log
+    install_service
+    if [ "$SINGBOX_BINARY_CHANGED" -eq 0 ] && _is_running && cmp -s "$SINGBOX_CONFIG" "$SINGBOX_GOOD_CONFIG" && health_check; then
+        _iptables_ready || setup_iptables
+        info "sing-box уже работает (PID $(cat "$SINGBOX_PID"))"
+        return 0
+    fi
+    rm -f "$SINGBOX_DISABLED_FILE"
+    _is_running && old_pid=$(cat "$SINGBOX_PID" 2>/dev/null)
+    if [ -n "$old_pid" ]; then "$SINGBOX_INIT" restart >/dev/null 2>&1; else "$SINGBOX_INIT" start >/dev/null 2>&1; fi
+    if _wait_healthy 20 "$old_pid"; then
+        cp "$SINGBOX_CONFIG" "$SINGBOX_GOOD_CONFIG"
+        _iptables_ready || setup_iptables
+        info "sing-box работает (PID $(cat "$SINGBOX_PID"))"
+        return 0
+    fi
+    warn "Новая конфигурация не прошла проверку соединения; восстанавливаю предыдущую"
+    if _restore_last_good; then
+        _iptables_ready || setup_iptables
+        die "Новая конфигурация отклонена; предыдущее соединение восстановлено"
+    fi
+    "$SINGBOX_INIT" stop >/dev/null 2>&1 || true
+    cleanup_iptables quiet
+    die "sing-box не запустился; трафик возвращён напрямую"
 }
 
 # ─── Watchdog ────────────────────────────────────────────────────────────────
@@ -927,11 +1428,18 @@ install_cron() {
 }
 
 _watchdog_locked() {
+    local log_size=0
     [ -f "$SINGBOX_DISABLED_FILE" ] && return 0
-    _is_running && return 0
-    logger -t singbox-watchdog "sing-box не запущен — перезапускаю"
-    start_singbox
-    setup_iptables
+    if ! _is_running; then
+        logger -t singbox-watchdog "sing-box не запущен — запускаю через procd"
+        start_singbox
+    elif ! _iptables_ready; then
+        logger -t singbox-watchdog "восстанавливаю TPROXY"
+        setup_iptables
+    fi
+    [ ! -f "$SINGBOX_LOG" ] || log_size=$(wc -c < "$SINGBOX_LOG" 2>/dev/null)
+    case "$log_size" in ''|*[!0-9]*) log_size=0 ;; esac
+    [ "$log_size" -le 1048576 ] || : > "$SINGBOX_LOG"
 }
 
 _watchdog() {
@@ -940,6 +1448,7 @@ _watchdog() {
 }
 
 refresh_subscription_and_apply() {
+    install_runtime_dependencies
     [ -s "$SINGBOX_SUB_FILE" ] || die "URL подписки не настроен"
     refresh_subscription
     apply_configuration preserve
@@ -957,12 +1466,12 @@ _activate_configuration() {
     fi
     rm -f "$SINGBOX_DISABLED_FILE"
     start_singbox
-    setup_iptables
     install_cron
 }
 
 apply_configuration() {
     local state="${1:-start}" force="${2:-0}"
+    install_runtime_dependencies
     install_singbox
     sync_rule_sets "$force"
     load_source || die "Сначала добавь ссылку сервера или подписку"
@@ -971,6 +1480,7 @@ apply_configuration() {
 }
 
 apply_update() {
+    install_runtime_dependencies
     install_singbox
     sync_rule_sets 1
     install_cron
@@ -990,6 +1500,7 @@ save_routing_settings() {
     [ "$refilter" = 1 ] || refilter=0
     [ "$russia" = 1 ] || russia=0
 
+    install_runtime_dependencies
     install_singbox
     sync_rule_sets 0 "$refilter" "$russia"
     mkdir -p "$(dirname "$SINGBOX_MODE_FILE")"
@@ -1030,7 +1541,11 @@ save_routing_settings() {
 stop_tunnel() {
     mkdir -p "$(dirname "$SINGBOX_DISABLED_FILE")"
     : > "$SINGBOX_DISABLED_FILE"
-    kill "$(cat "$SINGBOX_PID" 2>/dev/null)" 2>/dev/null || killall sing-box 2>/dev/null || true
+    [ ! -x "$SINGBOX_INIT" ] || { "$SINGBOX_INIT" disable >/dev/null 2>&1 || true; "$SINGBOX_INIT" stop >/dev/null 2>&1 || true; }
+    if _is_running; then
+        kill "$(cat "$SINGBOX_PID")" 2>/dev/null || true
+        sleep 1
+    fi
     rm -f "$SINGBOX_PID"
     cleanup_iptables
     info "sing-box остановлен, трафик идёт напрямую"
@@ -1038,10 +1553,15 @@ stop_tunnel() {
 
 install_panel() {
     if ! command -v uhttpd >/dev/null 2>&1; then
-        command -v opkg >/dev/null 2>&1 || die "Для панели нужен uhttpd"
         info "Устанавливаю uhttpd..."
-        opkg update >/dev/null 2>&1 && opkg install uhttpd >/dev/null 2>&1 \
-            || die "Не удалось установить uhttpd"
+        if command -v opkg >/dev/null 2>&1; then
+            opkg update >/dev/null 2>&1 && opkg install uhttpd >/dev/null 2>&1 \
+                || die "Не удалось установить uhttpd"
+        elif command -v apk >/dev/null 2>&1; then
+            apk -U add uhttpd >/dev/null 2>&1 || die "Не удалось установить uhttpd"
+        else
+            die "Для панели нужен uhttpd"
+        fi
     fi
 
     local root_hash token
@@ -1053,7 +1573,7 @@ install_panel() {
 #!/bin/sh
 exec "$SINGBOX_SELF" panel
 EOF
-    chmod 700 "$PANEL_ROOT/cgi-bin/panel"
+    chmod 755 "$PANEL_ROOT/cgi-bin/panel"
     printf '%s\n' '/:root:$p$root' > "$PANEL_AUTH"
     chmod 600 "$PANEL_AUTH"
     if [ ! -s "$PANEL_CSRF" ]; then
@@ -1061,6 +1581,11 @@ EOF
         [ -n "$token" ] || token="$$-$(date +%s)"
         printf '%s\n' "$token" > "$PANEL_CSRF"
         chmod 600 "$PANEL_CSRF"
+    fi
+    if _panel_is_running; then
+        kill "$(cat "$PANEL_PID")" 2>/dev/null || true
+        sleep 1
+        rm -f "$PANEL_PID"
     fi
     start_panel
 }
@@ -1123,9 +1648,8 @@ _panel_action_unlocked() {
             ;;
         select)
             index=$(_form_value server)
-            select_server "$index"
-            apply_configuration preserve
-            echo "Сервер выбран; конфигурация обновлена."
+            apply_server_selection "$index"
+            echo "Режим подключения выбран."
             ;;
         routing)
             mode=$(_form_value mode)
@@ -1156,11 +1680,11 @@ _panel_action_unlocked() {
 }
 
 _panel_action() {
-    _with_lock _panel_action_unlocked
+    _with_lock _state_transaction _panel_action_unlocked
 }
 
 panel_cgi() {
-    local message="" action_output csrf expected length mode telegram_calls refilter russia status status_class start_label stop_disabled selected
+    local message="" action_output csrf expected length mode telegram_calls refilter russia status status_class start_label stop_disabled selected auto_select
     local server_count domain_count route_label selected_name selected_host selected_flag selected_protocol
     if [ "${REQUEST_METHOD:-GET}" = "POST" ]; then
         case "${CONTENT_TYPE:-}" in application/x-www-form-urlencoded*) ;; *) die "Unsupported Content-Type" ;; esac
@@ -1189,6 +1713,7 @@ panel_cgi() {
     russia=$(cat "$SINGBOX_RUSSIA_BLOCKED_FILE" 2>/dev/null)
     [ "$russia" = 1 ] || russia=0
     selected=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
+    [ -f "$SINGBOX_AUTO_FILE" ] && auto_select=1 || auto_select=0
     server_count=$(grep -c '.' "$SINGBOX_SERVERS_FILE" 2>/dev/null)
     server_count="${server_count:-0}"
     domain_count=$(grep -c '.' "$SINGBOX_DOMAINS_FILE" 2>/dev/null)
@@ -1199,7 +1724,12 @@ panel_cgi() {
         status="Туннель остановлен"; status_class="offline"; start_label="Запустить"; stop_disabled=" disabled"
     fi
     if [ "$mode" = "list" ]; then route_label="По списку"; else route_label="Весь трафик"; fi
-    if [ -n "$selected" ]; then
+    if [ "$auto_select" = 1 ]; then
+        selected_name="Автовыбор"
+        selected_host="Лучший доступный сервер с автоматическим failover"
+        selected_flag="⚡"
+        selected_protocol="URLTest"
+    elif [ -n "$selected" ]; then
         selected_name=$(server_name "$selected")
         selected_host=$(server_host "$selected")
         selected_flag=$(server_flag "$selected")
@@ -1280,18 +1810,24 @@ EOF
 EOF
     local i=0 url name host flag checked protocol protocol_key latency latency_label quality
     if [ -s "$SINGBOX_SERVERS_FILE" ]; then
+        [ "$auto_select" = 1 ] && checked=" checked" || checked=""
+        printf '<label class="server-card p-auto"><input type="radio" name="server" value="auto"%s><span class="flag" aria-hidden="true">⚡</span><span class="server-copy"><strong>Автовыбор</strong><small>Проверка каждую минуту</small><span class="server-meta"><span class="protocol">URLTest</span><span class="latency">failover</span></span></span><span class="server-health"><span class="signal q4" title="Автоматический выбор" aria-label="Автоматический выбор сервера"><i></i><i></i><i></i><i></i></span><span class="check" aria-hidden="true">✓</span></span></label>\n' "$checked"
         while IFS= read -r url; do
             i=$((i + 1))
             name=$(server_name "$url")
             host=$(server_host "$url")
-            flag=$(server_flag "$url")
+            flag=$(server_flag "$url" "$name" "$host")
             protocol=$(server_protocol "$url")
             protocol_key=$(server_protocol_key "$url")
-            latency=$(awk -F '\t' -v i="$i" '$1==i{print $2;exit}' "$SINGBOX_PING_FILE" 2>/dev/null)
+            if [ -s "$SINGBOX_PING_FILE" ]; then
+                latency=$(awk -F '\t' -v i="$i" '$1==i{print $2;exit}' "$SINGBOX_PING_FILE" 2>/dev/null)
+            else
+                latency=""
+            fi
             quality=$(ping_quality "$latency")
             case "$latency" in '') latency_label="—" ;; timeout) latency_label="таймаут" ;;
                 *) latency_label="${latency} мс" ;; esac
-            [ "$url" = "$selected" ] && checked=" checked" || checked=""
+            [ "$auto_select" = 0 ] && [ "$url" = "$selected" ] && checked=" checked" || checked=""
             printf '<label class="server-card p-%s"><input type="radio" name="server" value="%s"%s><span class="flag" aria-hidden="true">%s</span><span class="server-copy"><strong>%s</strong><small>%s</small><span class="server-meta"><span class="protocol">%s</span><span class="latency">%s</span></span></span><span class="server-health"><span class="signal q%s" title="Пинг: %s" aria-label="Качество соединения: %s из 4"><i></i><i></i><i></i><i></i></span><span class="check" aria-hidden="true">✓</span></span></label>\n' \
                 "$protocol_key" "$i" "$checked" "$(_html_escape "$flag")" "$(_html_escape "$name")" "$(_html_escape "$host")" \
                 "$(_html_escape "$protocol")" "$(_html_escape "$latency_label")" "$quality" "$(_html_escape "$latency_label")" "$quality"
@@ -1388,10 +1924,11 @@ update_system() {
 
 # Минимальная проверка ссылок, списка доменов и обоих режимов маршрутизации.
 self_test() {
-    local test_dir normalized links link protocols="" expected rule_source
+    local test_dir normalized links link protocols="" expected rule_source emitted
     test_dir=$(mktemp -d /tmp/singbox-test-XXXXXX) || die "mktemp failed"
     SINGBOX_BIN="${SINGBOX_TEST_BIN:-true}"
     SINGBOX_CONFIG="$test_dir/config.json"
+    SINGBOX_GOOD_CONFIG="$test_dir/config.good.json"
     SINGBOX_VLESS_FILE="$test_dir/selected"
     SINGBOX_SUB_FILE="$test_dir/subscription"
     SINGBOX_SERVERS_FILE="$test_dir/servers"
@@ -1402,8 +1939,12 @@ self_test() {
     SINGBOX_RUSSIA_BLOCKED_FILE="$test_dir/russia_blocked_enabled"
     SINGBOX_PING_FILE="$test_dir/pings"
     SINGBOX_DISABLED_FILE="$test_dir/disabled"
+    SINGBOX_AUTO_FILE="$test_dir/auto_select"
     SINGBOX_LOG="$test_dir/sing-box.log"
+    SINGBOX_SELF="$test_dir/setup.sh"
     SINGBOX_CRON="$test_dir/cron"
+    SINGBOX_INIT="$test_dir/init"
+    PANEL_LOCK="$test_dir/lock"
     SINGBOX_RULESET_DIR="$test_dir/rules"
     REFILTER_DOMAINS_FILE="$SINGBOX_RULESET_DIR/refilter-domains.srs"
     REFILTER_IPS_FILE="$SINGBOX_RULESET_DIR/refilter-ips.srs"
@@ -1424,8 +1965,13 @@ self_test() {
 
     [ "$( (uname() { echo aarch64; }; detect_arch) )" = "linux-arm64-musl" ] \
         || { rm -rf "$test_dir"; die "OpenWrt architecture self-test failed"; }
+    [ "$(_json_escape 'a\b"c')" = 'a\\b\"c' ] &&
+        [ "$(_html_escape "a&<>\"'")" = 'a&amp;&lt;&gt;&quot;&#39;' ] \
+        || { rm -rf "$test_dir"; die "escaping self-test failed"; }
+    [ "$(server_host 'vless://id@example.com:443?security=tls#Test')" = example.com:443 ] \
+        || { rm -rf "$test_dir"; die "server display self-test failed"; }
     (
-        _is_running() { return 0; }; install_singbox() { :; }; load_source() { return 0; }
+        _is_running() { return 0; }; install_runtime_dependencies() { :; }; install_singbox() { :; }; load_source() { return 0; }
         gen_config() { :; }; start_singbox() { : > "$test_dir/restarted"; }; setup_iptables() { :; }
         apply_update
     ) >/dev/null
@@ -1434,11 +1980,32 @@ self_test() {
     parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls&sni=edge.example.com&path=%2Fws#Test'
     [ "$SV_HOST" = "example.com" ] && [ "$SV_PORT" = "443" ] && [ "$SV_PATH" = "/ws" ] \
         || { rm -rf "$test_dir"; die "parse_vless self-test failed"; }
+    emitted=$(_emit_outbound test)
+    ! printf '%s' "$emitted" | grep -Fq '"headers"' \
+        || { rm -rf "$test_dir"; die "implicit WebSocket Host self-test failed"; }
+    parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls&sni=edge.example.com&host=cdn.example.com&path=%2Fws'
+    printf '%s' "$(_emit_outbound test)" | grep -Fq '"headers":{"Host":"cdn.example.com"}' \
+        || { rm -rf "$test_dir"; die "explicit WebSocket Host self-test failed"; }
     parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:8443#No query'
     [ "$SV_HOST" = "example.com" ] && [ "$SV_PORT" = "8443" ] \
         || { rm -rf "$test_dir"; die "fragment self-test failed"; }
+    printf '%s\n' 'vless://id@example.com:443?security=tls#New name' > "$test_dir/renamed"
+    [ "$(_preserve_selected_server 'vless://id@example.com:443?security=tls#Old name' "$test_dir/renamed")" = \
+        'vless://id@example.com:443?security=tls#New name' ] \
+        || { rm -rf "$test_dir"; die "renamed server selection self-test failed"; }
     parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=grpc&security=tls&serviceName=grpc-vless'
     [ "$SV_PATH" = "grpc-vless" ] || { rm -rf "$test_dir"; die "gRPC serviceName self-test failed"; }
+    parse_server 'hy2://secret@hy2.example.com:443,5000-6000?sni=hy2.example.com&insecure=1'
+    [ "$SV_PORT" = 443 ] && [ "$SV_SERVER_PORTS" = '"443:443","5000:6000"' ] &&
+        printf '%s' "$(_emit_outbound test)" | grep -Fq '"server_ports":["443:443","5000:6000"]' \
+        || { rm -rf "$test_dir"; die "Hysteria2 port hopping self-test failed"; }
+    parse_server 'tuic://33333333-3333-3333-3333-333333333333:secret@tuic.example.com:443?sni=tuic.example.com&udp_over_stream=true'
+    emitted=$(_emit_outbound test)
+    printf '%s' "$emitted" | grep -Fq '"udp_over_stream":true' && ! printf '%s' "$emitted" | grep -Fq '"udp_relay_mode"' \
+        || { rm -rf "$test_dir"; die "TUIC UDP over stream self-test failed"; }
+    if (parse_server 'tuic://33333333-3333-3333-3333-333333333333:secret@tuic.example.com:443?udp_over_stream=true&udp_relay_mode=quic') >/dev/null 2>&1; then
+        rm -rf "$test_dir"; die "TUIC conflict self-test failed"
+    fi
     [ "$(server_flag 'vless://id@nl.example:443#Amsterdam NL')" = "🇳🇱" ] \
         || { rm -rf "$test_dir"; die "server_flag self-test failed"; }
     normalized=$(printf 'Example.COM\r\n*.blocked.test\nhttps://foo.example?x=1\nbad$host\nfoo..test\nexample.com\n' | normalize_domains)
@@ -1449,6 +2016,9 @@ self_test() {
     printf '1\n' > "$SINGBOX_TELEGRAM_FILE"
     printf '1\n' > "$SINGBOX_REFILTER_FILE"
     printf '1\n' > "$SINGBOX_RUSSIA_BLOCKED_FILE"
+    printf '%s\n' 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls&sni=edge.example.com&path=%2Fws#Test' > "$SINGBOX_SERVERS_FILE"
+    cp "$SINGBOX_SERVERS_FILE" "$SINGBOX_VLESS_FILE"
+    load_source
     gen_config >/dev/null
     if command -v python3 >/dev/null 2>&1; then
         python3 -m json.tool "$SINGBOX_CONFIG" >/dev/null \
@@ -1468,13 +2038,15 @@ self_test() {
 vmess://eyJ2IjoiMiIsInBzIjoiVG9reW8gVk1lc3MiLCJhZGQiOiJ2bWVzcy5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjIyMjIyMjIyLTIyMjItMjIyMi0yMjIyLTIyMjIyMjIyMjIyMiIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0Ijoid3MiLCJ0eXBlIjoibm9uZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJwYXRoIjoiL3ZtZXNzIiwidGxzIjoidGxzIiwic25pIjoiZWRnZS5leGFtcGxlLmNvbSJ9
 trojan://secret@trojan.example.com:443?security=tls&sni=trojan.example.com&type=tcp#Trojan
 ss://YWVzLTI1Ni1nY206dGVzdHBhc3M=@ss.example.com:8388#Shadowsocks
-hy2://secret@hy2.example.com:443?sni=hy2.example.com&obfs=salamander&obfs-password=cover#Hysteria2
-tuic://33333333-3333-3333-3333-333333333333:secret@tuic.example.com:443?sni=tuic.example.com&congestion_control=bbr#TUIC'
+hy2://secret@hy2.example.com:443,5000-6000?sni=hy2.example.com&obfs=salamander&obfs-password=cover#Hysteria2
+tuic://33333333-3333-3333-3333-333333333333:secret@tuic.example.com:443?sni=tuic.example.com&congestion_control=bbr&udp_over_stream=true#TUIC'
     while IFS= read -r link; do
         parse_server "$link"
         protocols="${protocols}${SV_PROTOCOL} "
+        printf '%s\n' "$link" > "$SINGBOX_SERVERS_FILE"
+        cp "$SINGBOX_SERVERS_FILE" "$SINGBOX_VLESS_FILE"
         gen_config >/dev/null
-        expected="\"type\":\"${SV_PROTOCOL}\",\"tag\":\"proxy\""
+        expected="\"type\":\"${SV_PROTOCOL}\",\"tag\":\"server-1\""
         grep -Fq "$expected" "$SINGBOX_CONFIG" \
             || { rm -rf "$test_dir"; die "${SV_PROTOCOL} outbound self-test failed"; }
         printf '%s: OK\n' "$(server_protocol "$link")"
@@ -1491,8 +2063,14 @@ EOF
         || { rm -rf "$test_dir"; die "multiple links self-test failed"; }
     select_server 2
     gen_config >/dev/null
-    grep -Fq '"type":"trojan","tag":"proxy"' "$SINGBOX_CONFIG" \
+    grep -Fq '"type":"trojan","tag":"server-2"' "$SINGBOX_CONFIG" &&
+        grep -Fq '"default":"server-2"' "$SINGBOX_CONFIG" \
         || { rm -rf "$test_dir"; die "server selection self-test failed"; }
+    select_server auto
+    gen_config >/dev/null
+    grep -Fq '"type":"urltest","tag":"auto"' "$SINGBOX_CONFIG" &&
+        grep -Fq '"default":"auto"' "$SINGBOX_CONFIG" \
+        || { rm -rf "$test_dir"; die "automatic failover self-test failed"; }
     [ "$(ping_quality 79)" = 4 ] && [ "$(ping_quality 301)" = 1 ] && [ "$(ping_quality timeout)" = 0 ] \
         || { rm -rf "$test_dir"; die "ping quality self-test failed"; }
     printf '17 */6 * * * sh /old/setup.sh refresh %s\n5 4 * * * echo keep\n' "$SUB_REFRESH_MARKER" > "$SINGBOX_CRON"
@@ -1515,6 +2093,42 @@ EOF
         _activate_configuration preserve
     ) >/dev/null
     [ -f "$test_dir/expected-start" ] || { rm -rf "$test_dir"; die "running state self-test failed"; }
+    mkdir "$PANEL_LOCK"; printf '999999\n' > "$PANEL_LOCK/pid"
+    _with_lock touch "$test_dir/lock-recovered"
+    [ -f "$test_dir/lock-recovered" ] || { rm -rf "$test_dir"; die "stale lock self-test failed"; }
+    printf 'stable\n' > "$SINGBOX_MODE_FILE"
+    if (
+        _is_running() { return 1; }
+        cleanup_iptables() { :; }
+        _state_transaction sh -c "printf 'broken\\n' > '$SINGBOX_MODE_FILE'; exit 1"
+    ) >/dev/null 2>&1; then
+        rm -rf "$test_dir"; die "state rollback self-test failed"
+    fi
+    [ "$(cat "$SINGBOX_MODE_FILE")" = stable ] && [ -f "$SINGBOX_DISABLED_FILE" ] \
+        || { rm -rf "$test_dir"; die "state rollback self-test failed"; }
+    rm -f "$SINGBOX_DISABLED_FILE" "$test_dir/unexpected-rollback-restart"
+    printf '#!/bin/sh\n: > "%s"\n' "$test_dir/unexpected-rollback-restart" > "$SINGBOX_INIT"
+    chmod 700 "$SINGBOX_INIT"
+    if (
+        _is_running() { return 0; }
+        health_check() { return 0; }
+        _iptables_ready() { return 0; }
+        _state_transaction sh -c "printf 'broken\\n' > '$SINGBOX_MODE_FILE'; exit 1"
+    ) >/dev/null 2>&1; then
+        rm -rf "$test_dir"; die "healthy rollback self-test failed"
+    fi
+    [ "$(cat "$SINGBOX_MODE_FILE")" = stable ] && [ ! -f "$test_dir/unexpected-rollback-restart" ] \
+        || { rm -rf "$test_dir"; die "healthy rollback self-test failed"; }
+    rm -f "$SINGBOX_SELF" "$SINGBOX_INIT" "$SINGBOX_DISABLED_FILE"
+    if (
+        _is_running() { return 1; }
+        cleanup_iptables() { :; }
+        _state_transaction sh -c "printf '#!/bin/sh\\n' > '$SINGBOX_SELF'; exit 1"
+    ) >/dev/null 2>&1; then
+        rm -rf "$test_dir"; die "first install rollback self-test failed"
+    fi
+    [ -s "$SINGBOX_SELF" ] && [ -f "$SINGBOX_DISABLED_FILE" ] \
+        || { rm -rf "$test_dir"; die "first install rollback self-test failed"; }
     rm -rf "$test_dir"
     echo "Итог: OK"
 }
@@ -1522,6 +2136,7 @@ EOF
 # ─── Меню ────────────────────────────────────────────────────────────────────
 
 configure_source() {
+    install_runtime_dependencies
     save_source "$1"
     persist_self
     install_panel
@@ -1544,15 +2159,15 @@ $line"; else source="$line"; fi
 choose_server_cli() {
     local i=0 url index
     [ -s "$SINGBOX_SERVERS_FILE" ] || die "Список серверов пуст"
+    echo "  0) Автовыбор с failover"
     while IFS= read -r url; do
         i=$((i + 1))
         printf '  %s) %s · %s · %s\n' "$i" "$(server_name "$url")" "$(server_protocol "$url")" "$(server_host "$url")"
     done < "$SINGBOX_SERVERS_FILE"
     printf "Номер сервера: "
     read -r index
-    select_server "$index"
-    apply_configuration preserve
-    info "Сервер выбран"
+    apply_server_selection "$index"
+    info "Режим подключения выбран"
 }
 
 _prompt_toggle() {
@@ -1640,29 +2255,29 @@ show_menu() {
     echo ""
     case "$choice" in
         1)
-            _with_lock apply_configuration
+            _with_lock _state_transaction apply_configuration
             ;;
         2)
             _with_lock stop_tunnel
             ;;
         3)
-            _with_lock prompt_source_cli
+            _with_lock _state_transaction prompt_source_cli
             ;;
         4)
-            _with_lock choose_server_cli
+            _with_lock _state_transaction choose_server_cli
             ;;
         5)
-            _with_lock configure_routing_cli
+            _with_lock _state_transaction configure_routing_cli
             ;;
         6)
-            _with_lock refresh_subscription_and_apply
+            _with_lock _state_transaction refresh_subscription_and_apply
             ;;
         7)
             echo "--- Последние 30 строк лога ---"
             tail -30 "$SINGBOX_LOG" 2>/dev/null || echo "Лог пустой"
             ;;
         8)
-            _with_lock update_system
+            _with_lock _state_transaction update_system
             ;;
         9)
             _with_lock install_panel
@@ -1680,6 +2295,18 @@ show_menu() {
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
+    run-managed)
+        run_managed
+        ;;
+    firewall-up)
+        [ -f "$SINGBOX_DISABLED_FILE" ] || { _is_running && _with_lock setup_iptables || true; }
+        ;;
+    firewall-down)
+        cleanup_iptables quiet
+        ;;
+    health)
+        health_check && info "Соединение исправно" || die "Проверка соединения не пройдена"
+        ;;
     panel)
         panel_cgi
         ;;
@@ -1687,34 +2314,37 @@ case "${1:-}" in
         _watchdog
         ;;
     refresh)
-        _with_lock refresh_subscription_and_apply
+        _with_lock _state_transaction refresh_subscription_and_apply
         ;;
     stop)
         _with_lock stop_tunnel
         ;;
     restart)
-        _with_lock apply_configuration
+        _with_lock _state_transaction apply_configuration
         ;;
     apply-update)
-        if [ "${SINGBOX_LOCK_HELD:-0}" = 1 ]; then apply_update; else _with_lock apply_update; fi
+        if [ "${SINGBOX_LOCK_HELD:-0}" = 1 ]; then apply_update; else _with_lock _state_transaction apply_update; fi
         ;;
     panel-start)
         _with_lock install_panel
         ;;
     self-update)
-        _with_lock update_system
+        _with_lock _state_transaction update_system
         ;;
     routing)
-        _with_lock configure_routing_cli
+        _with_lock _state_transaction configure_routing_cli
         ;;
     servers)
-        _with_lock choose_server_cli
+        _with_lock _state_transaction choose_server_cli
         ;;
     status)
         if _is_running; then
             info "sing-box работает (PID $(cat "$SINGBOX_PID"))"
-            [ -f "$SINGBOX_VLESS_FILE" ] && \
+            if [ -f "$SINGBOX_AUTO_FILE" ]; then
+                info "Сервер: автовыбор с failover"
+            elif [ -f "$SINGBOX_VLESS_FILE" ]; then
                 info "Сервер: $(server_host "$(cat "$SINGBOX_VLESS_FILE")")"
+            fi
         else
             info "sing-box не запущен"
         fi
@@ -1724,7 +2354,7 @@ case "${1:-}" in
         self_test
         ;;
     vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*|tuic://*|http://*|https://*)
-        _with_lock configure_source "$1" start
+        _with_lock _state_transaction configure_source "$1" start || exit $?
         info "Готово!"
         info "Панель: $(cat "$PANEL_URL_FILE")"
         ;;
