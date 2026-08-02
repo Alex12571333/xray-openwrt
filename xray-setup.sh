@@ -3,7 +3,7 @@
 # Один активный прокси-сервер, выбор и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260659"
+SCRIPT_VERSION="20260660"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -861,6 +861,17 @@ apply_configuration() {
     install_cron
 }
 
+apply_update() {
+    local running=0
+    _is_running && running=1
+    install_singbox
+    if load_source; then
+        gen_config
+        if [ "$running" -eq 1 ]; then start_singbox; setup_iptables; fi
+    fi
+    info "Скрипт и sing-box обновлены"
+}
+
 stop_tunnel() {
     mkdir -p /etc/sing-box
     : > "$SINGBOX_DISABLED_FILE"
@@ -990,6 +1001,11 @@ _panel_action() {
             stop_tunnel
             echo "Туннель остановлен."
             ;;
+        upgrade)
+            self_update || die "Не удалось проверить обновление скрипта"
+            sh "$SINGBOX_SELF" apply-update
+            echo "Скрипт и sing-box обновлены."
+            ;;
         *)
             die "Неизвестное действие"
             ;;
@@ -1054,7 +1070,7 @@ panel_cgi() {
 :root{color-scheme:dark;--bg:#080b12;--panel:#101620;--panel-2:#151c28;--line:#222c3b;--text:#f4f7fb;--muted:#8f9caf;--accent:#6d7cff;--accent-2:#8b5cf6;--green:#35d39a;--red:#ff6874;--radius:20px}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;font:15px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:radial-gradient(circle at 12% -10%,#29327a55,transparent 30%),radial-gradient(circle at 95% 8%,#5b2e8b33,transparent 28%),var(--bg)}
 button,input,textarea,select{font:inherit}button,summary,label{touch-action:manipulation}.shell{width:min(1180px,100%);margin:auto;padding:30px 24px 48px}
-.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:24px}.brand{display:flex;align-items:center;gap:12px}.brand-mark{display:grid;place-items:center;width:42px;height:42px;border-radius:13px;background:linear-gradient(145deg,var(--accent),var(--accent-2));box-shadow:0 12px 34px #6d7cff44;font-size:20px;font-weight:850}.brand h1{font-size:18px;letter-spacing:-.02em;margin:0}.brand p{color:var(--muted);font-size:12px;margin:2px 0 0}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:24px}.topbar-actions{display:flex;align-items:center;gap:8px}.brand{display:flex;align-items:center;gap:12px}.brand-mark{display:grid;place-items:center;width:42px;height:42px;border-radius:13px;background:linear-gradient(145deg,var(--accent),var(--accent-2));box-shadow:0 12px 34px #6d7cff44;font-size:20px;font-weight:850}.brand h1{font-size:18px;letter-spacing:-.02em;margin:0}.brand p{color:var(--muted);font-size:12px;margin:2px 0 0}
 .status-pill{display:flex;align-items:center;gap:8px;padding:9px 13px;border:1px solid var(--line);border-radius:999px;background:#111823;color:#cbd5e1;font-size:13px;font-weight:650}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 0 4px #ff68741c}.status-pill.online .status-dot{background:var(--green);box-shadow:0 0 0 4px #35d39a1c}
 .overview{display:grid;grid-template-columns:minmax(0,2fr) repeat(2,minmax(160px,1fr));gap:14px;margin-bottom:14px}.card{border:1px solid var(--line);border-radius:var(--radius);background:linear-gradient(160deg,#121925 0%,#0e141e 100%);box-shadow:0 22px 70px #0005}.hero{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:24px}.eyebrow{display:block;color:#8290a5;font-size:11px;font-weight:750;letter-spacing:.11em;text-transform:uppercase;margin-bottom:12px}.server-identity{display:flex;align-items:center;gap:15px;min-width:0}.flag{display:grid;place-items:center;flex:none;width:44px;height:44px;border:1px solid #ffffff12;border-radius:14px;background:#ffffff09;font-size:25px}.flag.large{width:58px;height:58px;border-radius:18px;font-size:32px}.server-identity h2{margin:0;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:24px;letter-spacing:-.035em}.server-identity p{margin:4px 0 0;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis}
 .controls{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}.metric{display:flex;flex-direction:column;justify-content:space-between;min-height:142px;padding:20px}.metric-icon{display:grid;place-items:center;width:34px;height:34px;border:1px solid #ffffff10;border-radius:11px;background:#ffffff08;color:#b8c1ff;font-weight:800}.metric span{color:var(--muted);font-size:12px}.metric strong{display:block;margin-top:auto;font-size:25px;letter-spacing:-.04em}.metric small{color:#718096}
@@ -1068,13 +1084,13 @@ button,input,textarea,select{font:inherit}button,summary,label{touch-action:mani
 .segment{display:grid;grid-template-columns:1fr 1fr;gap:8px}.route-option{position:relative;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c121b;cursor:pointer}.route-option:has(input:checked){border-color:#6573ef;background:#141b31}.route-option input{position:absolute;opacity:0}.route-option b,.route-option small{display:block}.route-option b{font-size:13px}.route-option small{margin-top:4px;color:var(--muted);font-size:11px}.route-option:focus-within{outline:2px solid #94a0ff;outline-offset:2px}.feature-toggle{position:relative;display:flex;align-items:center;gap:12px;margin-top:10px;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c121b;cursor:pointer}.feature-toggle:has(input:checked){border-color:#249fd1;background:#0e1d29}.feature-toggle input{position:absolute;opacity:0}.feature-toggle:focus-within{outline:2px solid #94a0ff;outline-offset:2px}.feature-copy{min-width:0;flex:1}.feature-copy b,.feature-copy small{display:block}.feature-copy b{font-size:13px}.feature-copy small{margin-top:4px;color:var(--muted);font-size:11px}.switch{position:relative;flex:none;width:42px;height:24px;border-radius:999px;background:#303b4e;transition:background .16s}.switch:before{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 2px 7px #0007;transition:transform .16s}.feature-toggle input:checked+.switch{background:#249fd1}.feature-toggle input:checked+.switch:before{transform:translateX(18px)}textarea{height:170px;min-height:170px;padding:12px;resize:none;overflow:auto;line-height:1.55}.hint{margin:8px 0 0;color:var(--muted);font-size:11px}
 .notice{margin:0 0 14px;padding:12px 14px;border:1px solid #35d39a32;border-radius:13px;background:#35d39a12;color:#a9f0d5;font-size:13px}.notice.error{border-color:#ff68743d;background:#ff687414;color:#ffabb2}
 body[data-busy]{cursor:progress}body[data-busy] form{pointer-events:none}body[data-busy]:before{content:"";position:fixed;z-index:20;top:0;left:0;width:32%;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent-2));box-shadow:0 0 18px var(--accent);animation:progress 1s ease-in-out infinite}@keyframes progress{0%{transform:translateX(-110%)}100%{transform:translateX(420%)}}
-@media(max-width:1020px){.overview{grid-template-columns:1fr 1fr}.hero{grid-column:1/-1}}@media(max-width:900px){.workspace{grid-template-columns:1fr}}@media(max-width:620px){.shell{padding:20px 14px 36px}.topbar,.hero{align-items:flex-start;flex-direction:column}.status-pill{align-self:flex-start}.overview{grid-template-columns:1fr 1fr}.hero{padding:20px}.controls{justify-content:flex-start}.server-grid,.segment{grid-template-columns:1fr}.source-form{grid-template-columns:1fr}.server-identity h2{font-size:20px}.metric{min-height:120px;padding:16px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+@media(max-width:1020px){.overview{grid-template-columns:1fr 1fr}.hero{grid-column:1/-1}}@media(max-width:900px){.workspace{grid-template-columns:1fr}}@media(max-width:620px){.shell{padding:20px 14px 36px}.topbar,.hero{align-items:flex-start;flex-direction:column}.topbar-actions{width:100%;justify-content:space-between}.status-pill{align-self:flex-start}.overview{grid-template-columns:1fr 1fr}.hero{padding:20px}.controls{justify-content:flex-start}.server-grid,.segment{grid-template-columns:1fr}.source-form{grid-template-columns:1fr}.server-identity h2{font-size:20px}.metric{min-height:120px;padding:16px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 </style></head><body><main class="shell">
 EOF
     cat <<EOF
 <header class="topbar">
   <div class="brand"><span class="brand-mark" aria-hidden="true">S</span><div><h1>SingBox Router</h1><p>OpenWrt control plane · v${SCRIPT_VERSION}</p></div></div>
-  <div class="status-pill ${status_class}"><span class="status-dot"></span>$(_html_escape "$status")</div>
+  <div class="topbar-actions"><form method="post"><input type="hidden" name="csrf" value="$(_html_escape "$csrf")"><button class="btn ghost" name="action" value="upgrade" title="Обновить скрипт и sing-box">↑ Обновить</button></form><div class="status-pill ${status_class}"><span class="status-dot"></span>$(_html_escape "$status")</div></div>
 </header>
 EOF
     if [ -n "$message" ]; then
@@ -1159,7 +1175,7 @@ document.addEventListener('submit',async event=>{
   event.preventDefault()
   const data=new FormData(form),button=event.submitter,label=button?.textContent
   if(button?.name)data.set(button.name,button.value)
-  const action=data.get('action'),working={ping:'Проверяю…',select:'Подключаю…',refresh:'Обновляю…',source:'Сохраняю…',routing:'Применяю…',start:'Запускаю…',stop:'Останавливаю…'}
+  const action=data.get('action'),working={ping:'Проверяю…',select:'Подключаю…',refresh:'Обновляю…',source:'Сохраняю…',routing:'Применяю…',start:'Запускаю…',stop:'Останавливаю…',upgrade:'Обновляю систему…'}
   document.body.dataset.busy='true'
   document.body.setAttribute('aria-busy','true')
   if(button){button.disabled=true;button.textContent=working[action]||'Выполняю…'}
@@ -1168,7 +1184,9 @@ document.addEventListener('submit',async event=>{
     if(!response.ok)throw new Error('HTTP '+response.status)
     const next=new DOMParser().parseFromString(await response.text(),'text/html')
     if(!next.querySelector('main'))throw new Error('Некорректный ответ')
+    const failed=next.querySelector('.notice.error')
     document.body.replaceWith(next.body)
+    if(action==='upgrade'&&!failed)location.reload()
   }catch(error){
     delete document.body.dataset.busy
     document.body.removeAttribute('aria-busy')
@@ -1194,13 +1212,15 @@ self_update() {
     if [ -z "$remote_ver" ]; then
         warn "Не удалось проверить версию"; return 1
     fi
-    if [ "$remote_ver" = "$SCRIPT_VERSION" ]; then
+    case "$remote_ver" in *[!0-9]*|'') warn "Получена некорректная версия"; return 1 ;; esac
+    if [ "$remote_ver" -le "$SCRIPT_VERSION" ]; then
         info "Версия актуальна: $SCRIPT_VERSION"; return 0
     fi
     info "Обновляю скрипт: $SCRIPT_VERSION → $remote_ver"
     script_tmp="${SINGBOX_SELF}.new"
     _download "$SCRIPT_URL" "$script_tmp" >/dev/null 2>&1 || die "Ошибка скачивания"
-    grep -q '^SCRIPT_VERSION=' "$script_tmp" || { rm -f "$script_tmp"; die "Получен некорректный скрипт"; }
+    grep -q "^SCRIPT_VERSION=\"${remote_ver}\"$" "$script_tmp" && sh -n "$script_tmp" \
+        || { rm -f "$script_tmp"; die "Получен некорректный скрипт"; }
     chmod 700 "$script_tmp"
     mv "$script_tmp" "$SINGBOX_SELF"
     info "Скрипт обновлён до $remote_ver"
@@ -1224,6 +1244,12 @@ self_test() {
 
     [ "$( (uname() { echo aarch64; }; detect_arch) )" = "linux-arm64-musl" ] \
         || { rm -rf "$test_dir"; die "OpenWrt architecture self-test failed"; }
+    (
+        _is_running() { return 0; }; install_singbox() { :; }; load_source() { return 0; }
+        gen_config() { :; }; start_singbox() { : > "$test_dir/restarted"; }; setup_iptables() { :; }
+        apply_update
+    ) >/dev/null
+    [ -f "$test_dir/restarted" ] || { rm -rf "$test_dir"; die "update self-test failed"; }
 
     parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls&sni=edge.example.com&path=%2Fws#Test'
     [ "$SV_HOST" = "example.com" ] && [ "$SV_PORT" = "443" ] && [ "$SV_PATH" = "/ws" ] \
@@ -1393,6 +1419,9 @@ case "${1:-}" in
         ;;
     restart)
         apply_configuration
+        ;;
+    apply-update)
+        apply_update
         ;;
     panel-start)
         install_panel
