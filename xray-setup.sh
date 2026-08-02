@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260662"
+SCRIPT_VERSION="20260663"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -45,7 +45,7 @@ PANEL_AUTH="/etc/sing-box/httpd.conf"
 PANEL_CSRF="/etc/sing-box/panel_csrf"
 PANEL_URL_FILE="/etc/sing-box/panel_url"
 PANEL_LOCK="/var/run/sing-box-panel.lock"
-PANEL_PORT="8088"
+PANEL_PORT="28765"
 SINGBOX_INIT="${SINGBOX_INIT:-/etc/init.d/sing-box-tunnel}"
 SINGBOX_FIREWALL_INCLUDE="${SINGBOX_FIREWALL_INCLUDE:-/etc/sing-box/firewall.include}"
 CRON_MARKER="# sing-box-tunnel"
