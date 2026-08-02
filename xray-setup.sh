@@ -3,13 +3,12 @@
 # Один активный прокси-сервер, выбор и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260658"
+SCRIPT_VERSION="20260659"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
-# sing-box 1.13+ собираются ДИНАМИЧЕСКИ (glibc) и не запускаются на OpenWrt (musl).
-# Поэтому пинимся на последнюю СТАТИЧЕСКУЮ ветку 1.12.x.
-SINGBOX_VERSION="1.12.8"
+# Для OpenWrt выбираем официальную musl/статическую сборку, а не glibc.
+SINGBOX_VERSION="1.13.12"
 
 SINGBOX_BIN="/usr/bin/sing-box"
 SINGBOX_CONFIG="/etc/sing-box/config.json"
@@ -85,12 +84,12 @@ persist_self() {
 
 detect_arch() {
     case $(uname -m) in
-        aarch64)        echo "linux-arm64" ;;
-        armv7l)         echo "linux-armv7" ;;
+        aarch64)        echo "linux-arm64-musl" ;;
+        armv7l)         echo "linux-armv7-musl" ;;
         armv6l)         echo "linux-armv6" ;;
-        x86_64)         echo "linux-amd64" ;;
-        i686|i386)      echo "linux-386" ;;
-        mipsel|mipsle)  echo "linux-mipsle-softfloat" ;;
+        x86_64)         echo "linux-amd64-musl" ;;
+        i686|i386)      echo "linux-386-musl" ;;
+        mipsel|mipsle)  echo "linux-mipsle-softfloat-musl" ;;
         mips)           echo "linux-mips-softfloat" ;;
         *) die "Unsupported arch: $(uname -m)" ;;
     esac
@@ -122,13 +121,17 @@ _b64dec() {
 }
 
 install_singbox() {
-    # бинарник есть И реально запускается?
-    if [ -x "$SINGBOX_BIN" ] && "$SINGBOX_BIN" version >/dev/null 2>&1; then
-        info "sing-box уже установлен: $("$SINGBOX_BIN" version 2>/dev/null | head -1)"
+    local installed arch archive url tmpdir bin new_bin
+    installed=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 { print $3 }')
+    if [ "$installed" = "$SINGBOX_VERSION" ]; then
+        info "sing-box уже установлен: $installed"
         return 0
     fi
-    info "Устанавливаю sing-box ${SINGBOX_VERSION} (статическая сборка)..."
-    local arch archive url tmpdir bin
+    if [ -n "$installed" ]; then
+        info "Обновляю sing-box: ${installed} → ${SINGBOX_VERSION}"
+    else
+        info "Устанавливаю sing-box ${SINGBOX_VERSION}..."
+    fi
     arch=$(detect_arch)
     archive="sing-box-${SINGBOX_VERSION}-${arch}.tar.gz"
     url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${archive}"
@@ -143,12 +146,12 @@ install_singbox() {
     bin=$(find "$tmpdir" -name "sing-box" -type f | head -1)
     [ -n "$bin" ] || die "Бинарник sing-box не найден в архиве"
 
-    mv "$bin" "$SINGBOX_BIN"
-    chmod +x "$SINGBOX_BIN"
+    new_bin="${SINGBOX_BIN}.new"
+    cp "$bin" "$new_bin" && chmod +x "$new_bin" || { rm -rf "$tmpdir" "$new_bin"; die "Не удалось установить sing-box"; }
+    "$new_bin" version >/dev/null 2>&1 \
+        || { rm -rf "$tmpdir" "$new_bin"; die "Новый sing-box не запускается; старый бинарник сохранён"; }
+    mv "$new_bin" "$SINGBOX_BIN"
     rm -rf "$tmpdir"
-    # проверка совместимости (musl/динамический линкер)
-    "$SINGBOX_BIN" version >/dev/null 2>&1 \
-        || die "sing-box установлен, но не запускается (несовместимый бинарник)"
     info "sing-box установлен: $("$SINGBOX_BIN" version 2>/dev/null | head -1)"
 }
 
@@ -328,7 +331,7 @@ parse_hysteria2() {
     SV_OBFS=$(_query_value "$query" obfs)
     SV_OBFS_PASSWORD=$(urldecode "$(_query_value "$query" obfs-password)")
     case "$SV_OBFS" in '') ;; salamander) [ -n "$SV_OBFS_PASSWORD" ] || die "Нет obfs-password Hysteria2" ;;
-        *) die "Obfs Hysteria2 '$SV_OBFS' не поддерживается sing-box 1.12" ;; esac
+        *) die "Obfs Hysteria2 '$SV_OBFS' не поддерживается; доступен salamander" ;; esac
 }
 
 parse_tuic() {
@@ -1218,6 +1221,9 @@ self_test() {
     SINGBOX_PING_FILE="$test_dir/pings"
     SINGBOX_LOG="$test_dir/sing-box.log"
     SINGBOX_CRON="$test_dir/cron"
+
+    [ "$( (uname() { echo aarch64; }; detect_arch) )" = "linux-arm64-musl" ] \
+        || { rm -rf "$test_dir"; die "OpenWrt architecture self-test failed"; }
 
     parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls&sni=edge.example.com&path=%2Fws#Test'
     [ "$SV_HOST" = "example.com" ] && [ "$SV_PORT" = "443" ] && [ "$SV_PATH" = "/ws" ] \
