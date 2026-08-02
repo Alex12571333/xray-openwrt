@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260663"
+SCRIPT_VERSION="20260664"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -70,6 +70,31 @@ _is_running() {
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     kill -0 "$pid" 2>/dev/null || return 1
     [ ! -r "/proc/$pid/comm" ] || [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = sing-box ]
+}
+
+_is_owned_singbox_command() {
+    case "$1" in
+        "$SINGBOX_BIN run -c $SINGBOX_CONFIG "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_stop_owned_singbox_processes() {
+    local proc pid command pids=""
+    for proc in /proc/[0-9]*; do
+        [ "$(cat "$proc/comm" 2>/dev/null)" = sing-box ] && [ -r "$proc/cmdline" ] || continue
+        command=$(tr '\000' ' ' < "$proc/cmdline")
+        _is_owned_singbox_command "$command" || continue
+        pid=${proc##*/}
+        kill "$pid" 2>/dev/null && pids="$pids $pid"
+    done
+    [ -z "$pids" ] || sleep 1
+    for pid in $pids; do
+        [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = sing-box ] && [ -r "/proc/$pid/cmdline" ] || continue
+        command=$(tr '\000' ' ' < "/proc/$pid/cmdline")
+        _is_owned_singbox_command "$command" && kill -9 "$pid" 2>/dev/null || true
+    done
+    rm -f "$SINGBOX_PID"
 }
 
 _panel_is_running() {
@@ -753,9 +778,12 @@ _emit_outbound_set() {
     done < "$SINGBOX_SERVERS_FILE" 2>/dev/null
     [ "$i" -gt 0 ] || die "Список серверов пуст"
     [ -n "$default_tag" ] || default_tag=server-1
-    [ ! -f "$SINGBOX_AUTO_FILE" ] || default_tag=auto
-    printf ',\n    {"type":"urltest","tag":"auto","outbounds":[%s],"interval":"1m","interrupt_exist_connections":false},\n' "$tags"
-    printf '    {"type":"selector","tag":"proxy","outbounds":["auto",%s],"default":"%s","interrupt_exist_connections":false},\n' "$tags" "$default_tag"
+    if [ -f "$SINGBOX_AUTO_FILE" ]; then
+        printf ',\n    {"type":"urltest","tag":"auto","outbounds":[%s],"interval":"1m","interrupt_exist_connections":false},\n' "$tags"
+        printf '    {"type":"selector","tag":"proxy","outbounds":["auto",%s],"default":"auto","interrupt_exist_connections":false},\n' "$tags"
+    else
+        printf ',\n    {"type":"selector","tag":"proxy","outbounds":[%s],"default":"%s","interrupt_exist_connections":false},\n' "$tags" "$default_tag"
+    fi
     printf '    {"type":"direct","tag":"direct"}'
 }
 
@@ -918,7 +946,7 @@ apply_server_selection() {
     gen_config
     if [ -f "$SINGBOX_DISABLED_FILE" ]; then
         info "Выбор сохранён; туннель оставлен остановленным"
-    elif _is_running && _switch_selector_live "$SELECTED_TAG"; then
+    elif _is_running && [ "$old_tag" != auto ] && [ "$SELECTED_TAG" != auto ] && _switch_selector_live "$SELECTED_TAG"; then
         if _wait_healthy 12; then
             cp "$SINGBOX_CONFIG" "$SINGBOX_GOOD_CONFIG"
             info "Сервер переключён без перезапуска sing-box"
@@ -1065,7 +1093,7 @@ normalize_domains() {
 # ─── Генерация конфига ───────────────────────────────────────────────────────
 
 gen_config() {
-    info "Генерирую конфиг..."
+    info "Проверяю конфиг..."
     mkdir -p "$(dirname "$SINGBOX_CONFIG")"
     [ -n "$SV_HOST" ] || die "Не задан сервер"
 
@@ -1149,8 +1177,13 @@ EOF
         rm -f "$tmp"
         die "Новый конфиг не прошёл sing-box check; старый оставлен без изменений"
     }
-    mv "$tmp" "$SINGBOX_CONFIG"
-    info "Конфиг записан: $SINGBOX_CONFIG"
+    if cmp -s "$tmp" "$SINGBOX_CONFIG"; then
+        rm -f "$tmp"
+        info "Конфиг уже актуален"
+    else
+        mv "$tmp" "$SINGBOX_CONFIG"
+        info "Конфиг обновлён: $SINGBOX_CONFIG"
+    fi
 }
 
 # ─── TPROXY iptables ─────────────────────────────────────────────────────────
@@ -1380,7 +1413,6 @@ _restore_last_good() {
 }
 
 start_singbox() {
-    local old_pid=""
     info "Активирую sing-box через procd..."
     mkdir -p /var/run /var/log
     install_service
@@ -1390,9 +1422,10 @@ start_singbox() {
         return 0
     fi
     rm -f "$SINGBOX_DISABLED_FILE"
-    _is_running && old_pid=$(cat "$SINGBOX_PID" 2>/dev/null)
-    if [ -n "$old_pid" ]; then "$SINGBOX_INIT" restart >/dev/null 2>&1; else "$SINGBOX_INIT" start >/dev/null 2>&1; fi
-    if _wait_healthy 20 "$old_pid"; then
+    "$SINGBOX_INIT" stop >/dev/null 2>&1 || true
+    _stop_owned_singbox_processes
+    "$SINGBOX_INIT" start >/dev/null 2>&1
+    if _wait_healthy 20; then
         cp "$SINGBOX_CONFIG" "$SINGBOX_GOOD_CONFIG"
         _iptables_ready || setup_iptables
         info "sing-box работает (PID $(cat "$SINGBOX_PID"))"
@@ -1404,8 +1437,9 @@ start_singbox() {
         die "Новая конфигурация отклонена; предыдущее соединение восстановлено"
     fi
     "$SINGBOX_INIT" stop >/dev/null 2>&1 || true
+    _stop_owned_singbox_processes
     cleanup_iptables quiet
-    die "sing-box не запустился; трафик возвращён напрямую"
+    die "Туннель не прошёл проверку соединения; трафик возвращён напрямую"
 }
 
 # ─── Watchdog ────────────────────────────────────────────────────────────────
@@ -1459,7 +1493,9 @@ refresh_subscription_and_apply() {
 
 _activate_configuration() {
     if [ "${1:-start}" = preserve ] && [ -f "$SINGBOX_DISABLED_FILE" ]; then
-        _is_running && stop_tunnel || cleanup_iptables quiet
+        [ ! -x "$SINGBOX_INIT" ] || "$SINGBOX_INIT" stop >/dev/null 2>&1 || true
+        _stop_owned_singbox_processes
+        cleanup_iptables quiet
         install_cron
         info "Конфигурация обновлена; туннель оставлен остановленным"
         return 0
@@ -1542,11 +1578,7 @@ stop_tunnel() {
     mkdir -p "$(dirname "$SINGBOX_DISABLED_FILE")"
     : > "$SINGBOX_DISABLED_FILE"
     [ ! -x "$SINGBOX_INIT" ] || { "$SINGBOX_INIT" disable >/dev/null 2>&1 || true; "$SINGBOX_INIT" stop >/dev/null 2>&1 || true; }
-    if _is_running; then
-        kill "$(cat "$SINGBOX_PID")" 2>/dev/null || true
-        sleep 1
-    fi
-    rm -f "$SINGBOX_PID"
+    _stop_owned_singbox_processes
     cleanup_iptables
     info "sing-box остановлен, трафик идёт напрямую"
 }
@@ -1924,7 +1956,7 @@ update_system() {
 
 # Минимальная проверка ссылок, списка доменов и обоих режимов маршрутизации.
 self_test() {
-    local test_dir normalized links link protocols="" expected rule_source emitted
+    local test_dir normalized links link protocols="" expected rule_source emitted config_inode
     test_dir=$(mktemp -d /tmp/singbox-test-XXXXXX) || die "mktemp failed"
     SINGBOX_BIN="${SINGBOX_TEST_BIN:-true}"
     SINGBOX_CONFIG="$test_dir/config.json"
@@ -1968,6 +2000,11 @@ self_test() {
     [ "$(_json_escape 'a\b"c')" = 'a\\b\"c' ] &&
         [ "$(_html_escape "a&<>\"'")" = 'a&amp;&lt;&gt;&quot;&#39;' ] \
         || { rm -rf "$test_dir"; die "escaping self-test failed"; }
+    ( SINGBOX_BIN=/usr/bin/sing-box; SINGBOX_CONFIG=/etc/sing-box/config.json
+      _is_owned_singbox_command '/usr/bin/sing-box run -c /etc/sing-box/config.json ' &&
+          ! _is_owned_singbox_command '/usr/bin/sing-box run -c /tmp/other.json ' &&
+          ! _is_owned_singbox_command 'timeout 10 /usr/bin/sing-box run -c /etc/sing-box/config.json ' ) \
+        || { rm -rf "$test_dir"; die "owned process self-test failed"; }
     [ "$(server_host 'vless://id@example.com:443?security=tls#Test')" = example.com:443 ] \
         || { rm -rf "$test_dir"; die "server display self-test failed"; }
     (
@@ -2064,8 +2101,13 @@ EOF
     select_server 2
     gen_config >/dev/null
     grep -Fq '"type":"trojan","tag":"server-2"' "$SINGBOX_CONFIG" &&
-        grep -Fq '"default":"server-2"' "$SINGBOX_CONFIG" \
+        grep -Fq '"default":"server-2"' "$SINGBOX_CONFIG" &&
+        ! grep -Fq '"type":"urltest","tag":"auto"' "$SINGBOX_CONFIG" \
         || { rm -rf "$test_dir"; die "server selection self-test failed"; }
+    config_inode=$(ls -di "$SINGBOX_CONFIG" | awk '{print $1}')
+    gen_config >/dev/null
+    [ "$(ls -di "$SINGBOX_CONFIG" | awk '{print $1}')" = "$config_inode" ] \
+        || { rm -rf "$test_dir"; die "unchanged config self-test failed"; }
     select_server auto
     gen_config >/dev/null
     grep -Fq '"type":"urltest","tag":"auto"' "$SINGBOX_CONFIG" &&
