@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260668"
+SCRIPT_VERSION="20260669"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -30,6 +30,7 @@ SINGBOX_RUSSIA_BLOCKED_FILE="${SINGBOX_RUSSIA_BLOCKED_FILE:-/etc/sing-box/russia
 SINGBOX_PING_FILE="${SINGBOX_PING_FILE:-/etc/sing-box/ping_cache}"
 SINGBOX_DISABLED_FILE="${SINGBOX_DISABLED_FILE:-/etc/sing-box/disabled}"
 SINGBOX_AUTO_FILE="${SINGBOX_AUTO_FILE:-/etc/sing-box/auto_select}"
+SINGBOX_FAILOVER_STATE="${SINGBOX_FAILOVER_STATE:-/var/run/sing-box-subscription-watchdog}"
 SINGBOX_LOG="/var/log/sing-box.log"
 SINGBOX_SELF="/etc/sing-box/setup.sh"
 SINGBOX_RULESET_DIR="${SINGBOX_RULESET_DIR:-/etc/sing-box/rules}"
@@ -1001,6 +1002,90 @@ apply_server_selection() {
     fi
 }
 
+_clash_group_delays() {
+    local group="$1" endpoint
+    endpoint="http://127.0.0.1:9090/group/${group}/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=8000"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS --max-time 12 "$endpoint" 2>/dev/null
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -q -T 12 -O - "$endpoint" 2>/dev/null
+    else
+        wget -q -T 12 -O - "$endpoint" 2>/dev/null
+    fi
+}
+
+_delay_for_server() {
+    # Ответ Clash API — плоский JSON-объект вида {"server-1":42,...}.
+    local response="$1" index="$2"
+    printf '%s' "$response" |
+        sed -n "s/.*\"server-${index}\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p"
+}
+
+_fastest_from_delays() {
+    local response="$1" count i=1 delay best_index="" best_delay=""
+    count=$(grep -c '.' "$SINGBOX_SERVERS_FILE" 2>/dev/null)
+    count=${count:-0}
+    while [ "$i" -le "$count" ]; do
+        delay=$(_delay_for_server "$response" "$i")
+        case "$delay" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ -z "$best_delay" ] || [ "$delay" -lt "$best_delay" ]; then
+                    best_index="$i"; best_delay="$delay"
+                fi
+                ;;
+        esac
+        i=$((i + 1))
+    done
+    [ -n "$best_index" ] || return 1
+    printf '%s %s\n' "$best_index" "$best_delay"
+}
+
+_save_proxy_delays() {
+    local response="$1" tmp count i=1 delay
+    tmp=$(mktemp /tmp/sb-delay-XXXXXX) || return 1
+    count=$(grep -c '.' "$SINGBOX_SERVERS_FILE" 2>/dev/null)
+    count=${count:-0}
+    while [ "$i" -le "$count" ]; do
+        delay=$(_delay_for_server "$response" "$i")
+        case "$delay" in ''|*[!0-9]*) delay=timeout ;; esac
+        printf '%s\t%s\n' "$i" "$delay" >> "$tmp"
+        i=$((i + 1))
+    done
+    mv "$tmp" "$SINGBOX_PING_FILE"
+    chmod 600 "$SINGBOX_PING_FILE"
+}
+
+select_fastest_server() {
+    local group response result index delay selected
+    [ -s "$SINGBOX_SERVERS_FILE" ] || die "Список серверов пуст"
+    if [ -f "$SINGBOX_DISABLED_FILE" ] || ! _is_running; then
+        info "Для разового замера запускаю туннель..."
+        # Временный URLTest позволяет запуститься через любой рабочий узел,
+        # даже если ранее выбранный вручную сервер сейчас недоступен.
+        : > "$SINGBOX_AUTO_FILE"
+        apply_configuration
+    fi
+    if [ -f "$SINGBOX_AUTO_FILE" ]; then group=auto; else group=proxy; fi
+    info "Один раз измеряю скорость доступных серверов..."
+    response=$(_clash_group_delays "$group") || die "Не удалось измерить серверы через sing-box"
+    result=$(_fastest_from_delays "$response") || die "Ни один сервер не ответил на проверку"
+    index=${result%% *}; delay=${result#* }
+    _save_proxy_delays "$response" || true
+
+    # Победитель становится постоянным приоритетом. URLTest остаётся только
+    # для failover и не пересчитывает лучший сервер, пока приоритет отвечает.
+    select_server "$index"
+    : > "$SINGBOX_AUTO_FILE"
+    load_source || die "Выбранный сервер исчез из списка"
+    gen_config
+    start_singbox
+    selected=$(cat "$SINGBOX_VLESS_FILE")
+    FASTEST_NAME=$(server_name "$selected")
+    FASTEST_DELAY="$delay"
+    info "Самый быстрый: ${FASTEST_NAME} (${FASTEST_DELAY} мс); выбор зафиксирован"
+}
+
 # Загружает уже выбранный сервер, не сбрасывая выбор при перезапуске.
 load_source() {
     SV_HOST=""
@@ -1078,6 +1163,18 @@ active_server_url() {
         [ -z "$active" ] || { printf '%s' "$active"; return; }
     fi
     printf '%s' "$preferred"
+}
+
+_preferred_server_tag() {
+    local preferred url i=0
+    preferred=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
+    [ -n "$preferred" ] || return 1
+    while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        i=$((i + 1))
+        [ "$url" != "$preferred" ] || { printf 'server-%s' "$i"; return 0; }
+    done < "$SINGBOX_SERVERS_FILE" 2>/dev/null
+    return 1
 }
 
 server_flag() {
@@ -1549,14 +1646,59 @@ _watchdog_locked() {
     [ -f "$SINGBOX_DISABLED_FILE" ] && return 0
     if ! _is_running; then
         logger -t singbox-watchdog "sing-box не запущен — запускаю через procd"
-        start_singbox
-    elif ! _iptables_ready; then
+        # Не завершаем watchdog после неудачного запуска: счётчик отказов ниже
+        # должен дойти до порога и обновить устаревшую подписку.
+        (start_singbox) || true
+    fi
+    if _is_running && ! _iptables_ready; then
         logger -t singbox-watchdog "восстанавливаю TPROXY"
         setup_iptables
     fi
+    _watchdog_subscription_refresh
     [ ! -f "$SINGBOX_LOG" ] || log_size=$(wc -c < "$SINGBOX_LOG" 2>/dev/null)
     case "$log_size" in ''|*[!0-9]*) log_size=0 ;; esac
     [ "$log_size" -le 1048576 ] || : > "$SINGBOX_LOG"
+}
+
+_watchdog_subscription_refresh() {
+    # Обновляем подписку только после трёх минут подтверждённой проблемы.
+    # Это охватывает и полный отказ, и переход sticky-failover с приоритетного
+    # сервера на резервный. Между повторными попытками выдерживается 30 минут.
+    local preferred active="" old_preferred="" failures=0 last_refresh=0 now problem=0 reason="проверка соединения не пройдена"
+    [ -s "$SINGBOX_SUB_FILE" ] || { rm -f "$SINGBOX_FAILOVER_STATE"; return 0; }
+    preferred=$(_preferred_server_tag 2>/dev/null) || return 0
+    if [ -f "$SINGBOX_AUTO_FILE" ]; then
+        active=$(_clash_group_now auto 2>/dev/null)
+        if [ -n "$active" ] && [ "$active" != "$preferred" ]; then
+            problem=1
+            reason="приоритетный сервер недоступен, активен ${active}"
+        fi
+    fi
+    health_check || problem=1
+    if [ -r "$SINGBOX_FAILOVER_STATE" ]; then
+        read -r old_preferred failures last_refresh < "$SINGBOX_FAILOVER_STATE"
+    fi
+    case "$failures" in ''|*[!0-9]*) failures=0 ;; esac
+    case "$last_refresh" in ''|*[!0-9]*) last_refresh=0 ;; esac
+    now=$(date +%s)
+    if [ "$problem" -eq 0 ]; then
+        printf '%s 0 %s\n' "$preferred" "$last_refresh" > "$SINGBOX_FAILOVER_STATE"
+        return 0
+    fi
+    [ "$old_preferred" = "$preferred" ] || failures=0
+    failures=$((failures + 1))
+    printf '%s %s %s\n' "$preferred" "$failures" "$last_refresh" > "$SINGBOX_FAILOVER_STATE"
+    [ "$failures" -ge 3 ] || return 0
+    [ $((now - last_refresh)) -ge 1800 ] || return 0
+
+    logger -t singbox-watchdog "${reason}; обновляю подписку"
+    if _state_transaction refresh_subscription_and_apply; then
+        logger -t singbox-watchdog "подписка автоматически обновлена"
+    else
+        logger -t singbox-watchdog "автоматическое обновление подписки не удалось; прежние настройки сохранены"
+    fi
+    preferred=$(_preferred_server_tag 2>/dev/null) || preferred=unknown
+    printf '%s 0 %s\n' "$preferred" "$now" > "$SINGBOX_FAILOVER_STATE"
 }
 
 _watchdog() {
@@ -1591,6 +1733,11 @@ apply_user_change() {
             install_runtime_dependencies
             install_singbox
             apply_server_selection "$1"
+            ;;
+        fastest)
+            install_runtime_dependencies
+            install_singbox
+            select_fastest_server
             ;;
         routing) save_routing_settings "$1" "$2" "$3" "$4" "$5" ;;
         start) apply_configuration ;;
@@ -1788,6 +1935,10 @@ _panel_action_unlocked() {
             count=$(refresh_pings)
             echo "Задержка проверена для ${count} серверов."
             ;;
+        fastest)
+            apply_user_change fastest
+            echo "Выбран и зафиксирован самый быстрый сервер: ${FASTEST_NAME} (${FASTEST_DELAY} мс)."
+            ;;
         select)
             index=$(_form_value server)
             apply_user_change select "$index"
@@ -1945,6 +2096,7 @@ EOF
     if [ -s "$SINGBOX_SUB_FILE" ]; then
         printf '<form method="post"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="action" value="refresh"><button class="btn ghost" type="submit">↻ Обновить</button></form>\n' "$(_html_escape "$csrf")"
     fi
+    printf '<form method="post"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="action" value="fastest"><button class="btn primary" type="submit" title="Один замер, затем стабильный failover">⚡ Самый быстрый</button></form>\n' "$(_html_escape "$csrf")"
     printf '<form method="post"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="action" value="ping"><button class="btn ghost" type="submit">⌁ Пинг</button></form></div>\n' "$(_html_escape "$csrf")"
     printf '</header><form method="post" class="server-select"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="action" value="select">\n' "$(_html_escape "$csrf")"
     cat <<'EOF'
@@ -2074,7 +2226,7 @@ update_system() {
 
 # Минимальная проверка ссылок, списка доменов и обоих режимов маршрутизации.
 self_test() {
-    local test_dir normalized links link protocols="" expected rule_source emitted config_inode parity_link
+    local test_dir normalized links link protocols="" expected rule_source emitted config_inode parity_link fastest_result
     test_dir=$(mktemp -d /tmp/singbox-test-XXXXXX) || die "mktemp failed"
     SINGBOX_BIN="${SINGBOX_TEST_BIN:-true}"
     SINGBOX_CONFIG="$test_dir/config.json"
@@ -2090,6 +2242,7 @@ self_test() {
     SINGBOX_PING_FILE="$test_dir/pings"
     SINGBOX_DISABLED_FILE="$test_dir/disabled"
     SINGBOX_AUTO_FILE="$test_dir/auto_select"
+    SINGBOX_FAILOVER_STATE="$test_dir/failover_state"
     SINGBOX_LOG="$test_dir/sing-box.log"
     SINGBOX_SELF="$test_dir/setup.sh"
     SINGBOX_CRON="$test_dir/cron"
@@ -2254,6 +2407,43 @@ EOF
     save_source "$(printf '%s\n' "$links" | sed -n '1p;3p')"
     [ "$(wc -l < "$SINGBOX_SERVERS_FILE" | tr -d ' ')" = 2 ] \
         || { rm -rf "$test_dir"; die "multiple links self-test failed"; }
+    (
+        apply_user_change() { printf '%s\n' "$@" > "$test_dir/web-fastest"; }
+        FORM_BODY='action=fastest'
+        _panel_action_unlocked >/dev/null
+    )
+    (
+        apply_user_change() { printf '%s\n' "$@" > "$test_dir/cli-fastest"; }
+        printf 'f\n' | choose_server_cli >/dev/null
+    )
+    cmp -s "$test_dir/web-fastest" "$test_dir/cli-fastest" \
+        || { rm -rf "$test_dir"; die "fastest web/CLI state path self-test failed"; }
+    fastest_result=$(_fastest_from_delays '{"server-1":121,"server-2":44}')
+    [ "$fastest_result" = "2 44" ] \
+        || { rm -rf "$test_dir"; die "one-shot fastest parser self-test failed"; }
+    (
+        install_runtime_dependencies() { :; }; install_singbox() { :; }; _is_running() { return 0; }
+        _clash_group_delays() { printf '%s' '{"server-1":121,"server-2":44}'; }
+        start_singbox() { :; }
+        apply_user_change fastest
+    ) >/dev/null
+    [ "$(cat "$SINGBOX_VLESS_FILE")" = "$(sed -n '2p' "$SINGBOX_SERVERS_FILE")" ] &&
+        [ -f "$SINGBOX_AUTO_FILE" ] &&
+        awk -F '\t' '$1 == 2 && $2 == 44 { found=1 } END { exit !found }' "$SINGBOX_PING_FILE" \
+        || { rm -rf "$test_dir"; die "one-shot fastest selection self-test failed"; }
+    printf '%s\n' 'https://example.com/subscription' > "$SINGBOX_SUB_FILE"
+    (
+        health_check() { return 1; }; _clash_group_now() { printf 'server-1'; }
+        _state_transaction() { "$@"; }
+        refresh_subscription_and_apply() { : > "$test_dir/automatic-refresh"; }
+        _watchdog_subscription_refresh
+        _watchdog_subscription_refresh
+        [ ! -f "$test_dir/automatic-refresh" ]
+        _watchdog_subscription_refresh
+    ) || { rm -rf "$test_dir"; die "subscription failover threshold self-test failed"; }
+    [ -f "$test_dir/automatic-refresh" ] \
+        || { rm -rf "$test_dir"; die "automatic subscription refresh self-test failed"; }
+    rm -f "$SINGBOX_FAILOVER_STATE" "$test_dir/automatic-refresh" "$SINGBOX_SUB_FILE"
     select_server 2
     gen_config >/dev/null
     grep -Fq '"type":"trojan","tag":"server-2"' "$SINGBOX_CONFIG" &&
@@ -2364,13 +2554,17 @@ choose_server_cli() {
     local i=0 url index
     [ -s "$SINGBOX_SERVERS_FILE" ] || die "Список серверов пуст"
     echo "  0) Автовыбор с failover"
+    echo "  f) Один раз найти самый быстрый и зафиксировать"
     while IFS= read -r url; do
         i=$((i + 1))
         printf '  %s) %s · %s · %s\n' "$i" "$(server_name "$url")" "$(server_protocol "$url")" "$(server_host "$url")"
     done < "$SINGBOX_SERVERS_FILE"
     printf "Номер сервера: "
     read -r index
-    apply_user_change select "$index"
+    case "$index" in
+        f|F|fastest) apply_user_change fastest ;;
+        *) apply_user_change select "$index" ;;
+    esac
     info "Режим подключения выбран"
 }
 
