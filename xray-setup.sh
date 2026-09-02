@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260666"
+SCRIPT_VERSION="20260667"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -1023,6 +1023,41 @@ server_host() {
     (parse_server "$1" >/dev/null 2>&1 && printf '%s:%s' "$SV_HOST" "$SV_PORT") || printf 'неизвестный сервер'
 }
 
+_clash_group_now() {
+    local group="$1" response now
+    if command -v curl >/dev/null 2>&1; then
+        response=$(curl -fsS --max-time 2 "http://127.0.0.1:9090/proxies/${group}" 2>/dev/null) || return 1
+    else
+        response=$(wget -q -T 2 -O - "http://127.0.0.1:9090/proxies/${group}" 2>/dev/null) || return 1
+    fi
+    if command -v jsonfilter >/dev/null 2>&1; then
+        now=$(printf '%s' "$response" | jsonfilter -e '@.now' 2>/dev/null)
+    else
+        now=$(printf '%s' "$response" | sed -n 's/.*"now"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    fi
+    [ -n "$now" ] || return 1
+    printf '%s' "$now"
+}
+
+_server_url_by_tag() {
+    local tag="$1" index
+    case "$tag" in server-[0-9]*) index=${tag#server-} ;; *) return 1 ;; esac
+    case "$index" in ''|*[!0-9]*) return 1 ;; esac
+    sed -n "${index}p" "$SINGBOX_SERVERS_FILE" 2>/dev/null
+}
+
+active_server_url() {
+    # Общий источник фактически активного сервера для панели и CLI.
+    local preferred tag active
+    preferred=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
+    if [ -f "$SINGBOX_AUTO_FILE" ]; then
+        tag=$(_clash_group_now auto 2>/dev/null)
+        active=$(_server_url_by_tag "$tag")
+        [ -z "$active" ] || { printf '%s' "$active"; return; }
+    fi
+    printf '%s' "$preferred"
+}
+
 server_flag() {
     local hint name="${2:-}" host="${3:-}"
     [ -n "$name" ] || name=$(server_name "$1")
@@ -1515,6 +1550,27 @@ refresh_subscription_and_apply() {
     info "Подписка и конфигурация обновлены"
 }
 
+# Единая точка изменения постоянного состояния для веб-панели и консоли.
+# Интерфейсы только собирают аргументы; запись, проверка, применение и откат
+# всегда выполняются одной и той же цепочкой функций.
+apply_user_change() {
+    local action="$1"
+    shift
+    case "$action" in
+        source)
+            save_source "$1"
+            apply_configuration "${2:-preserve}"
+            ;;
+        refresh) refresh_subscription_and_apply ;;
+        select) apply_server_selection "$1" ;;
+        routing) save_routing_settings "$1" "$2" "$3" "$4" "$5" ;;
+        start) apply_configuration ;;
+        stop) stop_tunnel ;;
+        upgrade) update_system ;;
+        *) die "Неизвестное изменение: $action" ;;
+    esac
+}
+
 # ─── Применение и веб-панель ────────────────────────────────────────────────
 
 _activate_configuration() {
@@ -1692,12 +1748,11 @@ _panel_action_unlocked() {
     case "$action" in
         source)
             source=$(_form_value source)
-            save_source "$source"
-            apply_configuration preserve
+            apply_user_change source "$source" preserve
             echo "Источник сохранён; конфигурация обновлена."
             ;;
         refresh)
-            refresh_subscription_and_apply
+            apply_user_change refresh
             echo "Подписка обновлена; текущий сервер сохранён, если он ещё доступен."
             ;;
         ping)
@@ -1706,7 +1761,7 @@ _panel_action_unlocked() {
             ;;
         select)
             index=$(_form_value server)
-            apply_server_selection "$index"
+            apply_user_change select "$index"
             echo "Режим подключения выбран."
             ;;
         routing)
@@ -1715,20 +1770,20 @@ _panel_action_unlocked() {
             telegram_calls=$(_form_value telegram_calls)
             refilter=$(_form_value refilter)
             russia=$(_form_value russia_blocked)
-            save_routing_settings "$mode" "$domains" "$telegram_calls" "$refilter" "$russia"
+            apply_user_change routing "$mode" "$domains" "$telegram_calls" "$refilter" "$russia"
             count=$(wc -l < "$SINGBOX_DOMAINS_FILE" | tr -d ' ')
             echo "Маршрутизация применена, доменов в списке: ${count}."
             ;;
         start)
-            apply_configuration
+            apply_user_change start
             echo "Туннель запущен."
             ;;
         stop)
-            stop_tunnel
+            apply_user_change stop
             echo "Туннель остановлен."
             ;;
         upgrade)
-            update_system
+            apply_user_change upgrade
             echo "Скрипт и sing-box обновлены."
             ;;
         *)
@@ -1743,7 +1798,7 @@ _panel_action() {
 
 panel_cgi() {
     local message="" action_output csrf expected length mode telegram_calls refilter russia status status_class start_label stop_disabled selected auto_select
-    local server_count domain_count route_label selected_name selected_host selected_flag selected_protocol
+    local server_count domain_count route_label selected_name selected_host selected_flag selected_protocol active_selected
     if [ "${REQUEST_METHOD:-GET}" = "POST" ]; then
         case "${CONTENT_TYPE:-}" in application/x-www-form-urlencoded*) ;; *) die "Unsupported Content-Type" ;; esac
         length="${CONTENT_LENGTH:-0}"
@@ -1772,6 +1827,7 @@ panel_cgi() {
     [ "$russia" = 1 ] || russia=0
     selected=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
     [ -f "$SINGBOX_AUTO_FILE" ] && auto_select=1 || auto_select=0
+    active_selected=$(active_server_url)
     server_count=$(grep -c '.' "$SINGBOX_SERVERS_FILE" 2>/dev/null)
     server_count="${server_count:-0}"
     domain_count=$(grep -c '.' "$SINGBOX_DOMAINS_FILE" 2>/dev/null)
@@ -1783,10 +1839,17 @@ panel_cgi() {
     fi
     if [ "$mode" = "list" ]; then route_label="По списку"; else route_label="Весь трафик"; fi
     if [ "$auto_select" = 1 ]; then
-        selected_name="Автовыбор"
-        selected_host="Лучший доступный сервер с автоматическим failover"
-        selected_flag="⚡"
-        selected_protocol="URLTest"
+        if [ -n "$active_selected" ]; then
+            selected_name="Автовыбор · $(server_name "$active_selected")"
+            selected_host=$(server_host "$active_selected")
+            selected_flag=$(server_flag "$active_selected")
+            selected_protocol=$(server_protocol "$active_selected")
+        else
+            selected_name="Автовыбор"
+            selected_host="Ожидаю доступный сервер"
+            selected_flag="⚡"
+            selected_protocol="URLTest"
+        fi
     elif [ -n "$selected" ]; then
         selected_name=$(server_name "$selected")
         selected_host=$(server_host "$selected")
@@ -1982,7 +2045,7 @@ update_system() {
 
 # Минимальная проверка ссылок, списка доменов и обоих режимов маршрутизации.
 self_test() {
-    local test_dir normalized links link protocols="" expected rule_source emitted config_inode
+    local test_dir normalized links link protocols="" expected rule_source emitted config_inode parity_link
     test_dir=$(mktemp -d /tmp/singbox-test-XXXXXX) || die "mktemp failed"
     SINGBOX_BIN="${SINGBOX_TEST_BIN:-true}"
     SINGBOX_CONFIG="$test_dir/config.json"
@@ -2026,6 +2089,18 @@ self_test() {
     [ "$(_json_escape 'a\b"c')" = 'a\\b\"c' ] &&
         [ "$(_html_escape "a&<>\"'")" = 'a&amp;&lt;&gt;&quot;&#39;' ] \
         || { rm -rf "$test_dir"; die "escaping self-test failed"; }
+    parity_link='vless://11111111-1111-1111-1111-111111111111@example.com:443'
+    (
+        apply_user_change() { printf '%s\n' "$@" > "$test_dir/web-change"; }
+        FORM_BODY="action=source&source=${parity_link}"
+        _panel_action_unlocked >/dev/null
+    )
+    (
+        apply_user_change() { printf '%s\n' "$@" > "$test_dir/cli-change"; }
+        printf '%s\n\n' "$parity_link" | prompt_source_cli >/dev/null
+    )
+    cmp -s "$test_dir/web-change" "$test_dir/cli-change" \
+        || { rm -rf "$test_dir"; die "web/CLI state path self-test failed"; }
     ( SINGBOX_BIN=/usr/bin/sing-box; SINGBOX_CONFIG=/etc/sing-box/config.json
       _is_owned_singbox_command '/usr/bin/sing-box run -c /etc/sing-box/config.json ' &&
           ! _is_owned_singbox_command '/usr/bin/sing-box run -c /tmp/other.json ' &&
@@ -2154,6 +2229,12 @@ EOF
         grep -Fq '"outbounds":["server-2","server-1"],"url":"https://www.gstatic.com/generate_204","interval":"1m","tolerance":10000' "$SINGBOX_CONFIG" &&
         grep -Fq '"default":"auto"' "$SINGBOX_CONFIG" \
         || { rm -rf "$test_dir"; die "automatic failover self-test failed"; }
+    link=$(
+        _clash_group_now() { printf 'server-1'; }
+        active_server_url
+    )
+    [ "$link" = "$(sed -n '1p' "$SINGBOX_SERVERS_FILE")" ] \
+        || { rm -rf "$test_dir"; die "active failover state self-test failed"; }
     [ "$(ping_quality 79)" = 4 ] && [ "$(ping_quality 301)" = 1 ] && [ "$(ping_quality timeout)" = 0 ] \
         || { rm -rf "$test_dir"; die "ping quality self-test failed"; }
     printf '17 */6 * * * sh /old/setup.sh refresh %s\n5 4 * * * echo keep\n' "$SUB_REFRESH_MARKER" > "$SINGBOX_CRON"
@@ -2220,10 +2301,9 @@ EOF
 
 configure_source() {
     install_runtime_dependencies
-    save_source "$1"
     persist_self
     install_panel
-    apply_configuration "${2:-preserve}"
+    apply_user_change source "$1" "${2:-preserve}"
     info "Источник серверов сохранён"
 }
 
@@ -2236,7 +2316,7 @@ prompt_source_cli() {
 $line"; else source="$line"; fi
     done
     [ -n "$source" ] || die "Источник не указан"
-    configure_source "$source" preserve
+    apply_user_change source "$source" preserve
 }
 
 choose_server_cli() {
@@ -2249,7 +2329,7 @@ choose_server_cli() {
     done < "$SINGBOX_SERVERS_FILE"
     printf "Номер сервера: "
     read -r index
-    apply_server_selection "$index"
+    apply_user_change select "$index"
     info "Режим подключения выбран"
 }
 
@@ -2296,7 +2376,7 @@ $line"
             done
             ;;
     esac
-    save_routing_settings "$mode" "$domains" "$telegram" "$refilter" "$russia"
+    apply_user_change routing "$mode" "$domains" "$telegram" "$refilter" "$russia"
     info "Маршрутизация сохранена"
 }
 
@@ -2338,10 +2418,10 @@ show_menu() {
     echo ""
     case "$choice" in
         1)
-            _with_lock _state_transaction apply_configuration
+            _with_lock _state_transaction apply_user_change start
             ;;
         2)
-            _with_lock stop_tunnel
+            _with_lock _state_transaction apply_user_change stop
             ;;
         3)
             _with_lock _state_transaction prompt_source_cli
@@ -2353,14 +2433,14 @@ show_menu() {
             _with_lock _state_transaction configure_routing_cli
             ;;
         6)
-            _with_lock _state_transaction refresh_subscription_and_apply
+            _with_lock _state_transaction apply_user_change refresh
             ;;
         7)
             echo "--- Последние 30 строк лога ---"
             tail -30 "$SINGBOX_LOG" 2>/dev/null || echo "Лог пустой"
             ;;
         8)
-            _with_lock _state_transaction update_system
+            _with_lock _state_transaction apply_user_change upgrade
             ;;
         9)
             _with_lock install_panel
@@ -2397,13 +2477,13 @@ case "${1:-}" in
         _watchdog
         ;;
     refresh)
-        _with_lock _state_transaction refresh_subscription_and_apply
+        _with_lock _state_transaction apply_user_change refresh
         ;;
     stop)
-        _with_lock stop_tunnel
+        _with_lock _state_transaction apply_user_change stop
         ;;
     restart)
-        _with_lock _state_transaction apply_configuration
+        _with_lock _state_transaction apply_user_change start
         ;;
     apply-update)
         if [ "${SINGBOX_LOCK_HELD:-0}" = 1 ]; then apply_update; else _with_lock _state_transaction apply_update; fi
@@ -2412,7 +2492,7 @@ case "${1:-}" in
         _with_lock install_panel
         ;;
     self-update)
-        _with_lock _state_transaction update_system
+        _with_lock _state_transaction apply_user_change upgrade
         ;;
     routing)
         _with_lock _state_transaction configure_routing_cli
@@ -2424,7 +2504,12 @@ case "${1:-}" in
         if _is_running; then
             info "sing-box работает (PID $(cat "$SINGBOX_PID"))"
             if [ -f "$SINGBOX_AUTO_FILE" ]; then
-                info "Сервер: автовыбор с failover"
+                _url=$(active_server_url)
+                if [ -n "$_url" ]; then
+                    info "Сервер: автовыбор → $(server_name "$_url") · $(server_host "$_url")"
+                else
+                    info "Сервер: автовыбор, ожидаю доступный узел"
+                fi
             elif [ -f "$SINGBOX_VLESS_FILE" ]; then
                 info "Сервер: $(server_host "$(cat "$SINGBOX_VLESS_FILE")")"
             fi
