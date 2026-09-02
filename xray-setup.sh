@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260669"
+SCRIPT_VERSION="20260670"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -1217,6 +1217,49 @@ server_flag() {
     esac
 }
 
+server_country_code() {
+    local url="$1" name="${2:-}" host="${3:-}" code hint
+    [ -n "$name" ] || name=$(server_name "$url")
+    [ -n "$host" ] || host=$(server_host "$url")
+    # Большинство подписок начинают имя с ISO-кода: NL Amsterdam, GR Athens…
+    code=$(printf '%s' "$name" | sed -n 's/^[[:space:]]*\([A-Za-z][A-Za-z]\)\([^A-Za-z].*\)$/\1/p')
+    if [ -n "$code" ]; then
+        code=$(printf '%s' "$code" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+        [ "$code" = uk ] && code=gb
+        printf '%s' "$code"
+        return 0
+    fi
+    hint=$(printf ' %s %s ' "$name" "$host" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+    case "$hint" in
+        *🇳🇱*|*netherlands*|*amsterdam*) code=nl ;; *🇩🇪*|*germany*|*frankfurt*) code=de ;;
+        *🇺🇸*|*usa*|*united*states*|*new*york*) code=us ;; *🇬🇧*|*united*kingdom*|*london*) code=gb ;;
+        *🇫🇷*|*france*|*paris*) code=fr ;; *🇫🇮*|*finland*|*helsinki*) code=fi ;;
+        *🇸🇪*|*sweden*|*stockholm*) code=se ;; *🇳🇴*|*norway*|*oslo*) code=no ;;
+        *🇨🇭*|*switzerland*|*zurich*) code=ch ;; *🇵🇱*|*poland*|*warsaw*) code=pl ;;
+        *🇨🇿*|*czech*|*prague*) code=cz ;; *🇦🇹*|*austria*|*vienna*) code=at ;;
+        *🇪🇸*|*spain*|*madrid*) code=es ;; *🇮🇹*|*italy*|*milan*) code=it ;;
+        *🇨🇦*|*canada*|*toronto*) code=ca ;; *🇯🇵*|*japan*|*tokyo*) code=jp ;;
+        *🇸🇬*|*singapore*) code=sg ;; *🇰🇷*|*korea*|*seoul*) code=kr ;;
+        *🇭🇰*|*hong*kong*) code=hk ;; *🇦🇪*|*emirates*|*dubai*) code=ae ;;
+        *🇮🇳*|*india*|*mumbai*) code=in ;; *🇦🇺*|*australia*|*sydney*) code=au ;;
+        *🇧🇷*|*brazil*|*sao*paulo*) code=br ;; *🇹🇷*|*turkey*|*istanbul*) code=tr ;;
+        *🇰🇿*|*kazakhstan*|*almaty*) code=kz ;; *🇷🇺*|*russia*|*moscow*) code=ru ;;
+        *) return 1 ;;
+    esac
+    printf '%s' "$code"
+}
+
+server_flag_markup() {
+    local url="$1" name="${2:-}" host="${3:-}" code label
+    code=$(server_country_code "$url" "$name" "$host" 2>/dev/null) || {
+        printf '%s' "$(server_flag "$url" "$name" "$host")"
+        return 0
+    }
+    label=$(printf '%s' "$code" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    printf '<span class="country-code">%s</span><img class="country-flag" src="https://flagcdn.com/w40/%s.png" srcset="https://flagcdn.com/w80/%s.png 2x" width="40" height="30" alt="Флаг %s" loading="lazy" onerror="this.remove()">' \
+        "$label" "$code" "$code" "$label"
+}
+
 ping_quality() {
     case "$1" in
         ''|timeout|*[!0-9]*) printf '0' ;;
@@ -1225,27 +1268,42 @@ ping_quality() {
     esac
 }
 
+_ping_server_to_file() {
+    local index="$1" url="$2" result_file="$3" host output ms
+    host=$(parse_server "$url" >/dev/null 2>&1 && printf '%s' "$SV_HOST")
+    if [ -n "$host" ]; then
+        output=$(ping -c 1 -W 1 "$host" 2>/dev/null)
+        ms=$(printf '%s\n' "$output" | sed -n 's/.*time[=<]\([0-9.]*\).*/\1/p' | head -1)
+        [ -n "$ms" ] && ms=$(awk -v n="$ms" 'BEGIN{printf "%.0f", n}')
+    else
+        ms=""
+    fi
+    printf '%s\t%s\n' "$index" "${ms:-timeout}" > "$result_file"
+}
+
 refresh_pings() {
     command -v ping >/dev/null 2>&1 || die "Команда ping не найдена"
-    local tmp i=0 checked=0 url host output ms
+    local tmp work_dir i=0 checked=0 batch=0 url result
     tmp=$(mktemp /tmp/sb-ping-XXXXXX) || die "Не удалось создать временный файл"
-    # ponytail: последовательная проверка ограничена 30 серверами; нужны воркеры только для больших подписок.
+    work_dir=$(mktemp -d /tmp/sb-ping-workers-XXXXXX) || { rm -f "$tmp"; die "Не удалось создать временный каталог"; }
+    # Проверяем весь список, но не перегружаем роутер: максимум 8 ping одновременно.
     while IFS= read -r url; do
-        i=$((i + 1))
-        if [ "$checked" -ge 30 ]; then
-            continue
+        [ -n "$url" ] || continue
+        i=$((i + 1)); checked=$((checked + 1)); batch=$((batch + 1))
+        (_ping_server_to_file "$i" "$url" "$work_dir/$i") &
+        if [ "$batch" -ge 8 ]; then
+            wait
+            batch=0
         fi
-        host=$(parse_server "$url" >/dev/null 2>&1 && printf '%s' "$SV_HOST")
-        if [ -n "$host" ]; then
-            output=$(ping -c 1 -W 1 "$host" 2>/dev/null)
-            ms=$(printf '%s\n' "$output" | sed -n 's/.*time[=<]\([0-9.]*\).*/\1/p' | head -1)
-            [ -n "$ms" ] && ms=$(awk -v n="$ms" 'BEGIN{printf "%.0f", n}')
-        else
-            ms=""
-        fi
-        printf '%s\t%s\n' "$i" "${ms:-timeout}" >> "$tmp"
-        checked=$((checked + 1))
     done < "$SINGBOX_SERVERS_FILE"
+    wait
+    i=1
+    while [ "$i" -le "$checked" ]; do
+        result="$work_dir/$i"
+        if [ -s "$result" ]; then cat "$result" >> "$tmp"; else printf '%s\ttimeout\n' "$i" >> "$tmp"; fi
+        i=$((i + 1))
+    done
+    rm -rf "$work_dir"
     mv "$tmp" "$SINGBOX_PING_FILE"
     chmod 600 "$SINGBOX_PING_FILE"
     printf '%s' "$checked"
@@ -1929,7 +1987,9 @@ _panel_action_unlocked() {
             ;;
         refresh)
             apply_user_change refresh
-            echo "Подписка обновлена; текущий сервер сохранён, если он ещё доступен."
+            count=$(grep -c '.' "$SINGBOX_SERVERS_FILE" 2>/dev/null)
+            count=${count:-0}
+            echo "Подписка заново скачана, конфиг пересобран; серверов: ${count}."
             ;;
         ping)
             count=$(refresh_pings)
@@ -2022,7 +2082,7 @@ panel_cgi() {
         if [ -n "$active_selected" ]; then
             selected_name="Автовыбор · $(server_name "$active_selected")"
             selected_host=$(server_host "$active_selected")
-            selected_flag=$(server_flag "$active_selected")
+            selected_flag=$(server_flag_markup "$active_selected")
             selected_protocol=$(server_protocol "$active_selected")
         else
             selected_name="Автовыбор"
@@ -2033,7 +2093,7 @@ panel_cgi() {
     elif [ -n "$selected" ]; then
         selected_name=$(server_name "$selected")
         selected_host=$(server_host "$selected")
-        selected_flag=$(server_flag "$selected")
+        selected_flag=$(server_flag_markup "$selected")
         selected_protocol=$(server_protocol "$selected")
     else
         selected_name="Сервер не выбран"
@@ -2054,9 +2114,9 @@ panel_cgi() {
 button,input,textarea,select{font:inherit}button,summary,label{touch-action:manipulation}.shell{width:min(1180px,100%);margin:auto;padding:30px 24px 48px}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:24px}.topbar-actions{display:flex;align-items:center;gap:8px}.brand{display:flex;align-items:center;gap:12px}.brand-mark{display:grid;place-items:center;width:42px;height:42px;border-radius:13px;background:linear-gradient(145deg,var(--accent),var(--accent-2));box-shadow:0 12px 34px #6d7cff44;font-size:20px;font-weight:850}.brand h1{font-size:18px;letter-spacing:-.02em;margin:0}.brand p{color:var(--muted);font-size:12px;margin:2px 0 0}
 .status-pill{display:flex;align-items:center;gap:8px;padding:9px 13px;border:1px solid var(--line);border-radius:999px;background:#111823;color:#cbd5e1;font-size:13px;font-weight:650}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 0 4px #ff68741c}.status-pill.online .status-dot{background:var(--green);box-shadow:0 0 0 4px #35d39a1c}
-.overview{display:grid;grid-template-columns:minmax(0,2fr) repeat(2,minmax(160px,1fr));gap:14px;margin-bottom:14px}.card{border:1px solid var(--line);border-radius:var(--radius);background:linear-gradient(160deg,#121925 0%,#0e141e 100%);box-shadow:0 22px 70px #0005}.hero{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:24px}.eyebrow{display:block;color:#8290a5;font-size:11px;font-weight:750;letter-spacing:.11em;text-transform:uppercase;margin-bottom:12px}.server-identity{display:flex;align-items:center;gap:15px;min-width:0}.flag{display:grid;place-items:center;flex:none;width:44px;height:44px;border:1px solid #ffffff12;border-radius:14px;background:#ffffff09;font-size:25px}.flag.large{width:58px;height:58px;border-radius:18px;font-size:32px}.server-identity h2{margin:0;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:24px;letter-spacing:-.035em}.server-identity p{margin:4px 0 0;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis}
+.overview{display:grid;grid-template-columns:minmax(0,2fr) repeat(2,minmax(160px,1fr));gap:14px;margin-bottom:14px}.card{border:1px solid var(--line);border-radius:var(--radius);background:linear-gradient(160deg,#121925 0%,#0e141e 100%);box-shadow:0 22px 70px #0005}.hero{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:24px}.eyebrow{display:block;color:#8290a5;font-size:11px;font-weight:750;letter-spacing:.11em;text-transform:uppercase;margin-bottom:12px}.server-identity{display:flex;align-items:center;gap:15px;min-width:0}.flag{position:relative;display:grid;place-items:center;flex:none;width:44px;height:44px;border:1px solid #ffffff12;border-radius:14px;background:#ffffff09;font-size:25px;overflow:hidden}.flag.large{width:58px;height:58px;border-radius:18px;font-size:32px}.country-code{font-size:15px;font-weight:850;letter-spacing:.04em}.country-flag{position:absolute;width:36px;height:27px;border-radius:4px;object-fit:cover;box-shadow:0 2px 8px #0008}.flag.large .country-flag{width:44px;height:33px}.server-identity h2{margin:0;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:24px;letter-spacing:-.035em}.server-identity p{margin:4px 0 0;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis}
 .controls{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}.metric{display:flex;flex-direction:column;justify-content:space-between;min-height:142px;padding:20px}.metric-icon{display:grid;place-items:center;width:34px;height:34px;border:1px solid #ffffff10;border-radius:11px;background:#ffffff08;color:#b8c1ff;font-weight:800}.metric span{color:var(--muted);font-size:12px}.metric strong{display:block;margin-top:auto;font-size:25px;letter-spacing:-.04em}.metric small{color:#718096}
-.workspace{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(340px,.85fr);gap:14px;align-items:start}.section{padding:22px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}.section-head h2{margin:0;font-size:17px;letter-spacing:-.02em}.section-head p{margin:3px 0 0;color:var(--muted);font-size:12px}.section-actions{display:flex;gap:7px}.server-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;max-height:410px;overflow:auto;padding:1px 4px 1px 1px}
+.workspace{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(340px,.85fr);gap:14px;align-items:start}.section{padding:22px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}.section-head h2{margin:0;font-size:17px;letter-spacing:-.02em}.section-head p{margin:3px 0 0;color:var(--muted);font-size:12px}.section-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px}.server-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;max-height:410px;overflow:auto;padding:1px 4px 1px 1px}
 .server-card{position:relative;display:flex;align-items:center;gap:12px;min-width:0;padding:13px;border:1px solid var(--line);border-radius:15px;background:#0c121b;cursor:pointer;transition:border-color .16s,background .16s,transform .16s}.server-card:hover{transform:translateY(-1px);border-color:#3b4760;background:#111926}.server-card:has(input:checked){border-color:#6978ff;background:linear-gradient(135deg,#17203a,#12182a);box-shadow:inset 0 0 0 1px #6978ff40}.server-card input{position:absolute;opacity:0;pointer-events:none}.server-card:focus-within{outline:2px solid #94a0ff;outline-offset:2px}.server-copy{min-width:0;flex:1}.server-copy strong,.server-copy small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.server-copy strong{font-size:14px}.server-copy small{margin-top:3px;color:var(--muted);font:11px ui-monospace,SFMono-Regular,Menlo,monospace}.check{display:grid;place-items:center;width:22px;height:22px;border:1px solid #344055;border-radius:50%;color:transparent;font-size:12px}.server-card:has(input:checked) .check{border-color:var(--accent);background:var(--accent);color:white}
 .server-meta{display:flex;align-items:center;gap:7px;margin-top:6px}.protocol{display:inline-flex;padding:2px 6px;border-radius:6px;background:#6573ef1c;color:#aeb7ff;font-size:9px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}.latency{white-space:nowrap;color:#8f9caf;font:10px ui-monospace,SFMono-Regular,Menlo,monospace}.server-health{display:grid;justify-items:end;gap:8px}.signal{display:flex;align-items:end;gap:2px;height:16px}.signal i{display:block;width:3px;border-radius:2px;background:#303b4e}.signal i:nth-child(1){height:4px}.signal i:nth-child(2){height:7px}.signal i:nth-child(3){height:11px}.signal i:nth-child(4){height:15px}.signal.q1 i:nth-child(-n+1),.signal.q2 i:nth-child(-n+2),.signal.q3 i:nth-child(-n+3),.signal.q4 i{background:var(--green)}.signal.q1 i:nth-child(-n+1){background:var(--red)}.signal.q2 i:nth-child(-n+2){background:#f6b94a}.protocol-filter{display:flex;flex-wrap:wrap;gap:6px;margin:-3px 0 13px}.protocol-filter input{position:absolute;opacity:0}.protocol-filter label{padding:6px 9px;border:1px solid var(--line);border-radius:9px;color:var(--muted);font-size:10px;font-weight:750;cursor:pointer}.protocol-filter input:checked+label{border-color:#6573ef;background:#6573ef20;color:#d8dcff}.protocol-filter input:focus-visible+label{outline:2px solid #94a0ff;outline-offset:2px}.server-select:has(#filter-vless:checked) .server-card:not(.p-vless),.server-select:has(#filter-vmess:checked) .server-card:not(.p-vmess),.server-select:has(#filter-trojan:checked) .server-card:not(.p-trojan),.server-select:has(#filter-shadowsocks:checked) .server-card:not(.p-shadowsocks),.server-select:has(#filter-hysteria2:checked) .server-card:not(.p-hysteria2),.server-select:has(#filter-tuic:checked) .server-card:not(.p-tuic){display:none}
 .empty{display:grid;grid-column:1/-1;place-items:center;min-height:210px;padding:30px;text-align:center;border:1px dashed #2b374a;border-radius:16px;background:#0b1018}.empty-icon{display:grid;place-items:center;width:48px;height:48px;margin-bottom:12px;border-radius:15px;background:#171f2d;color:#aeb7ff;font-size:22px}.empty strong{font-size:15px}.empty p{max-width:330px;margin:5px 0 0;color:var(--muted);font-size:13px}
@@ -2066,13 +2126,13 @@ button,input,textarea,select{font:inherit}button,summary,label{touch-action:mani
 .segment{display:grid;grid-template-columns:1fr 1fr;gap:8px}.route-option{position:relative;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c121b;cursor:pointer}.route-option:has(input:checked){border-color:#6573ef;background:#141b31}.route-option input{position:absolute;opacity:0}.route-option b,.route-option small{display:block}.route-option b{font-size:13px}.route-option small{margin-top:4px;color:var(--muted);font-size:11px}.route-option:focus-within{outline:2px solid #94a0ff;outline-offset:2px}.feature-toggle{position:relative;display:flex;align-items:center;gap:12px;margin-top:10px;padding:13px;border:1px solid var(--line);border-radius:14px;background:#0c121b;cursor:pointer}.feature-toggle:has(input:checked){border-color:#249fd1;background:#0e1d29}.feature-toggle input{position:absolute;opacity:0}.feature-toggle:focus-within{outline:2px solid #94a0ff;outline-offset:2px}.feature-copy{min-width:0;flex:1}.feature-copy b,.feature-copy small{display:block}.feature-copy b{font-size:13px}.feature-copy small{margin-top:4px;color:var(--muted);font-size:11px}.switch{position:relative;flex:none;width:42px;height:24px;border-radius:999px;background:#303b4e;transition:background .16s}.switch:before{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 2px 7px #0007;transition:transform .16s}.feature-toggle input:checked+.switch{background:#249fd1}.feature-toggle input:checked+.switch:before{transform:translateX(18px)}textarea{height:170px;min-height:170px;padding:12px;resize:none;overflow:auto;line-height:1.55}.hint{margin:8px 0 0;color:var(--muted);font-size:11px}
 .notice{margin:0 0 14px;padding:12px 14px;border:1px solid #35d39a32;border-radius:13px;background:#35d39a12;color:#a9f0d5;font-size:13px}.notice.error{border-color:#ff68743d;background:#ff687414;color:#ffabb2}
 body[data-busy]{cursor:progress}body[data-busy] form{pointer-events:none}body[data-busy]:before{content:"";position:fixed;z-index:20;top:0;left:0;width:32%;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent-2));box-shadow:0 0 18px var(--accent);animation:progress 1s ease-in-out infinite}@keyframes progress{0%{transform:translateX(-110%)}100%{transform:translateX(420%)}}
-@media(max-width:1020px){.overview{grid-template-columns:1fr 1fr}.hero{grid-column:1/-1}}@media(max-width:900px){.workspace{grid-template-columns:1fr}}@media(max-width:620px){.shell{padding:20px 14px 36px}.topbar,.hero{align-items:flex-start;flex-direction:column}.topbar-actions{width:100%;justify-content:space-between}.status-pill{align-self:flex-start}.overview{grid-template-columns:1fr 1fr}.hero{padding:20px}.controls{justify-content:flex-start}.server-grid,.segment{grid-template-columns:1fr}.source-form{grid-template-columns:1fr}.server-identity h2{font-size:20px}.metric{min-height:120px;padding:16px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+@media(max-width:1020px){.overview{grid-template-columns:1fr 1fr}.hero{grid-column:1/-1}}@media(max-width:900px){.workspace{grid-template-columns:1fr}}@media(max-width:620px){.shell{padding:20px 14px 36px}.topbar,.hero,.section-head{align-items:flex-start;flex-direction:column}.topbar-actions{width:100%;justify-content:space-between}.section-actions{width:100%;justify-content:flex-start}.status-pill{align-self:flex-start}.overview{grid-template-columns:1fr 1fr}.hero{padding:20px}.controls{justify-content:flex-start}.server-grid,.segment{grid-template-columns:1fr}.source-form{grid-template-columns:1fr}.server-identity h2{font-size:20px}.metric{min-height:120px;padding:16px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 </style></head><body><main class="shell">
 EOF
     cat <<EOF
 <header class="topbar">
   <div class="brand"><span class="brand-mark" aria-hidden="true">S</span><div><h1>SingBox Router</h1><p>OpenWrt control plane · v${SCRIPT_VERSION}</p></div></div>
-  <div class="topbar-actions"><form method="post"><input type="hidden" name="csrf" value="$(_html_escape "$csrf")"><button class="btn ghost" name="action" value="upgrade" title="Обновить скрипт, sing-box и включённые списки">↑ Обновить</button></form><div class="status-pill ${status_class}"><span class="status-dot"></span>$(_html_escape "$status")</div></div>
+  <div class="topbar-actions"><form method="post"><input type="hidden" name="csrf" value="$(_html_escape "$csrf")"><button class="btn ghost" name="action" value="upgrade" title="Обновить скрипт, sing-box и включённые списки">↑ Обновить систему</button></form><div class="status-pill ${status_class}"><span class="status-dot"></span>$(_html_escape "$status")</div></div>
 </header>
 EOF
     if [ -n "$message" ]; then
@@ -2082,7 +2142,7 @@ EOF
     cat <<EOF
 <section class="overview">
   <article class="card hero">
-    <div><span class="eyebrow">Текущий сервер</span><div class="server-identity"><span class="flag large" aria-hidden="true">$(_html_escape "$selected_flag")</span><div><h2>$(_html_escape "$selected_name")</h2><p>$(_html_escape "$selected_host") · $(_html_escape "$selected_protocol")</p></div></div></div>
+    <div><span class="eyebrow">Текущий сервер</span><div class="server-identity"><span class="flag large">${selected_flag}</span><div><h2>$(_html_escape "$selected_name")</h2><p>$(_html_escape "$selected_host") · $(_html_escape "$selected_protocol")</p></div></div></div>
     <form method="post" class="controls"><input type="hidden" name="csrf" value="$(_html_escape "$csrf")"><button class="btn primary" name="action" value="start">$(_html_escape "$start_label")</button><button class="btn danger" name="action" value="stop"${stop_disabled}>Остановить</button></form>
   </article>
   <article class="card metric"><span class="metric-icon">#</span><div><span>Серверов</span><strong>${server_count}</strong><small>в текущем источнике</small></div></article>
@@ -2094,7 +2154,7 @@ EOF
 EOF
     printf '<div class="section-actions">'
     if [ -s "$SINGBOX_SUB_FILE" ]; then
-        printf '<form method="post"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="action" value="refresh"><button class="btn ghost" type="submit">↻ Обновить</button></form>\n' "$(_html_escape "$csrf")"
+        printf '<form method="post"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="action" value="refresh"><button class="btn ghost" type="submit" title="Заново скачать сохранённую подписку и пересобрать конфиг">↻ Перекачать подписку</button></form>\n' "$(_html_escape "$csrf")"
     fi
     printf '<form method="post"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="action" value="fastest"><button class="btn primary" type="submit" title="Один замер, затем стабильный failover">⚡ Самый быстрый</button></form>\n' "$(_html_escape "$csrf")"
     printf '<form method="post"><input type="hidden" name="csrf" value="%s"><input type="hidden" name="action" value="ping"><button class="btn ghost" type="submit">⌁ Пинг</button></form></div>\n' "$(_html_escape "$csrf")"
@@ -2118,7 +2178,7 @@ EOF
             i=$((i + 1))
             name=$(server_name "$url")
             host=$(server_host "$url")
-            flag=$(server_flag "$url" "$name" "$host")
+            flag=$(server_flag_markup "$url" "$name" "$host")
             protocol=$(server_protocol "$url")
             protocol_key=$(server_protocol_key "$url")
             if [ -s "$SINGBOX_PING_FILE" ]; then
@@ -2131,7 +2191,7 @@ EOF
                 *) latency_label="${latency} мс" ;; esac
             [ "$auto_select" = 0 ] && [ "$url" = "$selected" ] && checked=" checked" || checked=""
             printf '<label class="server-card p-%s"><input type="radio" name="server" value="%s"%s><span class="flag" aria-hidden="true">%s</span><span class="server-copy"><strong>%s</strong><small>%s</small><span class="server-meta"><span class="protocol">%s</span><span class="latency">%s</span></span></span><span class="server-health"><span class="signal q%s" title="Пинг: %s" aria-label="Качество соединения: %s из 4"><i></i><i></i><i></i><i></i></span><span class="check" aria-hidden="true">✓</span></span></label>\n' \
-                "$protocol_key" "$i" "$checked" "$(_html_escape "$flag")" "$(_html_escape "$name")" "$(_html_escape "$host")" \
+                "$protocol_key" "$i" "$checked" "$flag" "$(_html_escape "$name")" "$(_html_escape "$host")" \
                 "$(_html_escape "$protocol")" "$(_html_escape "$latency_label")" "$quality" "$(_html_escape "$latency_label")" "$quality"
         done < "$SINGBOX_SERVERS_FILE"
     else
@@ -2226,7 +2286,7 @@ update_system() {
 
 # Минимальная проверка ссылок, списка доменов и обоих режимов маршрутизации.
 self_test() {
-    local test_dir normalized links link protocols="" expected rule_source emitted config_inode parity_link fastest_result
+    local test_dir normalized links link protocols="" expected rule_source emitted config_inode parity_link fastest_result ping_count test_i
     test_dir=$(mktemp -d /tmp/singbox-test-XXXXXX) || die "mktemp failed"
     SINGBOX_BIN="${SINGBOX_TEST_BIN:-true}"
     SINGBOX_CONFIG="$test_dir/config.json"
@@ -2354,6 +2414,12 @@ self_test() {
     fi
     [ "$(server_flag 'vless://id@nl.example:443#Amsterdam NL')" = "🇳🇱" ] \
         || { rm -rf "$test_dir"; die "server_flag self-test failed"; }
+    [ "$(server_country_code 'vless://id@example.com:443#GR Athens, Greece')" = gr ] &&
+        [ "$(server_country_code 'vless://id@example.com:443#BG Sofia, Bulgaria')" = bg ] &&
+        [ "$(server_country_code 'vless://id@example.com:443#CO Bogota, Colombia')" = co ] &&
+        [ "$(server_country_code 'vless://id@example.com:443#BE Brussels, Belgium')" = be ] &&
+        printf '%s' "$(server_flag_markup 'vless://id@example.com:443#NL Amsterdam')" | grep -Fq 'flagcdn.com/w40/nl.png' \
+        || { rm -rf "$test_dir"; die "country flag image self-test failed"; }
     normalized=$(printf 'Example.COM\r\n*.blocked.test\nhttps://foo.example?x=1\nbad$host\nfoo..test\nexample.com\n' | normalize_domains)
     [ "$normalized" = "$(printf 'example.com\nblocked.test\nfoo.example')" ] \
         || { rm -rf "$test_dir"; die "domain self-test failed"; }
@@ -2468,6 +2534,20 @@ EOF
         || { rm -rf "$test_dir"; die "active failover state self-test failed"; }
     [ "$(ping_quality 79)" = 4 ] && [ "$(ping_quality 301)" = 1 ] && [ "$(ping_quality timeout)" = 0 ] \
         || { rm -rf "$test_dir"; die "ping quality self-test failed"; }
+    cp "$SINGBOX_SERVERS_FILE" "$test_dir/servers.before-ping"
+    : > "$SINGBOX_SERVERS_FILE"
+    test_i=1
+    while [ "$test_i" -le 62 ]; do
+        printf 'vless://11111111-1111-1111-1111-111111111111@ping-%s.example:443#NL-Test-%s\n' "$test_i" "$test_i" >> "$SINGBOX_SERVERS_FILE"
+        test_i=$((test_i + 1))
+    done
+    ping_count=$(
+        ping() { printf '%s\n' '64 bytes from test: time=12.4 ms'; }
+        refresh_pings
+    )
+    [ "$ping_count" = 62 ] && [ "$(wc -l < "$SINGBOX_PING_FILE" | tr -d ' ')" = 62 ] \
+        || { rm -rf "$test_dir"; die "all-server parallel ping self-test failed"; }
+    mv "$test_dir/servers.before-ping" "$SINGBOX_SERVERS_FILE"
     printf '17 */6 * * * sh /old/setup.sh refresh %s\n5 4 * * * echo keep\n' "$SUB_REFRESH_MARKER" > "$SINGBOX_CRON"
     printf '%s\n' 'https://example.com/subscription' > "$SINGBOX_SUB_FILE"
     install_cron >/dev/null
