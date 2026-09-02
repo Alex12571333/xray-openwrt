@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260671"
+SCRIPT_VERSION="20260672"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -2332,10 +2332,16 @@ EOF
 
 # ─── Self-update ─────────────────────────────────────────────────────────────
 
+_cache_busted_url() {
+    local url="$1" nonce="${2:-$(date +%s)-$$}"
+    case "$url" in *\?*) printf '%s&cb=%s' "$url" "$nonce" ;; *) printf '%s?cb=%s' "$url" "$nonce" ;; esac
+}
+
 self_update() {
-    local remote_ver version_tmp script_tmp
+    local remote_ver version_tmp script_tmp request_nonce
+    request_nonce="$(date +%s)-$$"
     version_tmp=$(mktemp /tmp/sb-version-XXXXXX) || return 1
-    _download "$SCRIPT_VERSION_URL" "$version_tmp" >/dev/null 2>&1 || true
+    _download "$(_cache_busted_url "$SCRIPT_VERSION_URL" "$request_nonce")" "$version_tmp" >/dev/null 2>&1 || true
     remote_ver=$(tr -d ' \n' < "$version_tmp")
     rm -f "$version_tmp"
     if [ -z "$remote_ver" ]; then
@@ -2347,7 +2353,7 @@ self_update() {
     fi
     info "Обновляю скрипт: $SCRIPT_VERSION → $remote_ver"
     script_tmp="${SINGBOX_SELF}.new"
-    _download "$SCRIPT_URL" "$script_tmp" >/dev/null 2>&1 || die "Ошибка скачивания"
+    _download "$(_cache_busted_url "$SCRIPT_URL" "${remote_ver}-${request_nonce}")" "$script_tmp" >/dev/null 2>&1 || die "Ошибка скачивания"
     grep -q "^SCRIPT_VERSION=\"${remote_ver}\"$" "$script_tmp" && sh -n "$script_tmp" \
         || { rm -f "$script_tmp"; die "Получен некорректный скрипт"; }
     chmod 700 "$script_tmp"
@@ -2409,6 +2415,9 @@ self_test() {
     [ "$(_json_escape 'a\b"c')" = 'a\\b\"c' ] &&
         [ "$(_html_escape "a&<>\"'")" = 'a&amp;&lt;&gt;&quot;&#39;' ] \
         || { rm -rf "$test_dir"; die "escaping self-test failed"; }
+    [ "$(_cache_busted_url 'https://example.com/version' test)" = 'https://example.com/version?cb=test' ] &&
+        [ "$(_cache_busted_url 'https://example.com/script?raw=1' test)" = 'https://example.com/script?raw=1&cb=test' ] \
+        || { rm -rf "$test_dir"; die "self-update cache bypass self-test failed"; }
     parity_link='vless://11111111-1111-1111-1111-111111111111@example.com:443'
     (
         apply_user_change() { printf '%s\n' "$@" > "$test_dir/web-change"; }
