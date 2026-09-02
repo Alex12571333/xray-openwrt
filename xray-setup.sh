@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260664"
+SCRIPT_VERSION="20260665"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -516,7 +516,9 @@ _parse_v2ray_query() {
     SV_TYPE="${SV_TYPE:-tcp}"
     SV_SEC="${SV_SEC:-none}"
     SV_FP="${SV_FP:-chrome}"
-    case "$SV_TYPE" in tcp|ws|grpc) ;; *) die "Транспорт '$SV_TYPE' пока не поддерживается" ;; esac
+    # Имена из Xray/старых генераторов приводим к эквивалентам sing-box.
+    case "$SV_TYPE" in raw|none) SV_TYPE=tcp ;; h2) SV_TYPE=http ;; esac
+    case "$SV_TYPE" in tcp|http|ws|grpc|httpupgrade) ;; *) die "Транспорт '$SV_TYPE' пока не поддерживается" ;; esac
     case "$SV_PACKET_ENCODING" in ''|packetaddr|xudp) ;; *) die "Некорректный packet encoding" ;; esac
     case "$SV_INSECURE" in ''|0|false) SV_INSECURE=false ;; 1|true) SV_INSECURE=true ;;
         *) die "Некорректный allowInsecure" ;; esac
@@ -536,6 +538,10 @@ parse_vless() {
     _parse_hostport "$hostport" ""
     _parse_v2ray_query "$query"
     case "$SV_SEC" in none|tls|reality) ;; *) die "Security VLESS '$SV_SEC' пока не поддерживается" ;; esac
+    # Старое имя flow всё ещё встречается в Xray-подписках, хотя sing-box
+    # принимает только актуальное xtls-rprx-vision.
+    [ "$SV_FLOW" != "xtls-rprx-vision-udp443" ] || SV_FLOW="xtls-rprx-vision"
+    case "$SV_FLOW" in ''|xtls-rprx-vision) ;; *) die "Flow VLESS '$SV_FLOW' не поддерживается sing-box" ;; esac
     [ -n "$SV_UUID" ] && [ "$after_at" != "$rest" ] && [ -n "$SV_HOST" ] \
         || die "В VLESS-ссылке нет UUID или адреса сервера"
     case "$SV_SEC" in tls|reality) SV_SNI="${SV_SNI:-$SV_HOST}" ;; esac
@@ -561,7 +567,7 @@ parse_vmess() {
     SV_NAME=$(printf '%s' "$payload" | _json_value ps)
     SV_TYPE="${SV_TYPE:-tcp}"; SV_SEC="${SV_SEC:-none}"; SV_SECURITY="${SV_SECURITY:-auto}"
     SV_FP="${SV_FP:-chrome}"; SV_ALTER_ID="${SV_ALTER_ID:-0}"; SV_INSECURE=false
-    case "$SV_TYPE" in tcp|ws|grpc) ;; *) die "Транспорт VMess '$SV_TYPE' пока не поддерживается" ;; esac
+    case "$SV_TYPE" in tcp|http|ws|grpc|httpupgrade) ;; *) die "Транспорт VMess '$SV_TYPE' пока не поддерживается" ;; esac
     case "$SV_SEC" in none|tls) ;; *) die "Security VMess '$SV_SEC' пока не поддерживается" ;; esac
     case "$SV_SECURITY" in auto|none|zero|aes-128-gcm|chacha20-poly1305|aes-128-ctr) ;;
         *) die "Некорректное шифрование VMess" ;; esac
@@ -705,8 +711,10 @@ _emit_v2ray_transport() {
     host_hdr=$(_json_escape "$SV_HOST_HDR")
     [ -z "$host_hdr" ] || headers=",\"headers\":{\"Host\":\"${host_hdr}\"}"
     case "$SV_TYPE" in
+        http) printf '"transport":{"type":"http","host":"%s","path":"%s"},' "$host_hdr" "$path" ;;
         ws) printf '"transport":{"type":"ws","path":"%s"%s},' "$path" "$headers" ;;
         grpc) printf '"transport":{"type":"grpc","service_name":"%s"},' "$path" ;;
+        httpupgrade) printf '"transport":{"type":"httpupgrade","host":"%s","path":"%s"},' "$host_hdr" "$path" ;;
     esac
 }
 
@@ -845,8 +853,9 @@ refresh_subscription() {
             SINGBOX_SERVERS_FILE="$tmp"
             SINGBOX_VLESS_FILE="$selected_file"
             SINGBOX_CONFIG="$check_config"
+            parse_server "$selected"
             gen_config >/dev/null
-        ) || { rm -f "$tmp" "$check_config" "$selected_file"; die "Новая подписка не прошла проверку"; }
+        ) || { rm -f "$tmp" "$check_config" "${check_config}.new" "${check_config}.new.check-error" "$selected_file"; die "Новая подписка не прошла проверку"; }
         rm -f "$check_config" "$selected_file"
     fi
     mv "$tmp" "$SINGBOX_SERVERS_FILE"
@@ -1173,10 +1182,16 @@ ${rule_sets}
 }
 EOF
     chmod 600 "$tmp"
-    "$SINGBOX_BIN" check -c "$tmp" >/dev/null 2>&1 || {
+    local check_error check_detail
+    check_error="${tmp}.check-error"
+    if ! "$SINGBOX_BIN" check -c "$tmp" >/dev/null 2>"$check_error"; then
+        check_detail=$(sed -n '1,3p' "$check_error" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g;s/[[:space:]]*$//')
+        rm -f "$check_error"
         rm -f "$tmp"
+        [ -z "$check_detail" ] || warn "sing-box check: $check_detail"
         die "Новый конфиг не прошёл sing-box check; старый оставлен без изменений"
-    }
+    fi
+    rm -f "$check_error"
     if cmp -s "$tmp" "$SINGBOX_CONFIG"; then
         rm -f "$tmp"
         info "Конфиг уже актуален"
@@ -2023,6 +2038,20 @@ self_test() {
     parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls&sni=edge.example.com&host=cdn.example.com&path=%2Fws'
     printf '%s' "$(_emit_outbound test)" | grep -Fq '"headers":{"Host":"cdn.example.com"}' \
         || { rm -rf "$test_dir"; die "explicit WebSocket Host self-test failed"; }
+    parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=reality&sni=edge.example.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef&flow=xtls-rprx-vision-udp443'
+    [ "$SV_FLOW" = "xtls-rprx-vision" ] &&
+        printf '%s' "$(_emit_outbound test)" | grep -Fq '"flow":"xtls-rprx-vision"' \
+        || { rm -rf "$test_dir"; die "legacy VLESS flow adaptation self-test failed"; }
+    parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=httpupgrade&security=tls&sni=edge.example.com&host=cdn.example.com&path=%2Fupgrade'
+    printf '%s' "$(_emit_outbound test)" | grep -Fq '"transport":{"type":"httpupgrade","host":"cdn.example.com","path":"/upgrade"}' \
+        || { rm -rf "$test_dir"; die "HTTPUpgrade adaptation self-test failed"; }
+    parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=h2&security=tls&sni=edge.example.com&host=cdn.example.com&path=%2Fh2'
+    [ "$SV_TYPE" = http ] &&
+        printf '%s' "$(_emit_outbound test)" | grep -Fq '"transport":{"type":"http","host":"cdn.example.com","path":"/h2"}' \
+        || { rm -rf "$test_dir"; die "HTTP transport adaptation self-test failed"; }
+    parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=raw&security=tls&sni=edge.example.com'
+    [ "$SV_TYPE" = tcp ] && ! printf '%s' "$(_emit_outbound test)" | grep -Fq '"transport"' \
+        || { rm -rf "$test_dir"; die "raw transport adaptation self-test failed"; }
     parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:8443#No query'
     [ "$SV_HOST" = "example.com" ] && [ "$SV_PORT" = "8443" ] \
         || { rm -rf "$test_dir"; die "fragment self-test failed"; }
