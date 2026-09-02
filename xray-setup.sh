@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260667"
+SCRIPT_VERSION="20260668"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -400,6 +400,15 @@ install_singbox() {
     info "sing-box установлен: $("$SINGBOX_BIN" version 2>/dev/null | head -1)"
 }
 
+_singbox_supports_tcp_keepalive_fields() {
+    local version major rest minor
+    version=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 { print $3 }')
+    version=${version#v}; version=${version%%-*}
+    major=${version%%.*}; rest=${version#*.}; minor=${rest%%.*}
+    case "$major:$minor" in :*|*:|*[!0-9:]*) return 1 ;; esac
+    [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 13 ]; }
+}
+
 # ─── Парсинг ссылок серверов ─────────────────────────────────────────────────
 
 urldecode() {
@@ -733,24 +742,37 @@ _emit_tls() {
 }
 
 _emit_outbound() {
-    local tag="$1" host uuid password flow tls tr obfs packet_encoding udp_mode server_port
+    local tag="$1" host uuid password tls tr obfs udp_mode server_port keepalive=0
     host=$(_json_escape "$SV_HOST"); uuid=$(_json_escape "$SV_UUID")
     password=$(_json_escape "$SV_PASSWORD"); tls=$(_emit_tls); tr=$(_emit_v2ray_transport)
+    tls=${tls%,}; tr=${tr%,}
+    _singbox_supports_tcp_keepalive_fields && keepalive=1
     case "$SV_PROTOCOL" in
         vless)
-            flow=""; [ -n "$SV_FLOW" ] && flow="\"flow\":\"$(_json_escape "$SV_FLOW")\","
-            packet_encoding=""; [ -n "$SV_PACKET_ENCODING" ] && packet_encoding="\"packet_encoding\":\"${SV_PACKET_ENCODING}\","
-            printf '{"type":"vless","tag":"%s","server":"%s","server_port":%s,"uuid":"%s",%s%s%s%s"tcp_keep_alive":"2m","tcp_keep_alive_interval":"30s"}' \
-                "$tag" "$host" "$SV_PORT" "$uuid" "$flow" "$tls" "$tr" "$packet_encoding"
+            printf '{"type":"vless","tag":"%s","server":"%s","server_port":%s,"uuid":"%s"' \
+                "$tag" "$host" "$SV_PORT" "$uuid"
+            [ -z "$SV_FLOW" ] || printf ',"flow":"%s"' "$(_json_escape "$SV_FLOW")"
+            [ -z "$tls" ] || printf ',%s' "$tls"
+            [ -z "$tr" ] || printf ',%s' "$tr"
+            [ -z "$SV_PACKET_ENCODING" ] || printf ',"packet_encoding":"%s"' "$SV_PACKET_ENCODING"
+            [ "$keepalive" -eq 0 ] || printf ',"tcp_keep_alive":"2m","tcp_keep_alive_interval":"30s"'
+            printf '}'
             ;;
         vmess)
-            packet_encoding=""; [ -n "$SV_PACKET_ENCODING" ] && packet_encoding="\"packet_encoding\":\"${SV_PACKET_ENCODING}\","
-            printf '{"type":"vmess","tag":"%s","server":"%s","server_port":%s,"uuid":"%s","security":"%s","alter_id":%s,%s%s%s"tcp_keep_alive":"2m","tcp_keep_alive_interval":"30s"}' \
-                "$tag" "$host" "$SV_PORT" "$uuid" "$(_json_escape "$SV_SECURITY")" "$SV_ALTER_ID" "$tls" "$tr" "$packet_encoding"
+            printf '{"type":"vmess","tag":"%s","server":"%s","server_port":%s,"uuid":"%s","security":"%s","alter_id":%s' \
+                "$tag" "$host" "$SV_PORT" "$uuid" "$(_json_escape "$SV_SECURITY")" "$SV_ALTER_ID"
+            [ -z "$tls" ] || printf ',%s' "$tls"
+            [ -z "$tr" ] || printf ',%s' "$tr"
+            [ -z "$SV_PACKET_ENCODING" ] || printf ',"packet_encoding":"%s"' "$SV_PACKET_ENCODING"
+            [ "$keepalive" -eq 0 ] || printf ',"tcp_keep_alive":"2m","tcp_keep_alive_interval":"30s"'
+            printf '}'
             ;;
         trojan)
-            printf '{"type":"trojan","tag":"%s","server":"%s","server_port":%s,"password":"%s",%s%s}' \
-                "$tag" "$host" "$SV_PORT" "$password" "$tls" "$tr"
+            printf '{"type":"trojan","tag":"%s","server":"%s","server_port":%s,"password":"%s"' \
+                "$tag" "$host" "$SV_PORT" "$password"
+            [ -z "$tls" ] || printf ',%s' "$tls"
+            [ -z "$tr" ] || printf ',%s' "$tr"
+            printf '}'
             ;;
         shadowsocks)
             printf '{"type":"shadowsocks","tag":"%s","server":"%s","server_port":%s,"method":"%s","password":"%s"}' \
@@ -1544,6 +1566,7 @@ _watchdog() {
 
 refresh_subscription_and_apply() {
     install_runtime_dependencies
+    install_singbox
     [ -s "$SINGBOX_SUB_FILE" ] || die "URL подписки не настроен"
     refresh_subscription
     apply_configuration preserve
@@ -1558,11 +1581,17 @@ apply_user_change() {
     shift
     case "$action" in
         source)
+            install_runtime_dependencies
+            install_singbox
             save_source "$1"
             apply_configuration "${2:-preserve}"
             ;;
         refresh) refresh_subscription_and_apply ;;
-        select) apply_server_selection "$1" ;;
+        select)
+            install_runtime_dependencies
+            install_singbox
+            apply_server_selection "$1"
+            ;;
         routing) save_routing_settings "$1" "$2" "$3" "$4" "$5" ;;
         start) apply_configuration ;;
         stop) stop_tunnel ;;
@@ -2121,6 +2150,18 @@ self_test() {
     emitted=$(_emit_outbound test)
     ! printf '%s' "$emitted" | grep -Fq '"headers"' \
         || { rm -rf "$test_dir"; die "implicit WebSocket Host self-test failed"; }
+    emitted=$(
+        _singbox_supports_tcp_keepalive_fields() { return 1; }
+        _emit_outbound test
+    )
+    ! printf '%s' "$emitted" | grep -Fq '"tcp_keep_alive"' \
+        || { rm -rf "$test_dir"; die "legacy sing-box compatibility self-test failed"; }
+    emitted=$(
+        _singbox_supports_tcp_keepalive_fields() { return 0; }
+        _emit_outbound test
+    )
+    printf '%s' "$emitted" | grep -Fq '"tcp_keep_alive":"2m"' \
+        || { rm -rf "$test_dir"; die "current sing-box tuning self-test failed"; }
     parse_server 'vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls&sni=edge.example.com&host=cdn.example.com&path=%2Fws'
     printf '%s' "$(_emit_outbound test)" | grep -Fq '"headers":{"Host":"cdn.example.com"}' \
         || { rm -rf "$test_dir"; die "explicit WebSocket Host self-test failed"; }
