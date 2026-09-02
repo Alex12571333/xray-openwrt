@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260665"
+SCRIPT_VERSION="20260666"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -771,7 +771,7 @@ _emit_outbound() {
 }
 
 _emit_outbound_set() {
-    local selected default_tag="" tags="" url tag i=0
+    local selected default_tag="" tags="" auto_tags="" url tag i=0 n
     selected=$(cat "$SINGBOX_VLESS_FILE" 2>/dev/null)
     while IFS= read -r url; do
         [ -n "$url" ] || continue
@@ -787,7 +787,18 @@ _emit_outbound_set() {
     [ "$i" -gt 0 ] || die "Список серверов пуст"
     [ -n "$default_tag" ] || default_tag=server-1
     if [ -f "$SINGBOX_AUTO_FILE" ]; then
-        printf ',\n    {"type":"urltest","tag":"auto","outbounds":[%s],"interval":"1m","interrupt_exist_connections":false},\n' "$tags"
+        # URLTest сравнивает задержку начиная с первого доступного outbound.
+        # Ставим сохранённый выбор первым и задаём высокий hysteresis: пока он
+        # отвечает, колебания пинга не вызовут смену сервера. При неудачной
+        # проверке sing-box удалит его health history и выберет резервный.
+        auto_tags="\"${default_tag}\""
+        n=1
+        while [ "$n" -le "$i" ]; do
+            tag="server-${n}"
+            [ "$tag" = "$default_tag" ] || auto_tags="${auto_tags},\"${tag}\""
+            n=$((n + 1))
+        done
+        printf ',\n    {"type":"urltest","tag":"auto","outbounds":[%s],"url":"https://www.gstatic.com/generate_204","interval":"1m","tolerance":10000,"interrupt_exist_connections":false},\n' "$auto_tags"
         printf '    {"type":"selector","tag":"proxy","outbounds":["auto",%s],"default":"auto","interrupt_exist_connections":false},\n' "$tags"
     else
         printf ',\n    {"type":"selector","tag":"proxy","outbounds":[%s],"default":"%s","interrupt_exist_connections":false},\n' "$tags" "$default_tag"
@@ -2140,6 +2151,7 @@ EOF
     select_server auto
     gen_config >/dev/null
     grep -Fq '"type":"urltest","tag":"auto"' "$SINGBOX_CONFIG" &&
+        grep -Fq '"outbounds":["server-2","server-1"],"url":"https://www.gstatic.com/generate_204","interval":"1m","tolerance":10000' "$SINGBOX_CONFIG" &&
         grep -Fq '"default":"auto"' "$SINGBOX_CONFIG" \
         || { rm -rf "$test_dir"; die "automatic failover self-test failed"; }
     [ "$(ping_quality 79)" = 4 ] && [ "$(ping_quality 301)" = 1 ] && [ "$(ping_quality timeout)" = 0 ] \
