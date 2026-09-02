@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260670"
+SCRIPT_VERSION="20260671"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -1002,9 +1002,8 @@ apply_server_selection() {
     fi
 }
 
-_clash_group_delays() {
-    local group="$1" endpoint
-    endpoint="http://127.0.0.1:9090/group/${group}/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=8000"
+_clash_get() {
+    local endpoint="$1"
     if command -v curl >/dev/null 2>&1; then
         curl -fsS --max-time 12 "$endpoint" 2>/dev/null
     elif command -v uclient-fetch >/dev/null 2>&1; then
@@ -1014,11 +1013,69 @@ _clash_group_delays() {
     fi
 }
 
+_clash_group_delays() {
+    local group="$1" probe="${2:-https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204}"
+    _clash_get "http://127.0.0.1:9090/group/${group}/delay?url=${probe}&timeout=8000"
+}
+
+_delay_from_response() {
+    local response="$1" key="$2"
+    printf '%s' "$response" |
+        sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p"
+}
+
 _delay_for_server() {
     # Ответ Clash API — плоский JSON-объект вида {"server-1":42,...}.
     local response="$1" index="$2"
     printf '%s' "$response" |
         sed -n "s/.*\"server-${index}\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p"
+}
+
+_include_active_auto_delay() {
+    # У selector `proxy` вложенный URLTest возвращается под ключом `auto`, а
+    # выбранный им raw-outbound не дублируется. Возвращаем задержку его тегу.
+    local response="$1" active auto_delay index
+    if [ -f "$SINGBOX_AUTO_FILE" ]; then
+        active=$(_clash_group_now auto 2>/dev/null)
+        auto_delay=$(_delay_from_response "$response" auto)
+        case "$active:$auto_delay" in
+            server-[0-9]*:[0-9]*)
+                index=${active#server-}
+                if [ -z "$(_delay_for_server "$response" "$index")" ]; then
+                    response="$response
+\"${active}\":${auto_delay}"
+                fi
+                ;;
+        esac
+    fi
+    printf '%s' "$response"
+}
+
+_clash_individual_delays() {
+    local probe="$1" work_dir count i=1 batch=0 response delay result
+    work_dir=$(mktemp -d /tmp/sb-proxy-delay-XXXXXX) || return 1
+    count=$(grep -c '.' "$SINGBOX_SERVERS_FILE" 2>/dev/null)
+    count=${count:-0}
+    while [ "$i" -le "$count" ]; do
+        (
+            response=$(_clash_get "http://127.0.0.1:9090/proxies/server-${i}/delay?url=${probe}&timeout=8000") || exit 0
+            delay=$(_delay_from_response "$response" delay)
+            case "$delay" in ''|*[!0-9]*) ;; *) printf '"server-%s":%s\n' "$i" "$delay" ;; esac
+        ) > "$work_dir/$i" &
+        batch=$((batch + 1))
+        if [ "$batch" -ge 8 ]; then wait; batch=0; fi
+        i=$((i + 1))
+    done
+    wait
+    i=1; result=""
+    while [ "$i" -le "$count" ]; do
+        [ ! -s "$work_dir/$i" ] || result="$result$(cat "$work_dir/$i")
+"
+        i=$((i + 1))
+    done
+    rm -rf "$work_dir"
+    [ -n "$result" ] || return 1
+    printf '%s' "$result"
 }
 
 _fastest_from_delays() {
@@ -1057,7 +1114,7 @@ _save_proxy_delays() {
 }
 
 select_fastest_server() {
-    local group response result index delay selected
+    local response result index delay selected probe_google probe_cloudflare
     [ -s "$SINGBOX_SERVERS_FILE" ] || die "Список серверов пуст"
     if [ -f "$SINGBOX_DISABLED_FILE" ] || ! _is_running; then
         info "Для разового замера запускаю туннель..."
@@ -1066,10 +1123,29 @@ select_fastest_server() {
         : > "$SINGBOX_AUTO_FILE"
         apply_configuration
     fi
-    if [ -f "$SINGBOX_AUTO_FILE" ]; then group=auto; else group=proxy; fi
     info "Один раз измеряю скорость доступных серверов..."
-    response=$(_clash_group_delays "$group") || die "Не удалось измерить серверы через sing-box"
-    result=$(_fastest_from_delays "$response") || die "Ни один сервер не ответил на проверку"
+    probe_google='https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204'
+    probe_cloudflare='https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204'
+    # `auto/delay` в sing-box может вернуть пустой объект, если фоновая проверка
+    # только что заполнила кэш. Selector `proxy` принудительно тестирует raw
+    # outbounds; ниже есть поштучный резервный путь для особенностей API.
+    response=$(_clash_group_delays proxy "$probe_google" 2>/dev/null) || response=""
+    response=$(_include_active_auto_delay "$response")
+    result=$(_fastest_from_delays "$response" 2>/dev/null) || result=""
+    if [ -z "$result" ]; then
+        response=$(_clash_group_delays proxy "$probe_cloudflare" 2>/dev/null) || response=""
+        response=$(_include_active_auto_delay "$response")
+        result=$(_fastest_from_delays "$response" 2>/dev/null) || result=""
+    fi
+    if [ -z "$result" ]; then
+        response=$(_clash_individual_delays "$probe_google" 2>/dev/null) || response=""
+        result=$(_fastest_from_delays "$response" 2>/dev/null) || result=""
+    fi
+    if [ -z "$result" ]; then
+        response=$(_clash_individual_delays "$probe_cloudflare" 2>/dev/null) || response=""
+        result=$(_fastest_from_delays "$response" 2>/dev/null) || result=""
+    fi
+    [ -n "$result" ] || die "Ни один сервер не ответил через Google или Cloudflare"
     index=${result%% *}; delay=${result#* }
     _save_proxy_delays "$response" || true
 
@@ -1243,6 +1319,8 @@ server_country_code() {
         *🇭🇰*|*hong*kong*) code=hk ;; *🇦🇪*|*emirates*|*dubai*) code=ae ;;
         *🇮🇳*|*india*|*mumbai*) code=in ;; *🇦🇺*|*australia*|*sydney*) code=au ;;
         *🇧🇷*|*brazil*|*sao*paulo*) code=br ;; *🇹🇷*|*turkey*|*istanbul*) code=tr ;;
+        *🇬🇷*|*greece*|*athens*|*афин*|*грец*) code=gr ;; *🇧🇬*|*bulgaria*|*sofia*|*софи*|*болгар*) code=bg ;;
+        *🇨🇴*|*colombia*|*bogota*|*богот*|*колумб*) code=co ;; *🇧🇪*|*belgium*|*brussels*|*брюссел*|*бельг*) code=be ;;
         *🇰🇿*|*kazakhstan*|*almaty*) code=kz ;; *🇷🇺*|*russia*|*moscow*) code=ru ;;
         *) return 1 ;;
     esac
@@ -2286,7 +2364,7 @@ update_system() {
 
 # Минимальная проверка ссылок, списка доменов и обоих режимов маршрутизации.
 self_test() {
-    local test_dir normalized links link protocols="" expected rule_source emitted config_inode parity_link fastest_result ping_count test_i
+    local test_dir normalized links link protocols="" expected rule_source emitted config_inode parity_link fastest_result ping_count test_i augmented
     test_dir=$(mktemp -d /tmp/singbox-test-XXXXXX) || die "mktemp failed"
     SINGBOX_BIN="${SINGBOX_TEST_BIN:-true}"
     SINGBOX_CONFIG="$test_dir/config.json"
@@ -2487,6 +2565,25 @@ EOF
     fastest_result=$(_fastest_from_delays '{"server-1":121,"server-2":44}')
     [ "$fastest_result" = "2 44" ] \
         || { rm -rf "$test_dir"; die "one-shot fastest parser self-test failed"; }
+    : > "$SINGBOX_AUTO_FILE"
+    augmented=$(
+        _clash_group_now() { printf 'server-1'; }
+        _include_active_auto_delay '{"auto":38,"server-2":51}'
+    )
+    [ "$(_fastest_from_delays "$augmented")" = "1 38" ] \
+        || { rm -rf "$test_dir"; die "cached URLTest delay adaptation self-test failed"; }
+    augmented=$(
+        _clash_get() {
+            if printf '%s' "$1" | grep -Fq 'server-1/'; then
+                printf '{"delay":73}'
+            else
+                printf '{"delay":41}'
+            fi
+        }
+        _clash_individual_delays test-probe
+    )
+    [ "$(_fastest_from_delays "$augmented")" = "2 41" ] \
+        || { rm -rf "$test_dir"; die "individual delay fallback self-test failed"; }
     (
         install_runtime_dependencies() { :; }; install_singbox() { :; }; _is_running() { return 0; }
         _clash_group_delays() { printf '%s' '{"server-1":121,"server-2":44}'; }
