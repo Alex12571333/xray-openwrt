@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260672"
+SCRIPT_VERSION="20260673"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -214,7 +214,13 @@ _state_transaction() {
     if [ "$status" -ne 0 ]; then
         warn "Изменение отклонено; восстанавливаю прежние настройки"
         _restore_state "$backup" || warn "Не все файлы состояния удалось восстановить"
-        if [ "$was_running" -eq 1 ]; then
+        # Флаг disabled восстановлен из снимка и отражает намерение пользователя,
+        # а отсутствие PID — только состояние процесса. Не превращаем сбой в OFF.
+        if [ -f "$SINGBOX_DISABLED_FILE" ]; then
+            [ ! -x "$SINGBOX_INIT" ] || "$SINGBOX_INIT" stop >/dev/null 2>&1 || true
+            _stop_owned_singbox_processes
+            cleanup_iptables quiet
+        elif [ "$was_running" -eq 1 ]; then
             if _is_running && health_check; then
                 _iptables_ready || setup_iptables
             elif [ -x "$SINGBOX_INIT" ]; then
@@ -225,11 +231,10 @@ _state_transaction() {
                 warn "Прежнее соединение требует ручного запуска"
             fi
         else
-            mkdir -p "$(dirname "$SINGBOX_DISABLED_FILE")"
-            : > "$SINGBOX_DISABLED_FILE"
-            chmod 600 "$SINGBOX_DISABLED_FILE"
             [ ! -x "$SINGBOX_INIT" ] || "$SINGBOX_INIT" stop >/dev/null 2>&1 || true
+            _stop_owned_singbox_processes
             cleanup_iptables quiet
+            warn "Туннель временно не работает; автоматическое восстановление не отключено"
         fi
     fi
     rm -rf "$backup"
@@ -2685,8 +2690,33 @@ EOF
     ) >/dev/null 2>&1; then
         rm -rf "$test_dir"; die "state rollback self-test failed"
     fi
-    [ "$(cat "$SINGBOX_MODE_FILE")" = stable ] && [ -f "$SINGBOX_DISABLED_FILE" ] \
+    [ "$(cat "$SINGBOX_MODE_FILE")" = stable ] && [ ! -f "$SINGBOX_DISABLED_FILE" ] \
         || { rm -rf "$test_dir"; die "state rollback self-test failed"; }
+    (
+        _is_running() { return 1; }
+        start_singbox() { : > "$test_dir/watchdog-after-rollback"; }
+        _watchdog_subscription_refresh() { :; }
+        _watchdog_locked
+    ) >/dev/null 2>&1
+    [ -f "$test_dir/watchdog-after-rollback" ] \
+        || { rm -rf "$test_dir"; die "watchdog recovery after rollback self-test failed"; }
+    : > "$SINGBOX_DISABLED_FILE"
+    if (
+        _is_running() { return 1; }
+        _stop_owned_singbox_processes() { :; }
+        cleanup_iptables() { :; }
+        _state_transaction sh -c "rm -f '$SINGBOX_DISABLED_FILE'; exit 1"
+    ) >/dev/null 2>&1; then
+        rm -rf "$test_dir"; die "manual stop rollback self-test failed"
+    fi
+    [ -f "$SINGBOX_DISABLED_FILE" ] \
+        || { rm -rf "$test_dir"; die "manual stop intent self-test failed"; }
+    (
+        start_singbox() { : > "$test_dir/unexpected-manual-start"; }
+        _watchdog_locked
+    ) >/dev/null 2>&1
+    [ ! -f "$test_dir/unexpected-manual-start" ] \
+        || { rm -rf "$test_dir"; die "manual stop watchdog self-test failed"; }
     rm -f "$SINGBOX_DISABLED_FILE" "$test_dir/unexpected-rollback-restart"
     printf '#!/bin/sh\n: > "%s"\n' "$test_dir/unexpected-rollback-restart" > "$SINGBOX_INIT"
     chmod 700 "$SINGBOX_INIT"
@@ -2708,7 +2738,7 @@ EOF
     ) >/dev/null 2>&1; then
         rm -rf "$test_dir"; die "first install rollback self-test failed"
     fi
-    [ -s "$SINGBOX_SELF" ] && [ -f "$SINGBOX_DISABLED_FILE" ] \
+    [ -s "$SINGBOX_SELF" ] && [ ! -f "$SINGBOX_DISABLED_FILE" ] \
         || { rm -rf "$test_dir"; die "first install rollback self-test failed"; }
     rm -rf "$test_dir"
     echo "Итог: OK"
