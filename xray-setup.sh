@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260673"
+SCRIPT_VERSION="20260674"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -365,6 +365,13 @@ _b64dec() {
 
 install_singbox() {
     local installed arch archive url tmpdir bin new_bin previous
+    # Обычные операции только устанавливают отсутствующий движок. Любая замена
+    # существующего бинарника требует отдельного ручного действия.
+    if [ -e "$SINGBOX_BIN" ] && [ "${1:-ensure}" != manual ]; then
+        "$SINGBOX_BIN" version >/dev/null 2>&1 \
+            || die "Установленный sing-box не запускается; выполните engine-update вручную"
+        return 0
+    fi
     installed=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 { print $3 }')
     if [ "$installed" = "$SINGBOX_VERSION" ]; then
         info "sing-box уже установлен: $installed"
@@ -1726,7 +1733,7 @@ _restore_last_good() {
     cp "$SINGBOX_GOOD_CONFIG" "$SINGBOX_CONFIG" || return 1
     "$SINGBOX_INIT" restart >/dev/null 2>&1 || return 1
     _wait_healthy 20 && return 0
-    if [ -x "${SINGBOX_BIN}.previous" ]; then
+    if [ "$SINGBOX_BINARY_CHANGED" -eq 1 ] && [ -x "${SINGBOX_BIN}.previous" ]; then
         cp "${SINGBOX_BIN}.previous" "$SINGBOX_BIN" || return 1
         "$SINGBOX_INIT" restart >/dev/null 2>&1 || return 1
         _wait_healthy 20
@@ -1884,6 +1891,7 @@ apply_user_change() {
         start) apply_configuration ;;
         stop) stop_tunnel ;;
         upgrade) update_system ;;
+        engine-update) update_engine ;;
         *) die "Неизвестное изменение: $action" ;;
     esac
 }
@@ -1923,7 +1931,17 @@ apply_update() {
         gen_config
         _activate_configuration preserve
     fi
-    info "Скрипт и sing-box обновлены"
+    info "Скрипт и списки обновлены; версия sing-box сохранена"
+}
+
+update_engine() {
+    install_runtime_dependencies
+    install_singbox manual
+    if [ "$SINGBOX_BINARY_CHANGED" -eq 1 ] && load_source; then
+        gen_config
+        _activate_configuration preserve
+    fi
+    info "Ручное обновление sing-box завершено"
 }
 
 save_routing_settings() {
@@ -2107,7 +2125,11 @@ _panel_action_unlocked() {
             ;;
         upgrade)
             apply_user_change upgrade
-            echo "Скрипт и sing-box обновлены."
+            echo "Скрипт и списки обновлены; версия sing-box сохранена."
+            ;;
+        engine-update)
+            apply_user_change engine-update
+            echo "Ручное обновление sing-box завершено."
             ;;
         *)
             die "Неизвестное действие"
@@ -2215,7 +2237,7 @@ EOF
     cat <<EOF
 <header class="topbar">
   <div class="brand"><span class="brand-mark" aria-hidden="true">S</span><div><h1>SingBox Router</h1><p>OpenWrt control plane · v${SCRIPT_VERSION}</p></div></div>
-  <div class="topbar-actions"><form method="post"><input type="hidden" name="csrf" value="$(_html_escape "$csrf")"><button class="btn ghost" name="action" value="upgrade" title="Обновить скрипт, sing-box и включённые списки">↑ Обновить систему</button></form><div class="status-pill ${status_class}"><span class="status-dot"></span>$(_html_escape "$status")</div></div>
+  <div class="topbar-actions"><form method="post"><input type="hidden" name="csrf" value="$(_html_escape "$csrf")"><button class="btn ghost" name="action" value="upgrade" title="Обновить скрипт и списки без замены sing-box">↑ Скрипт и списки</button></form><form method="post"><input type="hidden" name="csrf" value="$(_html_escape "$csrf")"><button class="btn ghost" name="action" value="engine-update" title="Обновить sing-box вручную; возможен краткий перерыв связи">↑ Только sing-box</button></form><div class="status-pill ${status_class}"><span class="status-dot"></span>$(_html_escape "$status")</div></div>
 </header>
 EOF
     if [ -n "$message" ]; then
@@ -2370,7 +2392,7 @@ update_system() {
     [ -s "$SINGBOX_SELF" ] || persist_self
     self_update || die "Не удалось проверить обновление скрипта"
     SINGBOX_LOCK_HELD=1 sh "$SINGBOX_SELF" apply-update \
-        || die "Не удалось обновить sing-box или списки"
+        || die "Не удалось применить обновление скрипта или списков"
 }
 
 # Минимальная проверка ссылок, списка доменов и обоих режимов маршрутизации.
@@ -2423,6 +2445,26 @@ self_test() {
     [ "$(_cache_busted_url 'https://example.com/version' test)" = 'https://example.com/version?cb=test' ] &&
         [ "$(_cache_busted_url 'https://example.com/script?raw=1' test)" = 'https://example.com/script?raw=1&cb=test' ] \
         || { rm -rf "$test_dir"; die "self-update cache bypass self-test failed"; }
+    (
+        # Исполняемый файл другой версии не должен приводить к загрузке.
+        SINGBOX_BIN="$test_dir/existing-engine"
+        printf '#!/bin/sh\necho "sing-box version 1.12.0"\n' > "$SINGBOX_BIN"
+        chmod 700 "$SINGBOX_BIN"
+        _download() { : > "$test_dir/unexpected-engine-download"; return 1; }
+        install_singbox
+    ) || { rm -rf "$test_dir"; die "preserve installed engine self-test failed"; }
+    [ ! -f "$test_dir/unexpected-engine-download" ] \
+        || { rm -rf "$test_dir"; die "automatic engine replacement self-test failed"; }
+    (
+        install_runtime_dependencies() { :; }
+        install_singbox() { printf '%s' "$1" > "$test_dir/engine-update-mode"; }
+        load_source() { : > "$test_dir/unexpected-engine-reconfigure"; }
+        SINGBOX_BINARY_CHANGED=0
+        apply_user_change engine-update
+    ) >/dev/null
+    [ "$(cat "$test_dir/engine-update-mode")" = manual ] &&
+        [ ! -f "$test_dir/unexpected-engine-reconfigure" ] \
+        || { rm -rf "$test_dir"; die "manual engine update path self-test failed"; }
     parity_link='vless://11111111-1111-1111-1111-111111111111@example.com:443'
     (
         apply_user_change() { printf '%s\n' "$@" > "$test_dir/web-change"; }
@@ -2860,8 +2902,9 @@ show_menu() {
     echo "  5) Настроить маршрутизацию"
     echo "  6) Обновить подписку вручную"
     echo "  7) Показать логи"
-    echo "  8) Обновить скрипт, sing-box и списки"
+    echo "  8) Обновить скрипт и списки (без обновления sing-box)"
     echo "  9) Адрес веб-панели"
+    echo "  10) Обновить sing-box вручную (возможен перерыв связи)"
     echo "  0) Выход"
     echo "=============================="
     printf "Выбор: "
@@ -2897,6 +2940,9 @@ show_menu() {
             _with_lock install_panel
             info "Панель: $(cat "$PANEL_URL_FILE" 2>/dev/null)"
             ;;
+        10)
+            _with_lock _state_transaction apply_user_change engine-update
+            ;;
         0)
             exit 0
             ;;
@@ -2909,6 +2955,9 @@ show_menu() {
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
+    engine-update)
+        _with_lock _state_transaction apply_user_change engine-update
+        ;;
     run-managed)
         run_managed
         ;;
