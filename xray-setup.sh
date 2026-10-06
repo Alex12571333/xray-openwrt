@@ -3,7 +3,7 @@
 # Ручной или автоматический выбор сервера и маршрутизация через веб-панель
 # Использование: sh setup.sh <proxy://...>  ИЛИ  sh setup.sh <https://.../sub/...>
 
-SCRIPT_VERSION="20260675"
+SCRIPT_VERSION="20260676"
 SCRIPT_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/xray-setup.sh"
 SCRIPT_VERSION_URL="https://raw.githubusercontent.com/Alex12571333/xray-openwrt/main/version"
 
@@ -1809,19 +1809,13 @@ _watchdog_locked() {
 }
 
 _watchdog_subscription_refresh() {
-    # Обновляем подписку только после трёх минут подтверждённой проблемы.
-    # Это охватывает и полный отказ, и переход sticky-failover с приоритетного
-    # сервера на резервный. Между повторными попытками выдерживается 30 минут.
-    local preferred active="" old_preferred="" failures=0 last_refresh=0 now problem=0 reason="проверка соединения не пройдена"
+    # Обновляем подписку только после трёх неудачных проверок туннеля подряд.
+    # Работающий резервный сервер — штатный failover, а не повод применять
+    # подписку и рисковать перезапуском direct-соединений вместе с sing-box.
+    # Между повторными попытками выдерживается 30 минут.
+    local preferred old_preferred="" failures=0 last_refresh=0 now problem=0 reason="проверка соединения не пройдена"
     [ -s "$SINGBOX_SUB_FILE" ] || { rm -f "$SINGBOX_FAILOVER_STATE"; return 0; }
     preferred=$(_preferred_server_tag 2>/dev/null) || return 0
-    if [ -f "$SINGBOX_AUTO_FILE" ]; then
-        active=$(_clash_group_now auto 2>/dev/null)
-        if [ -n "$active" ] && [ "$active" != "$preferred" ]; then
-            problem=1
-            reason="приоритетный сервер недоступен, активен ${active}"
-        fi
-    fi
     health_check || problem=1
     if [ -r "$SINGBOX_FAILOVER_STATE" ]; then
         read -r old_preferred failures last_refresh < "$SINGBOX_FAILOVER_STATE"
